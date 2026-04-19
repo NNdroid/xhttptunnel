@@ -65,7 +65,6 @@ func generateRandomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// DumpConn: 流量透视拦截器
 type DumpConn struct {
 	net.Conn
 	Prefix string
@@ -113,17 +112,80 @@ func writeUDPFrame(w io.Writer, payload []byte) error {
 }
 
 // ==========================================
-// 2. Meek 虚拟连接 (带数据抢救)
+// 2. 高性能可靠传输缓冲区 (Seq/Ack 机制)
+// ==========================================
+
+type reliableBuffer struct {
+	mu         sync.RWMutex
+	data       []byte // 原始数据缓冲区
+	baseOffset uint64 // 当前 data[0] 对应的绝对偏移量 (Seq)
+}
+
+func (rb *reliableBuffer) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.data = append(rb.data, p...)
+	return len(p), nil
+}
+
+// GetSlice 获取从指定偏移量开始的数据，并清理掉已被对端确认 (Ack) 的旧数据
+func (rb *reliableBuffer) GetSlice(remoteAck uint64, maxLen int) ([]byte, uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	// 1. 清理对端已经确认收到的数据
+	if remoteAck > rb.baseOffset {
+		skip := remoteAck - rb.baseOffset
+		if skip <= uint64(len(rb.data)) {
+			rb.data = rb.data[skip:]
+			rb.baseOffset = remoteAck
+		} else {
+			rb.data = nil
+			rb.baseOffset = remoteAck
+		}
+	}
+
+	// 2. 如果没新数据发，返回空
+	if len(rb.data) == 0 {
+		return nil, rb.baseOffset
+	}
+
+	// 3. 截取分片
+	length := len(rb.data)
+	if length > maxLen {
+		length = maxLen
+	}
+
+	// 高性能拷贝：防止重传时底层 Transport 竞态修改切片
+	res := make([]byte, length)
+	copy(res, rb.data[:length])
+	return res, rb.baseOffset
+}
+
+func (rb *reliableBuffer) Len() int {
+	rb.mu.RLock()
+	defer rb.mu.RUnlock()
+	return len(rb.data)
+}
+
+// ==========================================
+// 3. Meek 虚拟连接 (集成可靠传输)
 // ==========================================
 
 type meekVirtualConn struct {
-	sessionID  string
-	local      net.Addr
-	remote     net.Addr
-	readCond   *sync.Cond
-	readBuf    bytes.Buffer
-	writeMutex sync.Mutex
-	writeBuf   bytes.Buffer
+	sessionID string
+	local     net.Addr
+	remote    net.Addr
+
+	readCond    *sync.Cond
+	readBuf     bytes.Buffer
+	nextReadSeq uint64 // 我方期待收到的下一个 Seq
+
+	writeBuf *reliableBuffer // 替换原来的 bytes.Buffer
+
 	closed     bool
 	lastActive int64
 }
@@ -134,6 +196,7 @@ func newMeekVirtualConn(sessionID string, local, remote net.Addr) *meekVirtualCo
 		local:      local,
 		remote:     remote,
 		readCond:   sync.NewCond(&sync.Mutex{}),
+		writeBuf:   &reliableBuffer{},
 		lastActive: time.Now().Unix(),
 	}
 }
@@ -154,53 +217,21 @@ func (c *meekVirtualConn) Write(p []byte) (int, error) {
 	if c.closed {
 		return 0, io.ErrClosedPipe
 	}
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
 	return c.writeBuf.Write(p)
 }
 
-func (c *meekVirtualConn) HasWriteData() bool {
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
-	return c.writeBuf.Len() > 0
-}
-
-func (c *meekVirtualConn) takeWriteBuf(max int) []byte {
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
-	if c.writeBuf.Len() == 0 {
-		return nil
-	}
-	takeLen := c.writeBuf.Len()
-	if takeLen > max {
-		takeLen = max
-	}
-	data := make([]byte, takeLen)
-	c.writeBuf.Read(data)
-	return data
-}
-
-// 核心功能：数据抢救
-func (c *meekVirtualConn) putWriteBufFront(data []byte) {
-	if len(data) == 0 {
-		return
-	}
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
-	newData := make([]byte, len(data)+c.writeBuf.Len())
-	copy(newData, data)
-	copy(newData[len(data):], c.writeBuf.Bytes())
-	c.writeBuf = *bytes.NewBuffer(newData)
-}
-
-func (c *meekVirtualConn) putReadBuf(data []byte) {
-	if len(data) == 0 {
-		return
-	}
+// PutReadData 带有 Seq 校验的写入逻辑 (防止重传导致的数据重复)
+func (c *meekVirtualConn) PutReadData(seq uint64, data []byte) uint64 {
 	c.readCond.L.Lock()
-	c.readBuf.Write(data)
-	c.readCond.Broadcast()
-	c.readCond.L.Unlock()
+	defer c.readCond.L.Unlock()
+
+	// 严格按序接收：丢弃重传产生的重复包
+	if seq == c.nextReadSeq && len(data) > 0 {
+		c.readBuf.Write(data)
+		c.nextReadSeq += uint64(len(data))
+		c.readCond.Broadcast()
+	}
+	return c.nextReadSeq
 }
 
 func (c *meekVirtualConn) updateActive() {
@@ -222,7 +253,7 @@ func (c *meekVirtualConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *meekVirtualConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // ==========================================
-// 3. XHTTP 动态 Padding 与 EOF 信令装甲
+// 4. XHTTP 动态 Padding 与 EOF 信令装甲
 // ==========================================
 
 type xhttpFramedConn struct {
@@ -252,7 +283,6 @@ func newXhttpFramedConn(r io.Reader, w io.Writer, closer func() error, local, re
 	return conn
 }
 
-// EOF 终结信令
 func (c *xhttpFramedConn) WriteCloseFrame() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -390,7 +420,7 @@ func (c *xhttpFramedConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *xhttpFramedConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // ==========================================
-// 4. 客户端极速稳态轮询拨号器 (带熔断机制)
+// 5. 客户端极速稳态轮询拨号器 (滑动窗口整合)
 // ==========================================
 
 func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net.Conn, error) {
@@ -432,7 +462,6 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 		logger.Debug("TLS 探测成功", zap.String("ALPN", protocol))
 	} else {
 		protocol = "http/1.1"
-		logger.Debug("使用明文连接", zap.String("Protocol", protocol))
 	}
 
 	var dialMut sync.Mutex
@@ -475,7 +504,6 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) { return coreDial() },
 		}
 	} else {
-		// 扩大连接池防并发耗尽
 		t1 := &http.Transport{ForceAttemptHTTP2: false, MaxIdleConnsPerHost: 200}
 		if isTLS {
 			t1.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) { return coreDial() }
@@ -488,12 +516,14 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 	client := &http.Client{Transport: rt, Timeout: 30 * time.Second}
 	virtualConn := newMeekVirtualConn(sessionID, firstConn.LocalAddr(), firstConn.RemoteAddr())
 
+	// 客户端数据泵
 	go func() {
 		defer virtualConn.Close()
-		consecutiveErrors := 0 // 熔断计数器
+		var ackedByServer uint64 // 记录服务端已经确认的 Seq
 
 		for !virtualConn.closed {
-			upData := virtualConn.takeWriteBuf(32768)
+			// GetSlice 实现了核心的滑动窗口：传入对方已确认的 Ack，返回当前应发的数据及对应的 Seq
+			upData, currentSeq := virtualConn.writeBuf.GetSlice(ackedByServer, 32768)
 
 			req, _ := http.NewRequest(http.MethodPost, reqURL, bytes.NewReader(upData))
 			req.ContentLength = int64(len(upData))
@@ -506,37 +536,47 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 			req.Header.Set("X-Target", targetAddr)
 			req.Header.Set("X-Network", network)
 			req.Header.Set("X-Session-ID", sessionID)
+
+			// 将 Seq 和 Ack 写入 HTTP 头
+			req.Header.Set("X-Seq", strconv.FormatUint(currentSeq, 10))
+
+			virtualConn.readCond.L.Lock()
+			myAck := virtualConn.nextReadSeq
+			virtualConn.readCond.L.Unlock()
+			req.Header.Set("X-Ack", strconv.FormatUint(myAck, 10))
 			req.Header.Set("Content-Type", "application/octet-stream")
 
 			resp, err := client.Do(req)
 
 			if err != nil {
-				// 数据抢救
-				if len(upData) > 0 {
-					virtualConn.putWriteBufFront(upData)
-				}
-
-				consecutiveErrors++
-				if consecutiveErrors > 5 {
-					// 连续 5 次失败（约 3 秒），直接熔断释放，防止永远挂起产生死锁！
-					logger.Error("❌ [Client] 连接严重超时, 触发熔断保护", zap.String("session", sessionID))
-					break
-				}
+				// 请求失败不需做“数据抢救”，因为数据依然安全保存在 writeBuf 中。
+				// 下一次循环由于 ackedByServer 没有推进，GetSlice 会自动重传这部分数据。
+				logger.Debug("HTTP 轮询失败，触发自动重传", zap.Error(err))
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 
-			// 成功则重置错误计数
-			consecutiveErrors = 0
+			// 更新服务端的 Ack (决定我们下次滑动窗口推多远)
+			if sAckStr := resp.Header.Get("X-Ack"); sAckStr != "" {
+				sAck, _ := strconv.ParseUint(sAckStr, 10, 64)
+				if sAck > ackedByServer {
+					ackedByServer = sAck
+				}
+			}
+
+			// 处理服务端的 Seq 及其数据
+			sSeqStr := resp.Header.Get("X-Seq")
+			sSeq, _ := strconv.ParseUint(sSeqStr, 10, 64)
+
 			downData, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
-			if len(downData) > 0 {
-				virtualConn.putReadBuf(downData)
+			if len(downData) > 0 || sSeqStr != "" {
+				virtualConn.PutReadData(sSeq, downData)
 			}
 
-			if len(upData) == 0 && len(downData) == 0 && !virtualConn.HasWriteData() {
-				time.Sleep(10 * time.Millisecond)
+			if len(upData) == 0 && len(downData) == 0 && virtualConn.writeBuf.Len() == 0 {
+				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}()
@@ -545,7 +585,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 }
 
 // ==========================================
-// 5. 服务端 Listener
+// 6. 服务端 Listener (整合滑动窗口)
 // ==========================================
 
 var (
@@ -576,6 +616,7 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 	if err != nil {
 		return nil, err
 	}
+
 	xl := &XHTTPListener{connCh: make(chan *xhttpFramedConn, 256), ln: ln, expectedToken: token}
 
 	cleanerOnce.Do(func() {
@@ -635,26 +676,36 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 			meekMutex.Unlock()
 		}
 
+		// 1. 处理上行请求 (包含 Seq 和 Ack)
+		cSeq, _ := strconv.ParseUint(r.Header.Get("X-Seq"), 10, 64)
+		cAck, _ := strconv.ParseUint(r.Header.Get("X-Ack"), 10, 64)
+
 		upData, _ := io.ReadAll(r.Body)
 		r.Body.Close()
-		if len(upData) > 0 {
-			vConn.putReadBuf(upData)
-		}
 
+		// 写入数据并获取服务端的确认号 (我的期望读指针)
+		myUpAck := vConn.PutReadData(cSeq, upData)
+
+		// 2. 准备下行数据
+		// 只有当接收到有效心跳或数据时，才进行延迟回包优化
 		var downData []byte
+		var myDownSeq uint64
+
 		if len(upData) > 0 {
-			downData = vConn.takeWriteBuf(65536)
+			downData, myDownSeq = vConn.writeBuf.GetSlice(cAck, 65536)
 		} else {
 			startWait := time.Now()
 			for {
-				downData = vConn.takeWriteBuf(65536)
-				if downData != nil || time.Since(startWait) > 100*time.Millisecond || vConn.closed {
+				downData, myDownSeq = vConn.writeBuf.GetSlice(cAck, 65536)
+				if len(downData) > 0 || time.Since(startWait) > 100*time.Millisecond || vConn.closed {
 					break
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
 		}
 
+		w.Header().Set("X-Ack", strconv.FormatUint(myUpAck, 10))
+		w.Header().Set("X-Seq", strconv.FormatUint(myDownSeq, 10))
 		w.Header().Set("Content-Length", strconv.Itoa(len(downData)))
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
@@ -684,17 +735,18 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 }
 
 // ==========================================
-// 6. 主逻辑与路由
+// 7. 主逻辑与路由
 // ==========================================
 
 func main() {
 	mode := flag.String("mode", "", "client or server")
-	listen := flag.String("listen", "127.0.0.1:1080", "Listen addr")
+	listen := flag.String("listen", "127.0.0.1:1080 (Server) tcp://127.0.0.1:1080 (Client)", "Listen addr")
 	serverURLFlag := flag.String("server", "https://abc.com/stream", "Server URL")
 	forward := flag.String("forward", "8.8.8.8:53", "Forward target")
 	defaultTarget := flag.String("default-target", "tcp://127.0.0.1:80", "Default target")
 	psk := flag.String("psk", "my-secret-token", "PSK")
 	sniFlag := flag.String("sni", "", "Custom TLS SNI")
+	path := flag.String("path", "/stream", "Custom Path (Server Only)")
 	hostFlag := flag.String("host", "", "Custom HTTP Host header")
 	alpnFlag := flag.String("alpn", "auto", "Force ALPN protocol")
 	certFlag := flag.String("cert", "", "TLS Cert")
@@ -709,9 +761,9 @@ func main() {
 	if *mode == "client" {
 		runClient(*listen, *serverURLFlag, *forward, *psk, *sniFlag, *hostFlag, *alpnFlag, *dumpFlag)
 	} else if *mode == "server" {
-		runServer(*listen, "/stream", *defaultTarget, *psk, *certFlag, *keyFlag, *dumpFlag)
+		runServer(*listen, *path, *defaultTarget, *psk, *certFlag, *keyFlag, *dumpFlag)
 	} else {
-		logger.Fatal("请指定模式")
+		logger.Fatal("请指定模式: -mode client 或 -mode server")
 	}
 }
 
@@ -782,7 +834,7 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 			logger.Fatal("UDP监听失败", zap.Error(err))
 		}
 		logger.Info("🚀 Client(UDP) 启动成功")
-		// UDP逻辑保持不变...
+
 		sessionMap := make(map[string]net.Conn)
 		var mu sync.Mutex
 		buf := make([]byte, 65535)
