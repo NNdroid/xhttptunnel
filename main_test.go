@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"net"
 	"sync"
 	"testing"
@@ -26,14 +27,14 @@ func TestReliableBuffer_Logic(t *testing.T) {
 	rb.Write([]byte("hello world"))
 
 	// 2. 获取数据 (尚未确认)
-	data, seq := rb.GetSlice(0, 5)
+	data, seq, _ := rb.GetSlice(0, 5)
 	if string(data) != "hello" || seq != 0 {
 		t.Fatalf("Expected 'hello' at seq 0, got %q at %d", data, seq)
 	}
 
 	// 3. 模拟对端返回 Ack = 5 (确认收到了 'hello')
 	// 滑动窗口应该向前移动，下一次获取应返回 ' world'
-	data2, seq2 := rb.GetSlice(5, 100)
+	data2, seq2, _ := rb.GetSlice(5, 100)
 	if string(data2) != " world" || seq2 != 5 { // 注意空格
 		t.Fatalf("Expected ' worl' at seq 5, got %q at %d", data2, seq2)
 	}
@@ -156,17 +157,17 @@ func BenchmarkXHTTPFramedConn_Read(b *testing.B) {
 
 	// 预先准备好带有 Padding 的帧流注入给客户端
 	go func() {
-		// 手动模拟 xhttpFramedConn.Write 的逻辑
+		// 手动模拟 xhttpFramedConn.Write 的逻辑 (需适配全新的 6 字节头协议)
 		for {
 			chunkSize := len(payload)
-			padLen := 32 // 固定的 Padding
-			frameLen := 4 + padLen + chunkSize
+			padLen := 32                       // 固定的 Padding
+			frameLen := 6 + padLen + chunkSize // ✅ 修改点 1：6 字节头部
 			frame := make([]byte, frameLen)
 
-			frame[0] = byte(chunkSize >> 8)
-			frame[1] = byte(chunkSize)
-			frame[2] = byte(padLen >> 8)
-			frame[3] = byte(padLen)
+			// ✅ 修改点 2：使用 uint32 写入 4 字节 Payload Length
+			binary.BigEndian.PutUint32(frame[0:4], uint32(chunkSize))
+			// ✅ 修改点 3：使用 uint16 写入 2 字节 Padding Length
+			binary.BigEndian.PutUint16(frame[4:6], uint16(padLen))
 
 			_, err := client.Write(frame)
 			if err != nil {
