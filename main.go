@@ -27,7 +27,24 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
-var logger *zap.Logger
+var (
+	logger *zap.Logger
+
+	// 64KB 切片池：适配 GetSlice 的最大请求量 (Server 端请求了 65536)
+	slicePool64k = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 65536)
+			return &b
+		},
+	}
+
+	// bytes.Buffer 池：用于替代高频且昂贵的 io.ReadAll
+	bytesBufPool = sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
+)
 
 func initLogger(levelStr string) {
 	config := zap.NewProductionConfig()
@@ -132,7 +149,7 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 }
 
 // GetSlice 获取从指定偏移量开始的数据，并清理掉已被对端确认 (Ack) 的旧数据
-func (rb *reliableBuffer) GetSlice(remoteAck uint64, maxLen int) ([]byte, uint64) {
+func (rb *reliableBuffer) GetSlice(remoteAck uint64, maxLen int) ([]byte, uint64, *[]byte) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
@@ -150,7 +167,7 @@ func (rb *reliableBuffer) GetSlice(remoteAck uint64, maxLen int) ([]byte, uint64
 
 	// 2. 如果没新数据发，返回空
 	if len(rb.data) == 0 {
-		return nil, rb.baseOffset
+		return nil, rb.baseOffset, nil
 	}
 
 	// 3. 截取分片
@@ -160,9 +177,10 @@ func (rb *reliableBuffer) GetSlice(remoteAck uint64, maxLen int) ([]byte, uint64
 	}
 
 	// 高性能拷贝：防止重传时底层 Transport 竞态修改切片
-	res := make([]byte, length)
+	bufPtr := slicePool64k.Get().(*[]byte)
+	res := (*bufPtr)[:length]
 	copy(res, rb.data[:length])
-	return res, rb.baseOffset
+	return res, rb.baseOffset, bufPtr
 }
 
 func (rb *reliableBuffer) Len() int {
@@ -286,9 +304,7 @@ func newXhttpFramedConn(r io.Reader, w io.Writer, closer func() error, local, re
 func (c *xhttpFramedConn) WriteCloseFrame() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	frame := make([]byte, 4)
-	binary.BigEndian.PutUint16(frame[0:2], 0xFFFF)
-	binary.BigEndian.PutUint16(frame[2:4], 0)
+	frame := []byte{0xFF, 0xFF, 0x00, 0x00}
 	_, err := c.w.Write(frame)
 	return err
 }
@@ -523,7 +539,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 
 		for !virtualConn.closed {
 			// GetSlice 实现了核心的滑动窗口：传入对方已确认的 Ack，返回当前应发的数据及对应的 Seq
-			upData, currentSeq := virtualConn.writeBuf.GetSlice(ackedByServer, 32768)
+			upData, currentSeq, upBufPtr := virtualConn.writeBuf.GetSlice(ackedByServer, 32768)
 
 			req, _ := http.NewRequest(http.MethodPost, reqURL, bytes.NewReader(upData))
 			req.ContentLength = int64(len(upData))
@@ -549,6 +565,10 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 			resp, err := client.Do(req)
 
 			if err != nil {
+				// 归还pool
+				if upBufPtr != nil {
+					slicePool64k.Put(upBufPtr)
+				}
 				// 请求失败不需做“数据抢救”，因为数据依然安全保存在 writeBuf 中。
 				// 下一次循环由于 ackedByServer 没有推进，GetSlice 会自动重传这部分数据。
 				logger.Debug("HTTP 轮询失败，触发自动重传", zap.Error(err))
@@ -568,11 +588,20 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 			sSeqStr := resp.Header.Get("X-Seq")
 			sSeq, _ := strconv.ParseUint(sSeqStr, 10, 64)
 
-			downData, _ := io.ReadAll(resp.Body)
+			downBuf := bytesBufPool.Get().(*bytes.Buffer)
+			downBuf.Reset()
+			downBuf.ReadFrom(resp.Body)
+			downData := downBuf.Bytes()
 			resp.Body.Close()
 
 			if len(downData) > 0 || sSeqStr != "" {
 				virtualConn.PutReadData(sSeq, downData)
+			}
+			
+			// 归还pool
+			bytesBufPool.Put(downBuf)
+			if upBufPtr != nil {
+				slicePool64k.Put(upBufPtr)
 			}
 
 			if len(upData) == 0 && len(downData) == 0 && virtualConn.writeBuf.Len() == 0 {
@@ -680,23 +709,30 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 		cSeq, _ := strconv.ParseUint(r.Header.Get("X-Seq"), 10, 64)
 		cAck, _ := strconv.ParseUint(r.Header.Get("X-Ack"), 10, 64)
 
-		upData, _ := io.ReadAll(r.Body)
+		upBuf := bytesBufPool.Get().(*bytes.Buffer)
+		upBuf.Reset()
+		upBuf.ReadFrom(r.Body)
+		upData := upBuf.Bytes()
 		r.Body.Close()
 
 		// 写入数据并获取服务端的确认号 (我的期望读指针)
 		myUpAck := vConn.PutReadData(cSeq, upData)
+		
+		// 归还pool
+		bytesBufPool.Put(upBuf)
 
 		// 2. 准备下行数据
 		// 只有当接收到有效心跳或数据时，才进行延迟回包优化
 		var downData []byte
 		var myDownSeq uint64
+		var downBufPtr *[]byte
 
 		if len(upData) > 0 {
-			downData, myDownSeq = vConn.writeBuf.GetSlice(cAck, 65536)
+			downData, myDownSeq, downBufPtr = vConn.writeBuf.GetSlice(cAck, 65536)
 		} else {
 			startWait := time.Now()
 			for {
-				downData, myDownSeq = vConn.writeBuf.GetSlice(cAck, 65536)
+				downData, myDownSeq, downBufPtr = vConn.writeBuf.GetSlice(cAck, 65536)
 				if len(downData) > 0 || time.Since(startWait) > 100*time.Millisecond || vConn.closed {
 					break
 				}
@@ -711,6 +747,11 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 		w.WriteHeader(http.StatusOK)
 		if len(downData) > 0 {
 			w.Write(downData)
+		}
+		
+		// 归还pool
+		if downBufPtr != nil {
+			slicePool64k.Put(downBufPtr)
 		}
 	})
 
