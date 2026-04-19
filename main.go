@@ -31,6 +31,8 @@ var (
 	logger         *zap.Logger
 	maxsendBufSize = 900 * 1000
 	maxframeSize   = 990 * 1000
+	padPoolLen     = 64 * 1024
+	padPool        []byte
 	// 适配 GetSlice 的最大请求量 (Server 端请求了 900K)
 	sendBuf = sync.Pool{
 		New: func() interface{} {
@@ -45,6 +47,12 @@ var (
 		},
 	}
 )
+
+func init() {
+	// 随机填充池初始化
+	padPool = make([]byte, padPoolLen)
+	io.ReadFull(rand.Reader, padPool)
+}
 
 func initLogger(levelStr string) {
 	config := zap.NewProductionConfig()
@@ -337,21 +345,32 @@ func (c *xhttpFramedConn) writeSingleFrame(chunk []byte) error {
 	}
 
 	frameLen := 6 + padLenInt + chunkSize
-	if frameLen > len(c.frameBuf) {
-		c.frameBuf = make([]byte, frameLen)
+	// 判断cap是否足够
+	if frameLen > cap(c.frameBuf) {
+		// 如果 不够使用2倍扩容
+		newCap := cap(c.frameBuf) * 2
+		if newCap < frameLen {
+			newCap = frameLen
+		}
+		c.frameBuf = make([]byte, frameLen, newCap)
+	} else {
+		//  足够，直接拉伸
+		c.frameBuf = c.frameBuf[:frameLen]
 	}
-	frame := c.frameBuf[:frameLen]
-
-	binary.BigEndian.PutUint32(frame[0:4], uint32(chunkSize)) // payload length
-	binary.BigEndian.PutUint16(frame[4:6], uint16(padLenInt)) // padding length
+	//写入header
+	binary.BigEndian.PutUint32(c.frameBuf[0:4], uint32(chunkSize)) // payload length
+	binary.BigEndian.PutUint16(c.frameBuf[4:6], uint16(padLenInt)) // padding length
+	//填充padding
 	if padLenInt > 0 {
-		io.ReadFull(rand.Reader, frame[6:6+padLenInt])
+		offset := mrand.Intn(padPoolLen - padLenInt)
+		copy(c.frameBuf[6:6+padLenInt], padPool[offset:offset+padLenInt])
 	}
+	// 写入payload
 	if chunkSize > 0 {
-		copy(frame[6+padLenInt:], chunk)
+		copy(c.frameBuf[6+padLenInt:], chunk)
 	}
 
-	_, err := c.w.Write(frame)
+	_, err := c.w.Write(c.frameBuf)
 	return err
 }
 
@@ -380,7 +399,7 @@ func (c *xhttpFramedConn) Write(p []byte) (int, error) {
 }
 
 func (c *xhttpFramedConn) Read(p []byte) (int, error) {
-	if len(c.readBuf) > 0 {
+	if len(c.readBuf) > 0 { // 没有len信息，所以readBuf有就直接返回
 		n := copy(p, c.readBuf)
 		c.readBuf = c.readBuf[n:]
 		return n, nil
@@ -392,12 +411,17 @@ func (c *xhttpFramedConn) Read(p []byte) (int, error) {
 		rawPayloadLen := binary.BigEndian.Uint32(c.hdrBuf[0:4])
 		padLen := int(binary.BigEndian.Uint16(c.hdrBuf[4:6]))
 
+		// 直接复用 c.payloadBuf 当作“垃圾桶”来接收 padding
 		if padLen > 0 {
-			if _, err := io.CopyN(io.Discard, c.r, int64(padLen)); err != nil {
+			if padLen > cap(c.payloadBuf) {
+				c.payloadBuf = make([]byte, padLen)
+			}
+			if _, err := io.ReadFull(c.r, c.payloadBuf[:padLen]); err != nil {
 				return 0, err
 			}
 		}
 
+		// 处理特殊信令和空帧
 		if rawPayloadLen == uint32(0xFFFFFFFF) {
 			return 0, io.EOF
 		}
@@ -407,19 +431,34 @@ func (c *xhttpFramedConn) Read(p []byte) (int, error) {
 
 		payloadLen := int(rawPayloadLen)
 
-		if payloadLen > len(c.payloadBuf) {
-			c.payloadBuf = make([]byte, payloadLen)
+		// 计算可以直接读入 buffer `p` 的长度
+		readIntoP := payloadLen
+		if readIntoP > len(p) {
+			readIntoP = len(p) // buffer 容量有限，只能装下这么多了
 		}
-		payload := c.payloadBuf[:payloadLen]
-		if _, err := io.ReadFull(c.r, payload); err != nil {
+		// 数据直接从 io.Reader 灌入用户的 p
+		if _, err := io.ReadFull(c.r, p[:readIntoP]); err != nil {
 			return 0, err
 		}
 
-		n := copy(p, payload)
-		if n < payloadLen {
-			c.readBuf = payload[n:]
+		// 如果用户的 p 太小，剩下的 payload 必须读入内部 buffer 暂存
+		leftover := payloadLen - readIntoP
+		if leftover > 0 {
+			// 使用 cap 而不是 len 来判断，最大程度减少 make() 重新分配内存的次数
+			if leftover > cap(c.payloadBuf) {
+				c.payloadBuf = make([]byte, leftover)
+			}
+			leftoverBuf := c.payloadBuf[:leftover]
+
+			if _, err := io.ReadFull(c.r, leftoverBuf); err != nil {
+				// 如果前面给用户的 p 已经读了 readIntoP 字节，
+				// 这里哪怕断开，也应该把已读到的长度返回给上层
+				return readIntoP, err
+			}
+			// 保存这部分没被拿走的数据，供下一次 Read 消费
+			c.readBuf = leftoverBuf
 		}
-		return n, nil
+		return readIntoP, nil
 	}
 }
 
@@ -494,7 +533,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 			return firstConn, nil
 		}
 		dialMut.Unlock()
-		
+
 		// logger.Debug("⏳ [Dialer] 补充建立底层 TCP/TLS 连接...")
 		c, err := net.DialTimeout("tcp", net.JoinHostPort(serverURL.Hostname(), basePort), 10*time.Second)
 		if err != nil {
@@ -546,7 +585,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 	go func() {
 		defer virtualConn.Close()
 		defer logger.Debug("💀 客户端 HTTP 数据泵已停止", zap.String("session", sessionID))
-		
+
 		var ackedByServer uint64 // 记录服务端已经确认的 Seq
 
 		for !virtualConn.closed {
@@ -574,7 +613,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 			req.Header.Set("X-Ack", strconv.FormatUint(myAck, 10))
 			req.Header.Set("Content-Type", "application/octet-stream")
 
-			logger.Debug("📤 [Pump] 发起 HTTP 轮询请求", 
+			logger.Debug("📤 [Pump] 发起 HTTP 轮询请求",
 				zap.String("session", sessionID),
 				zap.Uint64("Client_Seq", currentSeq),
 				zap.Uint64("Client_Ack", myAck),
@@ -591,27 +630,27 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
-			
+
 			// 拦截非 200 OK 的异常状态码！
 			if resp.StatusCode != http.StatusOK {
 				if upBufPtr != nil {
 					sendBuf.Put(upBufPtr)
 				}
-				
+
 				downBuf := bytesBufPool.Get().(*bytes.Buffer)
 				downBuf.Reset()
 				downBuf.ReadFrom(resp.Body)
 				bodyErr := downBuf.Bytes()
 				resp.Body.Close()
-				
-				logger.Error("❌ [Pump] 收到异常 HTTP 状态码", 
+
+				logger.Error("❌ [Pump] 收到异常 HTTP 状态码",
 					zap.String("session", sessionID),
-					zap.Int("status", resp.StatusCode), 
+					zap.Int("status", resp.StatusCode),
 					zap.String("error_body", string(bodyErr)),
 				)
 
 				bytesBufPool.Put(downBuf)
-				time.Sleep(2 * time.Second) 
+				time.Sleep(2 * time.Second)
 				continue
 			}
 
@@ -634,7 +673,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 			downData := downBuf.Bytes()
 			resp.Body.Close()
 
-			logger.Debug("📥 [Pump] 收到 HTTP 轮询响应", 
+			logger.Debug("📥 [Pump] 收到 HTTP 轮询响应",
 				zap.String("session", sessionID),
 				zap.Uint64("Server_Seq", sSeq),
 				zap.Uint64("Server_Ack", sAck),
@@ -717,8 +756,8 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-		logger.Debug("👀 [HTTP] 收到原始 HTTP 请求", 
-			zap.String("method", r.Method), 
+		logger.Debug("👀 [HTTP] 收到原始 HTTP 请求",
+			zap.String("method", r.Method),
 			zap.String("remote", r.RemoteAddr),
 			zap.String("session", r.Header.Get("X-Session-ID")),
 			zap.String("auth", r.Header.Get("Proxy-Authorization")),
@@ -735,7 +774,7 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 			return
 		}
 		if xl.expectedToken != "" && r.Header.Get("Proxy-Authorization") != "Bearer "+xl.expectedToken {
-			logger.Warn("❌ [HTTP] 拒绝请求: 密码错误或未授权", 
+			logger.Warn("❌ [HTTP] 拒绝请求: 密码错误或未授权",
 				zap.String("remote", r.RemoteAddr),
 				zap.String("got_token", r.Header.Get("Proxy-Authorization")),
 				zap.String("expected", "Bearer "+xl.expectedToken),
@@ -781,7 +820,7 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 		// 写入数据并获取服务端的确认号 (我的期望读指针)
 		myUpAck := vConn.PutReadData(cSeq, upData)
 
-		logger.Debug("📥 [HTTP] 解析上行请求", 
+		logger.Debug("📥 [HTTP] 解析上行请求",
 			zap.String("session", sessionID),
 			zap.Uint64("Client_Seq", cSeq),
 			zap.Uint64("Client_Ack", cAck),
@@ -803,7 +842,7 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 		} else {
 			startWait := time.Now()
 			// logger.Debug("⏳ [HTTP] 客户端为空包，触发长轮询等待下行数据...", zap.String("session", sessionID))
-			
+
 			for {
 				downData, myDownSeq, downBufPtr = vConn.writeBuf.GetSlice(cAck, maxsendBufSize)
 				if len(downData) > 0 || time.Since(startWait) > 100*time.Millisecond || vConn.closed {
@@ -811,19 +850,19 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
-			
+
 			/*
-			if time.Since(startWait) > 10*time.Millisecond {
-				logger.Debug("⌛ [HTTP] 长轮询结束", 
-					zap.String("session", sessionID), 
-					zap.Duration("wait_time", time.Since(startWait)),
-					zap.Int("Down_Bytes_Found", len(downData)),
-				)
-			}
+				if time.Since(startWait) > 10*time.Millisecond {
+					logger.Debug("⌛ [HTTP] 长轮询结束",
+						zap.String("session", sessionID),
+						zap.Duration("wait_time", time.Since(startWait)),
+						zap.Int("Down_Bytes_Found", len(downData)),
+					)
+				}
 			*/
 		}
 
-		logger.Debug("📤 [HTTP] 准备发送下行响应", 
+		logger.Debug("📤 [HTTP] 准备发送下行响应",
 			zap.String("session", sessionID),
 			zap.Uint64("Server_Seq", myDownSeq),
 			zap.Uint64("Server_Ack", myUpAck),
@@ -937,7 +976,7 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 				logger.Error("❌ Accept 接收本地连接失败", zap.Error(err))
 				continue
 			}
-			
+
 			go func() {
 				defer conn.Close()
 				connID := generateRandomHex(4)
@@ -965,13 +1004,13 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 					} else {
 						logger.Debug("🛑 [TCP] 上行转发 (Local->Server) 正常结束", zap.String("id", connID), zap.Int64("bytes", n))
 					}
-					
+
 					if xfc, ok := xc.(*xhttpFramedConn); ok {
 						xfc.WriteCloseFrame()
 					}
 					clientConn.Close()
 				}()
-				
+
 				// 下行：XHTTP Server -> Local Client
 				n, err := io.Copy(clientConn, xc)
 				if err != nil && err != io.EOF {
@@ -992,7 +1031,7 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 		sessionMap := make(map[string]net.Conn)
 		var mu sync.Mutex
 		buf := make([]byte, 65535)
-		
+
 		for {
 			n, cAddr, err := pc.ReadFrom(buf)
 			if err != nil {
@@ -1005,7 +1044,7 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 			if !exists {
 				connID := generateRandomHex(4)
 				logger.Debug("🔌 [UDP] 发现新本地客户端，准备建立隧道", zap.String("id", connID), zap.String("client", cAddr.String()))
-				
+
 				xc, err = DialXHTTP(serverURL, cfg, forwardTarget, "udp")
 				if err != nil {
 					logger.Error("❌ [UDP] XHTTP 隧道拨号失败", zap.String("id", connID), zap.Error(err))
@@ -1013,19 +1052,19 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 					continue
 				}
 				logger.Debug("✅ [UDP] XHTTP 隧道拨号成功", zap.String("id", connID))
-				
+
 				sessionMap[cAddr.String()] = xc
-				
+
 				// 下行：XHTTP Server -> Local Client (UDP)
 				go func(addr net.Addr, conn net.Conn, id string) {
 					defer conn.Close()
-					defer func() { 
+					defer func() {
 						mu.Lock()
 						delete(sessionMap, addr.String())
 						mu.Unlock()
 						logger.Debug("💀 [UDP] 本地会话清理完毕", zap.String("id", id), zap.String("client", addr.String()))
 					}()
-					
+
 					dBuf := make([]byte, 65535)
 					for {
 						l, err := readUDPFrameInto(conn, dBuf)
@@ -1043,7 +1082,7 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 				}(cAddr, xc, connID)
 			}
 			mu.Unlock()
-			
+
 			// 上行：Local Client -> XHTTP Server (UDP)
 			// logger.Debug("🔼 [UDP] 转发上行数据", zap.String("client", cAddr.String()), zap.Int("bytes", n))
 			if err := writeUDPFrame(xc, buf[:n]); err != nil {
@@ -1096,7 +1135,7 @@ func runServer(listenAddr, path, defaultTargetStr, psk, certFile, keyFile string
 
 		go func(xc *xhttpFramedConn) {
 			defer xc.Close()
-			
+
 			// 为了日志追踪，生成一个简单的短 ID
 			connID := generateRandomHex(4)
 			logger.Debug("🔌 接收到新客户端请求", zap.String("id", connID), zap.String("remote", xc.RemoteAddr().String()))
@@ -1135,14 +1174,14 @@ func runServer(listenAddr, path, defaultTargetStr, psk, certFile, keyFile string
 					} else {
 						logger.Debug("🛑 TCP 上行 (Client->Target) 正常结束", zap.String("id", connID), zap.Int64("bytes", n))
 					}
-					
+
 					if c, ok := targetConn.(interface{ CloseWrite() error }); ok {
 						c.CloseWrite()
 					} else {
 						targetConn.Close()
 					}
 				}()
-				
+
 				// 下行：Target -> Client
 				n, err := io.Copy(xc, targetConn)
 				if err != nil && err != io.EOF {
@@ -1180,7 +1219,7 @@ func runServer(listenAddr, path, defaultTargetStr, psk, certFile, keyFile string
 						rc.Write(uBuf[:n])
 					}
 				}()
-				
+
 				// 下行：Target -> Client (UDP)
 				dBuf := make([]byte, 65535)
 				for {
