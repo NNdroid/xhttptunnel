@@ -14,6 +14,17 @@ import (
 func init() {
 	logger = zap.NewNop()
 	zap.ReplaceGlobals(logger)
+
+	// 如果你的 sendBuf 是在 main.go 的 main 函数里初始化的，
+	// 跑测试时可能会因为 nil 导致 panic，这里做一个兜底初始化
+	if sendBuf.New == nil {
+		sendBuf = sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 262144) // 默认 256KB
+				return &b
+			},
+		}
+	}
 }
 
 // ==========================================
@@ -27,20 +38,23 @@ func TestReliableBuffer_Logic(t *testing.T) {
 	rb.Write([]byte("hello world"))
 
 	// 2. 获取数据 (尚未确认)
-	data, seq, _ := rb.GetSlice(0, 5)
+	// 【修复】：传入 ackedSeq=0, dispatchSeq=0, maxLen=5
+	data, seq, _ := rb.GetSlice(0, 0, 5)
 	if string(data) != "hello" || seq != 0 {
 		t.Fatalf("Expected 'hello' at seq 0, got %q at %d", data, seq)
 	}
 
 	// 3. 模拟对端返回 Ack = 5 (确认收到了 'hello')
 	// 滑动窗口应该向前移动，下一次获取应返回 ' world'
-	data2, seq2, _ := rb.GetSlice(5, 100)
+	// 【修复】：传入 ackedSeq=5, dispatchSeq=5, maxLen=100
+	data2, seq2, _ := rb.GetSlice(5, 5, 100)
 	if string(data2) != " world" || seq2 != 5 { // 注意空格
-		t.Fatalf("Expected ' worl' at seq 5, got %q at %d", data2, seq2)
+		t.Fatalf("Expected ' world' at seq 5, got %q at %d", data2, seq2)
 	}
 
 	// 4. 模拟 Ack 越界清空
-	rb.GetSlice(11, 100)
+	// 【修复】：传入 ackedSeq=11, dispatchSeq=11, maxLen=100
+	rb.GetSlice(11, 11, 100)
 	if rb.Len() != 0 {
 		t.Fatalf("Buffer should be empty, len is %d", rb.Len())
 	}
@@ -88,7 +102,8 @@ func BenchmarkReliableBuffer_WriteAndAck(b *testing.B) {
 
 		// 模拟每写一次，对端 Ack 确认了这部分数据 (完全滑动)
 		acked += uint64(len(payload))
-		rb.GetSlice(acked, 8192)
+		// 【修复】：参数对齐并发版签名
+		rb.GetSlice(acked, acked, 8192)
 	}
 }
 
@@ -118,7 +133,6 @@ func BenchmarkMeekVirtualConn_PutRead(b *testing.B) {
 }
 
 // BenchmarkXHTTPFramedConn_Write 测试带动态 Padding 和流量混淆的写出性能
-// 注意：这个测试通常会暴露 crypto/rand 生成 Padding 的 CPU 瓶颈
 func BenchmarkXHTTPFramedConn_Write(b *testing.B) {
 	client, server := net.Pipe()
 	defer client.Close()
@@ -161,12 +175,12 @@ func BenchmarkXHTTPFramedConn_Read(b *testing.B) {
 		for {
 			chunkSize := len(payload)
 			padLen := 32                       // 固定的 Padding
-			frameLen := 6 + padLen + chunkSize // ✅ 修改点 1：6 字节头部
+			frameLen := 6 + padLen + chunkSize // ✅ 使用 6 字节头部
 			frame := make([]byte, frameLen)
 
-			// ✅ 修改点 2：使用 uint32 写入 4 字节 Payload Length
+			// ✅ 使用 uint32 写入 4 字节 Payload Length
 			binary.BigEndian.PutUint32(frame[0:4], uint32(chunkSize))
-			// ✅ 修改点 3：使用 uint16 写入 2 字节 Padding Length
+			// ✅ 使用 uint16 写入 2 字节 Padding Length
 			binary.BigEndian.PutUint16(frame[4:6], uint16(padLen))
 
 			_, err := client.Write(frame)
