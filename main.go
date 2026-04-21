@@ -652,6 +652,21 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 		if protocol == "" {
 			utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos}
 			tlsConn := utls.UClient(firstConn, utlsConfig, utls.HelloChrome_Auto)
+
+			// 提前构建握手状态
+			if err := tlsConn.BuildHandshakeState(); err != nil {
+				firstConn.Close() // 必须显式关闭底层连接，防止泄露
+				return nil, fmt.Errorf("utls build handshake state failed: %w", err)
+			}
+
+			// 找到 ALPN 扩展并强行修改为 nextProtos
+			for _, ext := range tlsConn.Extensions {
+				if alpnExt, ok := ext.(*utls.ALPNExtension); ok {
+					alpnExt.AlpnProtocols = nextProtos
+					break
+				}
+			}
+
 			if err := tlsConn.Handshake(); err != nil {
 				firstConn.Close()
 				return nil, err
@@ -700,6 +715,21 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 		if isTLS {
 			utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos}
 			tlsC := utls.UClient(c, utlsConfig, utls.HelloChrome_Auto)
+
+			// 提前构建握手状态
+			if err := tlsC.BuildHandshakeState(); err != nil {
+				c.Close() // 必须显式关闭底层连接，防止泄露
+				return nil, fmt.Errorf("utls build handshake state failed: %w", err)
+			}
+
+			// 找到 ALPN 扩展并强行修改为 nextProtos
+			for _, ext := range tlsC.Extensions {
+				if alpnExt, ok := ext.(*utls.ALPNExtension); ok {
+					alpnExt.AlpnProtocols = nextProtos
+					break
+				}
+			}
+
 			if err := tlsC.Handshake(); err != nil {
 				logger.Error("❌ [Dialer] 补充 TLS 握手失败", zap.Error(err))
 				c.Close()
@@ -804,7 +834,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 						bodyReader = bytes.NewReader(upData)
 					} else {
 						// 空包轮询改用 GET，彻底绕过代理对 POST 的 411 拦截
-						method = http.MethodGet 
+						method = http.MethodGet
 						bodyReader = http.NoBody
 					}
 
@@ -819,13 +849,13 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 						q.Set("t", strconv.FormatInt(time.Now().UnixNano(), 36))
 						req.URL.RawQuery = q.Encode()
 					}
-					
+
 					// 全局防缓存头，给代理双重警告
 					req.Header.Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 					if cfg.Host != "" {
 						req.Host = cfg.Host
 					} else if cfg.SNI != "" {
-						req.Host = cfg.SNI 
+						req.Host = cfg.SNI
 					}
 					if cfg.Password != "" {
 						req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Password)
