@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -549,6 +550,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 			basePort = "80"
 		}
 	}
+	cfg.Path = serverURL.Path
 
 	var nextProtos []string
 	switch strings.ToLower(cfg.ALPN) {
@@ -560,7 +562,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 		nextProtos = []string{"h2", "http/1.1"}
 	}
 
-	// logger.Debug("⏳ 正在探测服务端底层连接...", zap.String("host", serverURL.Hostname()), zap.String("port", basePort))
+	logger.Debug("[Sniffer] ⏳ 正在探测底层连接...", zap.String("host", serverURL.Hostname()), zap.String("port", basePort))
 	firstConn, err := net.DialTimeout("tcp", net.JoinHostPort(serverURL.Hostname(), basePort), 10*time.Second)
 	if err != nil {
 		return nil, err
@@ -568,6 +570,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 
 	var protocol string
 	if isTLS {
+		// 探测支持的协议
 		utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos}
 		tlsConn := utls.UClient(firstConn, utlsConfig, utls.HelloChrome_Auto)
 		if err := tlsConn.Handshake(); err != nil {
@@ -576,10 +579,13 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 		}
 		firstConn = tlsConn
 		protocol = tlsConn.ConnectionState().NegotiatedProtocol
-		logger.Debug("✅ TLS 探测成功", zap.String("ALPN", protocol), zap.String("SNI", cfg.SNI))
+		logger.Debug("[Sniffer] ✅ TLS 探测成功", zap.String("ALPN", protocol), zap.String("SNI", cfg.SNI))
 	} else {
 		protocol = "http/1.1"
-		// logger.Debug("✅ 纯明文 HTTP 连接就绪")
+		if slices.Contains(nextProtos, "h2") {
+			protocol = "h2"
+		}
+		logger.Debug("[Sniffer] ✅ 尝试明文HTTP", zap.String("ALPN", protocol))
 	}
 
 	var dialMut sync.Mutex
@@ -593,7 +599,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 		}
 		dialMut.Unlock()
 
-		// logger.Debug("⏳ [Dialer] 补充建立底层 TCP/TLS 连接...")
+		logger.Debug("⏳ [Dialer] 补充建立底层 TCP/TLS 连接...")
 		c, err := net.DialTimeout("tcp", net.JoinHostPort(serverURL.Hostname(), basePort), 10*time.Second)
 		if err != nil {
 			logger.Error("❌ [Dialer] 补充连接建立失败", zap.Error(err))
