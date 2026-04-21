@@ -20,11 +20,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -611,7 +613,7 @@ func probeHTTP3(ctx context.Context, hostPort, sni string, timeout time.Duration
 	}
 }
 
-func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net.Conn, error) {
+func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr, network string) (net.Conn, error) {
 	isTLS := serverURL.Scheme == "https"
 	basePort := serverURL.Port()
 	if basePort == "" {
@@ -833,7 +835,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 						bodyReader = http.NoBody
 					}
 
-					req, _ := http.NewRequest(method, reqURL, bodyReader)
+					req, _ := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
 
 					if len(upData) > 0 {
 						req.ContentLength = int64(len(upData))
@@ -1047,7 +1049,7 @@ func (l *XHTTPListener) Accept() (net.Conn, error) {
 func (l *XHTTPListener) Close() error   { return l.ln.Close() }
 func (l *XHTTPListener) Addr() net.Addr { return l.ln.Addr() }
 
-func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListener, error) {
+func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile string) (*XHTTPListener, error) {
 	listenAddr = strings.TrimPrefix(listenAddr, "tcp://")
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -1056,21 +1058,27 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 
 	xl := &XHTTPListener{connCh: make(chan *xhttpFramedConn, 256), ln: ln, expectedToken: token}
 
-	// 后台清理 Goroutine
+	// 后台清理
 	cleanerOnce.Do(func() {
 		go func() {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
 			for {
-				time.Sleep(1 * time.Minute)
-				now := time.Now().Unix()
-				meekMutex.Lock()
-				for id, v := range meekSessions {
-					if now-atomic.LoadInt64(&v.lastActive) > 120 {
-						logger.Debug("🧹 [Cleaner] 发现过期会话，清理释放资源", zap.String("session", id))
-						v.Close()
-						delete(meekSessions, id)
+				select {
+				case <-ctx.Done(): // 收到退出信号，停止清理协程
+					return
+				case <-ticker.C:
+					now := time.Now().Unix()
+					meekMutex.Lock()
+					for id, v := range meekSessions {
+						if now-atomic.LoadInt64(&v.lastActive) > 120 {
+							logger.Debug("🧹 [Cleaner] 发现过期会话，清理释放资源", zap.String("session", id))
+							v.Close()
+							delete(meekSessions, id)
+						}
 					}
+					meekMutex.Unlock()
 				}
-				meekMutex.Unlock()
 			}
 		}()
 	})
@@ -1228,6 +1236,14 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 
 	server := &http.Server{IdleTimeout: 1 * time.Hour}
 
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		logger.Info("🛑 正在优雅关闭 HTTP 服务器...")
+		server.Shutdown(shutdownCtx)
+	}()
+
 	if certFile != "" && keyFile != "" {
 		// TLS 情况：启动 TCP(TLS) 服务并同时尝试启动 HTTP/3 (QUIC) UDP 服务
 		server.Handler = mux
@@ -1240,12 +1256,19 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 			}
 		}()
 
-		// HTTP/3 (QUIC) server：会在 UDP 上监听相同地址
+		// HTTP/3 (QUIC) server
 		go func() {
-			logger.Info("🔐 [Server] 尝试启动 HTTP/3 (QUIC) 服务器（需要 UDP 端口可用）", zap.String("addr", listenAddr))
-			// ListenAndServeQUIC，它只会纯粹地绑定 UDP 协议，完美避开与上面 TCP 服务的端口冲突
-			if err := http3.ListenAndServeQUIC(listenAddr, certFile, keyFile, mux); err != nil {
-				logger.Error("HTTP/3 异常退出或无法启动（可能是端口/UDP 被占用）", zap.Error(err))
+			logger.Info("🔐 [Server] 尝试启动 HTTP/3 (QUIC) 服务器", zap.String("addr", listenAddr))
+			h3Server := &http3.Server{
+				Addr:    listenAddr,
+				Handler: mux,
+			}
+			go func() {
+				<-ctx.Done()
+				h3Server.Close() // 退出时关闭 UDP监听
+			}()
+			if err := h3Server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+				logger.Error("HTTP/3 异常退出", zap.Error(err))
 			}
 		}()
 
@@ -1335,8 +1358,11 @@ func main() {
 	initLogger(*logLevelFlag)
 	defer logger.Sync()
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	if *mode == "client" {
-		runClient(*listen, *serverURLFlag, *forward, *psk, *sniFlag, *hostFlag, *alpnFlag, *dumpFlag)
+		runClient(ctx, *listen, *serverURLFlag, *forward, *psk, *sniFlag, *hostFlag, *alpnFlag, *dumpFlag)
 	} else if *mode == "server" {
 		cert, key := *certFlag, *keyFlag
 		if *selfSignFlag && (cert == "" && key == "") {
@@ -1352,13 +1378,13 @@ func main() {
 			*certFlag = cert
 			*keyFlag = key
 		}
-		runServer(*listen, *path, *defaultTarget, *psk, *certFlag, *keyFlag, *dumpFlag)
+		runServer(ctx, *listen, *path, *defaultTarget, *psk, *certFlag, *keyFlag, *dumpFlag)
 	} else {
 		logger.Fatal("请指定模式: -mode client 或 -mode server")
 	}
 }
 
-func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHost, alpn string, dump bool) {
+func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk, customSNI, customHost, alpn string, dump bool) {
 	if !strings.Contains(listenStr, "://") {
 		listenStr = "tcp://" + listenStr
 	}
@@ -1390,10 +1416,21 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 			logger.Fatal("TCP监听失败", zap.Error(err))
 		}
 		logger.Info("🚀 Client 启动成功", zap.String("addr", u.Host), zap.String("ALPN", alpn))
+		//监听退出信号，打断 ln.Accept()
+		go func() {
+			<-ctx.Done()
+			logger.Info("🛑 收到退出信号，正在关闭客户端 TCP 监听...")
+			ln.Close()
+		}()
 
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
+				// 区分是优雅退出导致的错误，还是真实的报错
+				if ctx.Err() != nil {
+					return
+				}
+
 				logger.Error("❌ Accept 接收本地连接失败", zap.Error(err))
 				continue
 			}
@@ -1404,7 +1441,7 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 				logger.Debug("🔌 [TCP] 收到本地客户端连接", zap.String("id", connID), zap.String("client", conn.RemoteAddr().String()))
 
 				logger.Debug("⏳ [TCP] 正在拨号远程 XHTTP 隧道...", zap.String("id", connID), zap.String("server", serverURL.Host))
-				xc, err := DialXHTTP(serverURL, cfg, forwardTarget, "tcp")
+				xc, err := DialXHTTP(ctx, serverURL, cfg, forwardTarget, "tcp")
 				if err != nil {
 					logger.Error("❌ [TCP] XHTTP 隧道拨号失败", zap.String("id", connID), zap.Error(err))
 					return
@@ -1448,6 +1485,12 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 			logger.Fatal("UDP监听失败", zap.Error(err))
 		}
 		logger.Info("🚀 Client(UDP) 启动成功", zap.String("addr", u.Host))
+		//监听退出信号，打断 pc.ReadFrom()
+		go func() {
+			<-ctx.Done()
+			logger.Info("🛑 收到退出信号，正在关闭客户端 UDP 监听...")
+			pc.Close()
+		}()
 
 		sessionMap := make(map[string]net.Conn)
 		var mu sync.Mutex
@@ -1456,6 +1499,10 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 		for {
 			n, cAddr, err := pc.ReadFrom(buf)
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+
 				logger.Error("❌ [UDP] 本地读取失败", zap.Error(err))
 				continue
 			}
@@ -1466,7 +1513,7 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 				connID := generateRandomHex(4)
 				logger.Debug("🔌 [UDP] 发现新本地客户端，准备建立隧道", zap.String("id", connID), zap.String("client", cAddr.String()))
 
-				xc, err = DialXHTTP(serverURL, cfg, forwardTarget, "udp")
+				xc, err = DialXHTTP(ctx, serverURL, cfg, forwardTarget, "udp")
 				if err != nil {
 					logger.Error("❌ [UDP] XHTTP 隧道拨号失败", zap.String("id", connID), zap.Error(err))
 					mu.Unlock()
@@ -1513,7 +1560,7 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 	}
 }
 
-func runServer(listenAddr, path, defaultTargetStr, psk, certFile, keyFile string, dump bool) {
+func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, certFile, keyFile string, dump bool) {
 	defURL, err := url.Parse(defaultTargetStr)
 	if err != nil {
 		logger.Fatal("解析失败", zap.Error(err))
@@ -1528,15 +1575,26 @@ func runServer(listenAddr, path, defaultTargetStr, psk, certFile, keyFile string
 		host = listenAddr
 	}
 
-	xl, err := ListenXHTTP(host, path, psk, certFile, keyFile)
+	xl, err := ListenXHTTP(ctx, host, path, psk, certFile, keyFile)
 	if err != nil {
 		logger.Fatal("Server 监听失败", zap.Error(err))
 	}
 	logger.Info("🚀 Server 启动成功", zap.String("listen", host))
+	//监听全局退出，关闭虚拟 Listener
+	go func() {
+		<-ctx.Done()
+		logger.Info("🛑 收到退出信号，停止接收新会话...")
+		xl.Close()
+	}()
 
 	for {
 		conn, err := xl.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				logger.Info("✅ 主服务已安全退出")
+				return
+			}
+
 			logger.Error("❌ Accept 接收连接失败", zap.Error(err))
 			continue
 		}
