@@ -4,24 +4,34 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
+	mbig "math/big"
 	mrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+
+	quic "github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
@@ -333,20 +343,20 @@ func (c *meekVirtualConn) SetWriteDeadline(t time.Time) error { return nil }
 // ==========================================
 
 type xhttpFramedConn struct {
-	r          io.Reader
-	w          io.Writer
-	closer     func() error
-	local      net.Addr
-	remote     net.Addr
-	targetAddr string
-	network    string
-	mu         sync.Mutex
-	readBuf    []byte
-	frameBuf   []byte
-	hdrBuf     []byte
-	payloadBuf []byte
-	closeCh    chan struct{}
-	closedFlag int32
+	r             io.Reader
+	w             io.Writer
+	closer        func() error
+	local         net.Addr
+	remote        net.Addr
+	targetAddr    string
+	network       string
+	mu            sync.Mutex
+	readBuf       []byte
+	frameBuf      []byte
+	hdrBuf        []byte
+	payloadBuf    []byte
+	closeCh       chan struct{}
+	closedFlag    int32
 	lastWriteTime int64
 }
 
@@ -354,7 +364,7 @@ func newXhttpFramedConn(r io.Reader, w io.Writer, closer func() error, local, re
 	conn := &xhttpFramedConn{
 		r: r, w: w, closer: closer, local: local, remote: remote,
 		frameBuf: make([]byte, maxframeSize), hdrBuf: make([]byte, 6), payloadBuf: make([]byte, maxsendBufSize),
-		closeCh: make(chan struct{}),
+		closeCh:       make(chan struct{}),
 		lastWriteTime: time.Now().Unix(),
 	}
 	go conn.heartbeatLoop()
@@ -378,10 +388,10 @@ func (c *xhttpFramedConn) heartbeatLoop() {
 		case <-ticker.C:
 			// 获取上次真实发送数据的时间
 			last := atomic.LoadInt64(&c.lastWriteTime)
-			
+
 			// 如果距离上次发包已经过去了 20 秒，说明连接处于绝对空闲状态
 			if time.Now().Unix()-last >= 20 {
-				c.Write(nil) // 发送空帧，这会自动触发上面的 StoreInt64 刷新时间
+				c.Write(nil) // 发送空，这会自动触发上面的 StoreInt64 刷新时间
 			}
 		case <-c.closeCh:
 			return
@@ -540,6 +550,67 @@ func (c *xhttpFramedConn) SetWriteDeadline(t time.Time) error { return nil }
 // 5. 客户端极速稳态轮询拨号器 (滑动窗口整合)
 // ==========================================
 
+// helper: 根据 cfg.ALPN 构建用于 TLS 探测/握手的 NextProtos 列表
+func buildNextProtos(alpn string) []string {
+	alpn = strings.ToLower(strings.TrimSpace(alpn))
+	switch alpn {
+	case "h1", "http/1.1":
+		return []string{"http/1.1"}
+	case "h2":
+		return []string{"h2", "http/1.1"}
+	case "h3":
+		// 针对 QUIC/HTTP3，包含常见 h3 变体以提高兼容性
+		return []string{"h3", "h3-32", "h3-31", "h3-30", "h3-29", "h2", "http/1.1"}
+	default: // auto
+		return []string{"h3", "h3-32", "h3-31", "h3-30", "h3-29", "h2", "http/1.1"}
+	}
+}
+
+// probeHTTP3: 使用 quic.DialAddr 尝试一次轻量的 QUIC/TLS 握手探测（短超时）。
+// hostPort 格式 "example.com:443"，sni 为 TLS ServerName，timeout 推荐 1500-2500ms。
+func probeHTTP3(ctx context.Context, hostPort, sni string, timeout time.Duration) (bool, error) {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         sni,
+		NextProtos:         []string{"h3", "h3-32", "h3-31", "h3-30", "h3-29"},
+	}
+
+	qconf := &quic.Config{}
+
+	logger.Debug("🔎 probeHTTP3 开始 QUIC 握手探测", zap.String("hostport", hostPort), zap.String("sni", sni), zap.Duration("timeout", timeout))
+
+	type result struct {
+		sess *quic.Conn
+		err  error
+	}
+
+	ch := make(chan result, 1)
+	go func() {
+		sess, err := quic.DialAddr(cctx, hostPort, tlsConf, qconf)
+		ch <- result{sess: sess, err: err}
+	}()
+
+	select {
+	case <-cctx.Done():
+		logger.Debug("🔎 probeHTTP3 超时/取消", zap.String("hostport", hostPort), zap.Error(cctx.Err()))
+		return false, cctx.Err()
+	case res := <-ch:
+		if res.err != nil {
+			logger.Debug("🔎 probeHTTP3 握手失败", zap.String("hostport", hostPort), zap.Error(res.err))
+			return false, res.err
+		}
+		// 握手成功，立即关闭会话释放服务端资源
+		if cerr := res.sess.CloseWithError(0, "probe done"); cerr != nil {
+			logger.Debug("🔎 probeHTTP3: CloseWithError 返回", zap.Error(cerr))
+		}
+		logger.Debug("🔎 probeHTTP3 握手成功，发现 QUIC/HTTP3 支持", zap.String("hostport", hostPort))
+		return true, nil
+	}
+}
+
 func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net.Conn, error) {
 	isTLS := serverURL.Scheme == "https"
 	basePort := serverURL.Port()
@@ -552,35 +623,56 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 	}
 	cfg.Path = serverURL.Path
 
-	var nextProtos []string
-	switch strings.ToLower(cfg.ALPN) {
-	case "h1", "http/1.1":
-		nextProtos = []string{"http/1.1"}
-	case "h2":
-		nextProtos = []string{"h2"}
-	default:
-		nextProtos = []string{"h2", "http/1.1"}
-	}
+	// 根据配置构建 NextProtos（包含 h3 变体以提高兼容性）
+	nextProtos := buildNextProtos(cfg.ALPN)
 
-	logger.Debug("[Sniffer] ⏳ 正在探测底层连接...", zap.String("host", serverURL.Hostname()), zap.String("port", basePort))
+	logger.Debug("[Sniffer] ⏳ 正在探测底层连接...", zap.String("host", serverURL.Hostname()), zap.String("port", basePort), zap.Strings("protos", nextProtos))
 	firstConn, err := net.DialTimeout("tcp", net.JoinHostPort(serverURL.Hostname(), basePort), 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	var protocol string
+	var protocol string // 空字符串表示尚未确定
 	if isTLS {
-		// 探测支持的协议
-		utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos}
-		tlsConn := utls.UClient(firstConn, utlsConfig, utls.HelloChrome_Auto)
-		if err := tlsConn.Handshake(); err != nil {
-			firstConn.Close()
-			return nil, err
+		// 优先尝试 QUIC/HTTP3 探测（仅在用户期望 h3 或 auto 时）
+		alpnPref := strings.ToLower(strings.TrimSpace(cfg.ALPN))
+		if alpnPref == "h3" || alpnPref == "auto" {
+			hostPort := net.JoinHostPort(serverURL.Hostname(), basePort) // 默认 UDP 端口与 TCP 端口相同，通常是 443
+			logger.Debug("尝试使用 QUIC/HTTP3 探测", zap.String("hostport", hostPort), zap.String("sni", cfg.SNI))
+			ok, perr := probeHTTP3(context.Background(), hostPort, cfg.SNI, 1800*time.Millisecond)
+			if ok && perr == nil {
+				protocol = "h3"
+				logger.Debug("QUIC/HTTP3 探测成功，使用 HTTP/3", zap.String("host", serverURL.Hostname()))
+			} else {
+				logger.Debug("QUIC/HTTP3 探测失败，回落至 TCP/TLS 探测", zap.String("host", serverURL.Hostname()), zap.Error(perr))
+			}
 		}
-		firstConn = tlsConn
-		protocol = tlsConn.ConnectionState().NegotiatedProtocol
-		logger.Debug("[Sniffer] ✅ TLS 探测成功", zap.String("ALPN", protocol), zap.String("SNI", cfg.SNI))
+
+		// 如果尚未确定为 h3，就继续做 TCP+TLS(uTLS) 探测以判断 h2/h1
+		if protocol == "" {
+			utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos}
+			tlsConn := utls.UClient(firstConn, utlsConfig, utls.HelloChrome_Auto)
+			if err := tlsConn.Handshake(); err != nil {
+				firstConn.Close()
+				return nil, err
+			}
+			firstConn = tlsConn
+			neg := tlsConn.ConnectionState().NegotiatedProtocol
+			if neg == "" {
+				// 未协商到 ALPN；按 nextProtos 回退到合理值
+				if slices.Contains(nextProtos, "h2") {
+					protocol = "h2"
+				} else {
+					protocol = "http/1.1"
+				}
+			} else {
+				// 有协商结果，可能是 "h2" 或 "http/1.1" 等
+				protocol = neg
+			}
+			logger.Debug("[Sniffer] ✅ TLS 探测完成", zap.String("ALPN", protocol), zap.String("SNI", cfg.SNI))
+		}
 	} else {
+		// 明文，仅尝试 http/2 via TCP (h2c) 或 http/1.1
 		protocol = "http/1.1"
 		if slices.Contains(nextProtos, "h2") {
 			protocol = "h2"
@@ -622,16 +714,32 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 	if isTLS {
 		scheme = "https"
 	}
-	reqURL := fmt.Sprintf("%s://%s%s", scheme, cfg.SNI, cfg.Path)
+	realHostPort := net.JoinHostPort(serverURL.Hostname(), basePort)
+	reqURL := fmt.Sprintf("%s://%s%s", scheme, realHostPort, cfg.Path)
 	sessionID := generateRandomHex(16)
 
 	var rt http.RoundTripper
-	if protocol == "h2" {
+	// 根据探测/配置决定使用哪类 Transport
+	if protocol == "h3" {
+		logger.Debug("🚀 [Dialer] 准备使用 HTTP/3 (QUIC) 作为传输", zap.String("session", sessionID))
+		rt = &http3.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         cfg.SNI,
+				NextProtos:         []string{"h3", "h3-32", "h3-31", "h3-30", "h3-29"},
+			},
+			QUICConfig: &quic.Config{
+				KeepAlivePeriod: 90 * time.Second,
+			},
+		}
+	} else if protocol == "h2" {
+		logger.Debug("🚀 [Dialer] 准备使用 HTTP/2 作为传输", zap.String("session", sessionID))
 		rt = &http2.Transport{
 			AllowHTTP:      true,
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) { return coreDial() },
 		}
 	} else {
+		logger.Debug("🚀 [Dialer] 准备使用 HTTP/1.1 作为传输", zap.String("session", sessionID))
 		t1 := &http.Transport{ForceAttemptHTTP2: false, MaxIdleConnsPerHost: 100, MaxConnsPerHost: 100, DisableKeepAlives: false}
 		if isTLS {
 			t1.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) { return coreDial() }
@@ -641,10 +749,10 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 		rt = t1
 	}
 
-	client := &http.Client{Transport: rt, Timeout: 15 * time.Second}
+	client := &http.Client{Transport: rt, Timeout: 90 * time.Second}
 	virtualConn := newMeekVirtualConn(sessionID, firstConn.LocalAddr(), firstConn.RemoteAddr())
 
-	logger.Debug("🚀 启动客户端 HTTP 数据泵", zap.String("session", sessionID), zap.String("target", targetAddr))
+	logger.Debug("🚀 启动客户端 HTTP 数据泵", zap.String("session", sessionID), zap.String("target", targetAddr), zap.String("transport", fmt.Sprintf("%T", rt)))
 
 	// 客户端数据泵
 	go func() {
@@ -689,10 +797,35 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 						dispatchSeq = currentSeq + uint64(len(upData))
 					}
 					windowMu.Unlock()
-					req, _ := http.NewRequest(http.MethodPost, reqURL, bytes.NewReader(upData))
-					req.ContentLength = int64(len(upData))
+					var method string
+					var bodyReader io.Reader
+					if len(upData) > 0 {
+						method = http.MethodPost
+						bodyReader = bytes.NewReader(upData)
+					} else {
+						// 空包轮询改用 GET，彻底绕过代理对 POST 的 411 拦截
+						method = http.MethodGet 
+						bodyReader = http.NoBody
+					}
+
+					req, _ := http.NewRequest(method, reqURL, bodyReader)
+
+					if len(upData) > 0 {
+						req.ContentLength = int64(len(upData))
+					} else {
+						// 由于 GET 请求极易被 CDN/代理 缓存，
+						// 必须加上随机时间戳强制穿透，保证每次都能拿到最新的下行数据
+						q := req.URL.Query()
+						q.Set("t", strconv.FormatInt(time.Now().UnixNano(), 36))
+						req.URL.RawQuery = q.Encode()
+					}
+					
+					// 全局防缓存头，给代理双重警告
+					req.Header.Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 					if cfg.Host != "" {
 						req.Host = cfg.Host
+					} else if cfg.SNI != "" {
+						req.Host = cfg.SNI 
 					}
 					if cfg.Password != "" {
 						req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Password)
@@ -708,7 +841,10 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 					// 将 Seq 和 Ack 写入 HTTP 头
 					req.Header.Set("X-Seq", strconv.FormatUint(currentSeq, 10))
 					req.Header.Set("X-Ack", strconv.FormatUint(myAck, 10))
-					req.Header.Set("Content-Type", "application/octet-stream")
+					// GET 请求绝对不能带 Content-Type，否则会被 Azure/严格代理 直接 400 拦截！
+					if len(upData) > 0 {
+						req.Header.Set("Content-Type", "application/octet-stream")
+					}
 					// 消费并清除重传信号
 					// 如果 triggerRetry 是 1，把它改成 0，并且给当前请求加上 X-Retry
 					if atomic.CompareAndSwapInt32(&triggerRetry, 1, 0) {
@@ -720,6 +856,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 						zap.Uint64("Client_Seq", currentSeq),
 						zap.Uint64("Client_Ack", myAck),
 						zap.Int("Up_Bytes", len(upData)),
+						zap.Int("worker", id),
 					)
 
 					resp, err := client.Do(req)
@@ -803,7 +940,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 					_, errBody := downBuf.ReadFrom(resp.Body)
 					downData := downBuf.Bytes()
 					resp.Body.Close()
-					
+
 					// 严格校验下行数据的完整性
 					if errBody != nil {
 						logger.Warn("⚠️ [Pump] 读取下行 Body 失败，触发安全重传", zap.Error(errBody))
@@ -811,7 +948,7 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 						if upBufPtr != nil {
 							sendBuf.Put(upBufPtr)
 						}
-						
+
 						// 触发重传机制
 						windowMu.Lock()
 						dispatchSeq = atomic.LoadUint64(&ackedByServer)
@@ -847,6 +984,12 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 		}
 		//在这里等待 8 个 Worker 退出
 		wg.Wait()
+
+		// 如果使用的是 http3.Transport，需要在退出时调用 Close
+		if rt3, ok := rt.(*http3.Transport); ok {
+			logger.Debug("🧹 [Dialer] 关闭 HTTP/3 Transport", zap.String("session", sessionID))
+			rt3.Close()
+		}
 	}()
 
 	return newXhttpFramedConn(virtualConn, virtualConn, virtualConn.Close, virtualConn.local, virtualConn.remote), nil
@@ -969,7 +1112,7 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 		_, errBody := upBuf.ReadFrom(r.Body)
 		upData := upBuf.Bytes()
 		r.Body.Close()
-		
+
 		// 如果读取 Body 报错（如 Nginx 提前切断），绝不能把残缺数据送进状态机！
 		if errBody != nil {
 			logger.Warn("⚠️ [HTTP] 读取上行 Body 失败或不完整，丢弃该包", zap.Error(errBody))
@@ -1061,21 +1204,85 @@ func ListenXHTTP(listenAddr, path, token, certFile, keyFile string) (*XHTTPListe
 	server := &http.Server{IdleTimeout: 1 * time.Hour}
 
 	if certFile != "" && keyFile != "" {
+		// TLS 情况：启动 TCP(TLS) 服务并同时尝试启动 HTTP/3 (QUIC) UDP 服务
 		server.Handler = mux
+
+		// TCP/TLS HTTP server （支持 h2）
 		go func() {
+			logger.Info("🔐 [Server] 启动 TCP(TLS) HTTP 服务器", zap.String("addr", listenAddr))
 			if err := server.ServeTLS(ln, certFile, keyFile); err != nil && err != http.ErrServerClosed {
 				logger.Fatal("TLS 异常退出", zap.Error(err))
 			}
 		}()
+
+		// HTTP/3 (QUIC) server：会在 UDP 上监听相同地址
+		go func() {
+			logger.Info("🔐 [Server] 尝试启动 HTTP/3 (QUIC) 服务器（需要 UDP 端口可用）", zap.String("addr", listenAddr))
+			// ListenAndServeQUIC，它只会纯粹地绑定 UDP 协议，完美避开与上面 TCP 服务的端口冲突
+			if err := http3.ListenAndServeQUIC(listenAddr, certFile, keyFile, mux); err != nil {
+				logger.Error("HTTP/3 异常退出或无法启动（可能是端口/UDP 被占用）", zap.Error(err))
+			}
+		}()
+
 	} else {
+		// 非 TLS 情况：保留原来的 h2c（明文 HTTP/2 over TCP）行为
 		server.Handler = h2c.NewHandler(mux, &http2.Server{IdleTimeout: 1 * time.Hour})
 		go func() {
+			logger.Info("🚀 [Server] 启动明文 HTTP (h2c) 服务器", zap.String("addr", listenAddr))
 			if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 				logger.Fatal("H2C 异常退出", zap.Error(err))
 			}
 		}()
 	}
 	return xl, nil
+}
+
+// generateSelfSignedCert 生成一个有效期为 10 年的自签名证书并保存到指定路径
+func generateSelfSignedCert(certPath, keyPath string) error {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: mbig.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"xhttptunnel-selfsigned"},
+			CommonName:   "localhost",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(time.Hour * 24 * 365 * 10), // 10 年有效期
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return err
+	}
+
+	// 写入证书文件
+	certOut, err := os.Create(certPath)
+	if err != nil {
+		return err
+	}
+	defer certOut.Close()
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
+		return err
+	}
+
+	// 写入私钥文件
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer keyOut.Close()
+	if err := pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ==========================================
@@ -1089,14 +1296,15 @@ func main() {
 	forward := flag.String("forward", "8.8.8.8:53", "Forward target")
 	defaultTarget := flag.String("default-target", "tcp://127.0.0.1:80", "Default target")
 	psk := flag.String("psk", "my-secret-token", "PSK")
-	sniFlag := flag.String("sni", "", "Custom TLS SNI")
+	sniFlag := flag.String("sni", "www.bing.com", "Custom TLS SNI")
 	path := flag.String("path", "/stream", "Custom Path (Server Only)")
-	hostFlag := flag.String("host", "", "Custom HTTP Host header")
-	alpnFlag := flag.String("alpn", "auto", "Force ALPN protocol")
+	hostFlag := flag.String("host", "www.bing.com", "Custom HTTP Host header")
+	alpnFlag := flag.String("alpn", "auto", "Force ALPN protocol (h3/h2/h1/auto)")
 	certFlag := flag.String("cert", "", "TLS Cert")
 	keyFlag := flag.String("key", "", "TLS Key")
-	logLevelFlag := flag.String("loglevel", "info", "Log level")
+	logLevelFlag := flag.String("loglevel", "debug", "Log level") // 增强默认为 debug
 	dumpFlag := flag.Bool("dump", false, "Dump Hex")
+	selfSignFlag := flag.Bool("selfsign", false, "Auto generate self-signed certificate (Server only)")
 	flag.Parse()
 
 	initLogger(*logLevelFlag)
@@ -1105,6 +1313,20 @@ func main() {
 	if *mode == "client" {
 		runClient(*listen, *serverURLFlag, *forward, *psk, *sniFlag, *hostFlag, *alpnFlag, *dumpFlag)
 	} else if *mode == "server" {
+		cert, key := *certFlag, *keyFlag
+		if *selfSignFlag && (cert == "" && key == "") {
+			cert = "cert.pem"
+			key = "key.pem"
+			// 检查文件是否已存在，不存在则生成
+			if _, err := os.Stat(cert); os.IsNotExist(err) {
+				if err := generateSelfSignedCert(cert, key); err != nil {
+					logger.Fatal("❌ 自动生成自签名证书失败", zap.Error(err))
+				}
+				logger.Info("I 已自动生成自签名证书", zap.String("cert", cert), zap.String("key", key))
+			}
+			*certFlag = cert
+			*keyFlag = key
+		}
 		runServer(*listen, *path, *defaultTarget, *psk, *certFlag, *keyFlag, *dumpFlag)
 	} else {
 		logger.Fatal("请指定模式: -mode client 或 -mode server")
@@ -1135,7 +1357,7 @@ func runClient(listenStr, serverURLStr, forwardTarget, psk, customSNI, customHos
 	}
 
 	cfg := &Config{Password: psk, Path: serverURL.Path, SNI: sni, Host: host, ALPN: alpn}
-	logger.Debug("🔧 客户端配置初始化", zap.String("SNI", cfg.SNI), zap.String("Host", cfg.Host), zap.String("Target", forwardTarget))
+	logger.Debug("🔧 客户端配置初始化", zap.String("SNI", cfg.SNI), zap.String("Host", cfg.Host), zap.String("Target", forwardTarget), zap.String("ALPN", cfg.ALPN))
 
 	if u.Scheme == "tcp" {
 		ln, err := net.Listen("tcp", u.Host)
