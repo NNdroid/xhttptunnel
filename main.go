@@ -695,16 +695,11 @@ func DialXHTTP(serverURL *url.URL, cfg *Config, targetAddr, network string) (net
 		logger.Debug("[Sniffer] ✅ 尝试明文HTTP", zap.String("ALPN", protocol))
 	}
 
-	var dialMut sync.Mutex
-	var firstConnUsed bool
+	var connConsumed atomic.Bool
 	coreDial := func() (net.Conn, error) {
-		dialMut.Lock()
-		if !firstConnUsed {
-			firstConnUsed = true
-			dialMut.Unlock()
+		if connConsumed.CompareAndSwap(false, true) {
 			return firstConn, nil
 		}
-		dialMut.Unlock()
 
 		logger.Debug("⏳ [Dialer] 补充建立底层 TCP/TLS 连接...")
 		c, err := net.DialTimeout("tcp", net.JoinHostPort(serverURL.Hostname(), basePort), 10*time.Second)
