@@ -44,6 +44,7 @@ var (
 	logger         *zap.Logger
 	maxsendBufSize = 900 * 1000
 	maxframeSize   = 990 * 1000
+	maxUDPFrameSize = 65535
 	padPoolLen     = 64 * 1024
 	padPool        []byte
 	// 适配 GetSlice 的最大请求量 (Server 端请求了 900K)
@@ -126,26 +127,48 @@ func (c *DumpConn) Write(b []byte) (int, error) {
 
 func readUDPFrameInto(r io.Reader, buf []byte) (int, error) {
 	var lenBuf [2]byte
+	// 读取 2 字节的长度头
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		return 0, err
 	}
-	length := binary.BigEndian.Uint16(lenBuf[:])
-	if int(length) > len(buf) {
-		return 0, fmt.Errorf("too large")
+	
+	length := int(binary.BigEndian.Uint16(lenBuf[:]))
+	
+	// 检查传入的 buf 是否足够大
+	if length > len(buf) {
+		return 0, fmt.Errorf("buffer too small: need %d, got %d. Stream is corrupted", length, len(buf))
 	}
-	if _, err := io.ReadFull(r, buf[:length]); err != nil {
-		return 0, err
+	
+	// 读取实际载荷
+	if length > 0 {
+		if _, err := io.ReadFull(r, buf[:length]); err != nil {
+			return 0, err
+		}
 	}
-	return int(length), nil
+	
+	// 读取成功后，打印详细的 Hex Dump
+	fmt.Printf("\n--- [UDP] ⬇️ 读取 %d 字节 ---\n%s\n", length, hex.Dump(buf[:length]))
+	
+	return length, nil
 }
 
 func writeUDPFrame(w io.Writer, payload []byte) error {
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(payload)))
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return err
+	payloadLen := len(payload)
+	
+	// 发送前，打印详细的 Hex Dump (修正了箭头方向为 ⬆️)
+	fmt.Printf("\n--- [UDP] ⬆️ 发送 %d 字节 ---\n%s\n", payloadLen, hex.Dump(payload))
+	
+	// 防御性检查
+	if payloadLen > maxUDPFrameSize {
+		return fmt.Errorf("payload too large: %d bytes (max %d)", payloadLen, maxUDPFrameSize)
 	}
-	_, err := w.Write(payload)
+
+	// 合并 Header 和 Payload
+	frame := make([]byte, 2+payloadLen)
+	binary.BigEndian.PutUint16(frame[0:2], uint16(payloadLen))
+	copy(frame[2:], payload)
+
+	_, err := w.Write(frame)
 	return err
 }
 
@@ -1039,15 +1062,72 @@ type XHTTPListener struct {
 	RequestCount  uint64
 }
 
-func (l *XHTTPListener) Accept() (net.Conn, error) {
-	conn, ok := <-l.connCh
-	if !ok {
-		return nil, fmt.Errorf("closed")
+func (l *XHTTPListener) Accept(ctx context.Context) (net.Conn, error) {
+	select {
+	case conn, ok := <-l.connCh:
+		if !ok {
+			return nil, fmt.Errorf("closed")
+		}
+		return conn, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	return conn, nil
 }
 func (l *XHTTPListener) Close() error   { return l.ln.Close() }
 func (l *XHTTPListener) Addr() net.Addr { return l.ln.Addr() }
+
+// ActiveTracker tracks active requests.
+type ActiveTracker struct {
+	wg    sync.WaitGroup
+	n     int64 // atomic
+	quiet chan struct{}
+}
+
+func NewActiveTracker() *ActiveTracker {
+	return &ActiveTracker{quiet: make(chan struct{})}
+}
+
+// Middleware returns an http.Handler wrapper.
+func (t *ActiveTracker) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&t.n, 1)
+		t.wg.Add(1)
+		defer func() {
+			t.wg.Done()
+			if atomic.AddInt64(&t.n, -1) == 0 {
+				// notify waiters that count reached 0 (non-blocking)
+				select {
+				case <-t.quiet:
+					// already closed
+				default:
+					close(t.quiet)
+				}
+			}
+		}()
+
+		// If handler respects r.Context(), it will be canceled on shutdown.
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Wait waits until active requests drop to zero or ctx is done.
+// Returns nil if zero reached, otherwise ctx.Err().
+func (t *ActiveTracker) Wait(ctx context.Context) error {
+	// Fast path
+	if atomic.LoadInt64(&t.n) == 0 {
+		return nil
+	}
+	// Wait for either quiet channel closed (count -> 0) or ctx.Done
+	select {
+	case <-t.quiet:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Optional: get current active count.
+func (t *ActiveTracker) Active() int64 { return atomic.LoadInt64(&t.n) }
 
 func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile string) (*XHTTPListener, error) {
 	listenAddr = strings.TrimPrefix(listenAddr, "tcp://")
@@ -1234,54 +1314,117 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		}
 	})
 
-	server := &http.Server{IdleTimeout: 1 * time.Hour}
 
+	tracker := NewActiveTracker()
+	// wrap your mux with the tracker middleware
+	wrapped := tracker.Middleware(mux)
+	
+	server := &http.Server{
+		IdleTimeout: 1 * time.Hour,
+		// 初始化时不设置 Handler，在下面根据条件设置，确保一定使用 wrapped
+	}
+
+	// 1. 完善 ConnState tracking
+	var (
+		connsMu sync.Mutex
+		conns   = make(map[net.Conn]struct{})
+	)
+	server.ConnState = func(c net.Conn, state http.ConnState) {
+		connsMu.Lock()
+		defer connsMu.Unlock()
+		switch state {
+		case http.StateNew:
+			conns[c] = struct{}{}
+		case http.StateClosed, http.StateHijacked:
+			delete(conns, c)
+		}
+	}
+
+	// 引入 WaitGroup 来管理所有服务器 goroutine 的生命周期
+	var wg sync.WaitGroup
+
+	// 2. 补全优雅关闭与强制关闭逻辑
+	wg.Add(1)
 	go func() {
-		<-ctx.Done()
+		defer wg.Done()
+		<-ctx.Done() // 等待外部中断信号 (如 SIGTERM)
+		logger.Info("🛑 收到退出信号，正在优雅关闭 HTTP 服务器...")
+
+		// 给服务器 5 秒钟的时间处理完现有的请求
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		logger.Info("🛑 正在优雅关闭 HTTP 服务器...")
-		server.Shutdown(shutdownCtx)
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("⚠️ 优雅关闭超时或出错，强制关闭残留的 TCP 连接...", zap.Error(err))
+			// 真正执行强制关闭操作
+			connsMu.Lock()
+			for c := range conns {
+				c.Close()
+			}
+			connsMu.Unlock()
+		} else {
+			logger.Info("✅ HTTP 服务器已优雅退出")
+		}
 	}()
 
 	if certFile != "" && keyFile != "" {
-		// TLS 情况：启动 TCP(TLS) 服务并同时尝试启动 HTTP/3 (QUIC) UDP 服务
-		server.Handler = mux
+		// HTTP/3 (QUIC) server 配置
+		h3Server := &http3.Server{
+			Addr:    listenAddr,
+			Handler: wrapped, // 修复：必须使用 wrapped 才能让中间件生效
+		}
 
-		// TCP/TLS HTTP server （支持 h2）
+		// 3. 为 TCP/TLS 服务添加 Alt-Svc 头部，引导客户端使用 HTTP/3
+		server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// quic-go 的 SetQUICHeaders 会在 Response 中写入 Alt-Svc: h3=":port"
+			_ = h3Server.SetQUICHeaders(w.Header())
+			wrapped.ServeHTTP(w, r) // 同样使用 wrapped
+		})
+
+		// 启动 TCP/TLS HTTP 服务器 （支持 h2）
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			logger.Info("🔐 [Server] 启动 TCP(TLS) HTTP 服务器", zap.String("addr", listenAddr))
+			// 注意：假设 ln 是外部传入的 net.Listener
 			if err := server.ServeTLS(ln, certFile, keyFile); err != nil && err != http.ErrServerClosed {
 				logger.Fatal("TLS 异常退出", zap.Error(err))
 			}
 		}()
 
-		// HTTP/3 (QUIC) server
+		// 启动 HTTP/3 (QUIC) 服务器
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			logger.Info("🔐 [Server] 尝试启动 HTTP/3 (QUIC) 服务器", zap.String("addr", listenAddr))
-			h3Server := &http3.Server{
-				Addr:    listenAddr,
-				Handler: mux,
-			}
-			go func() {
-				<-ctx.Done()
-				h3Server.Close() // 退出时关闭 UDP监听
-			}()
 			if err := h3Server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
 				logger.Error("HTTP/3 异常退出", zap.Error(err))
 			}
 		}()
 
+		// 监听 ctx 以关闭 HTTP/3 监听器
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ctx.Done()
+			h3Server.Close() // 退出时关闭 UDP 监听
+		}()
+
 	} else {
 		// 非 TLS 情况：保留原来的 h2c（明文 HTTP/2 over TCP）行为
-		server.Handler = h2c.NewHandler(mux, &http2.Server{IdleTimeout: 1 * time.Hour})
+		// 修复：必须使用 wrapped 包装 mux
+		server.Handler = h2c.NewHandler(wrapped, &http2.Server{IdleTimeout: 1 * time.Hour})
+		
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			logger.Info("🚀 [Server] 启动明文 HTTP (h2c) 服务器", zap.String("addr", listenAddr))
 			if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 				logger.Fatal("H2C 异常退出", zap.Error(err))
 			}
 		}()
 	}
+
 	return xl, nil
 }
 
@@ -1494,7 +1637,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 
 		sessionMap := make(map[string]net.Conn)
 		var mu sync.Mutex
-		buf := make([]byte, 65535)
+		buf := make([]byte, maxUDPFrameSize)
 
 		for {
 			n, cAddr, err := pc.ReadFrom(buf)
@@ -1533,7 +1676,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 						logger.Debug("💀 [UDP] 本地会话清理完毕", zap.String("id", id), zap.String("client", addr.String()))
 					}()
 
-					dBuf := make([]byte, 65535)
+					dBuf := make([]byte, maxUDPFrameSize)
 					for {
 						l, err := readUDPFrameInto(conn, dBuf)
 						if err != nil {
@@ -1544,7 +1687,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 							}
 							return
 						}
-						// logger.Debug("🔽 [UDP] 转发下行数据", zap.String("id", id), zap.Int("bytes", l))
+						logger.Debug("🔽 [UDP] 转发下行数据", zap.String("id", id), zap.Int("bytes", l))
 						pc.WriteTo(dBuf[:l], addr)
 					}
 				}(cAddr, xc, connID)
@@ -1552,7 +1695,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 			mu.Unlock()
 
 			// 上行：Local Client -> XHTTP Server (UDP)
-			// logger.Debug("🔼 [UDP] 转发上行数据", zap.String("client", cAddr.String()), zap.Int("bytes", n))
+			logger.Debug("🔼 [UDP] 转发上行数据", zap.String("client", cAddr.String()), zap.Int("bytes", n))
 			if err := writeUDPFrame(xc, buf[:n]); err != nil {
 				logger.Debug("⚠️ [UDP] 写入上行 Frame 失败", zap.String("client", cAddr.String()), zap.Error(err))
 			}
@@ -1588,7 +1731,7 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 	}()
 
 	for {
-		conn, err := xl.Accept()
+		conn, err := xl.Accept(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				logger.Info("✅ 主服务已安全退出")
@@ -1683,7 +1826,7 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 
 				// 上行：Client -> Target (UDP)
 				go func() {
-					uBuf := make([]byte, 65535)
+					uBuf := make([]byte, maxUDPFrameSize)
 					for {
 						n, err := readUDPFrameInto(xc, uBuf)
 						if err != nil {
@@ -1694,13 +1837,13 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 							}
 							return
 						}
-						// logger.Debug("🔼 转发 UDP 上行数据", zap.String("id", connID), zap.Int("bytes", n)) // 流量大时可注释掉
+						logger.Debug("🔼 转发 UDP 上行数据", zap.String("id", connID), zap.Int("bytes", n)) // 流量大时可注释掉
 						rc.Write(uBuf[:n])
 					}
 				}()
 
 				// 下行：Target -> Client (UDP)
-				dBuf := make([]byte, 65535)
+				dBuf := make([]byte, maxUDPFrameSize)
 				for {
 					n, err := rc.Read(dBuf)
 					if err != nil {
@@ -1711,7 +1854,7 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 						}
 						return
 					}
-					// logger.Debug("🔽 转发 UDP 下行数据", zap.String("id", connID), zap.Int("bytes", n)) // 流量大时可注释掉
+					logger.Debug("🔽 转发 UDP 下行数据", zap.String("id", connID), zap.Int("bytes", n)) // 流量大时可注释掉
 					writeUDPFrame(xc, dBuf[:n])
 				}
 			} else {
