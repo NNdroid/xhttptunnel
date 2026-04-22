@@ -125,6 +125,27 @@ func (c *DumpConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
+type DumpPacketConn struct {
+	net.PacketConn
+	Prefix string
+}
+
+func (c *DumpPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(b)
+	if n > 0 {
+		fmt.Printf("\n--- [%s] ⬇️ 从 %s 读取 %d 字节 ---\n%s\n", c.Prefix, addr.String(), n, hex.Dump(b[:n]))
+	}
+	return n, addr, err
+}
+
+func (c *DumpPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(b, addr)
+	if n > 0 {
+		fmt.Printf("\n--- [%s] ⬆️ 发送到 %s %d 字节 ---\n%s\n", c.Prefix, addr.String(), n, hex.Dump(b[:n]))
+	}
+	return n, err
+}
+
 func readUDPFrameInto(r io.Reader, buf []byte) (int, error) {
 	var lenBuf [2]byte
 	// 读取 2 字节的长度头
@@ -146,19 +167,12 @@ func readUDPFrameInto(r io.Reader, buf []byte) (int, error) {
 		}
 	}
 
-	// 读取成功后，打印详细的 Hex Dump
-	fmt.Printf("\n--- [UDP] ⬇️ 读取 %d 字节 ---\n%s\n", length, hex.Dump(buf[:length]))
-
 	return length, nil
 }
 
 func writeUDPFrame(w io.Writer, payload []byte) error {
 	payloadLen := len(payload)
 
-	// 发送前，打印详细的 Hex Dump (修正了箭头方向为 ⬆️)
-	fmt.Printf("\n--- [UDP] ⬆️ 发送 %d 字节 ---\n%s\n", payloadLen, hex.Dump(payload))
-
-	// 防御性检查
 	if payloadLen > maxUDPFrameSize {
 		return fmt.Errorf("payload too large: %d bytes (max %d)", payloadLen, maxUDPFrameSize)
 	}
@@ -1651,6 +1665,14 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 		if err != nil {
 			logger.Fatal("UDP监听失败", zap.Error(err))
 		}
+		
+		if dump {
+			pc = &DumpPacketConn{
+				PacketConn: pc,
+				Prefix:     "Client Local[UDP]",
+			}
+		}
+		
 		logger.Info("🚀 Client(UDP) 启动成功", zap.String("addr", u.Host))
 		//监听退出信号，打断 pc.ReadFrom()
 		go func() {
@@ -1744,7 +1766,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 						}
 						// 收到服务端数据，刷新活跃时间
 						atomic.StoreInt64(&session.lastActive, time.Now().Unix())
-						logger.Debug("🔽 [UDP] 转发下行数据", zap.String("id", id), zap.Int("bytes", l))
+						//logger.Debug("🔽 [UDP] 转发下行数据", zap.String("id", id), zap.Int("bytes", l))
 						pc.WriteTo(dBuf[:l], addr)
 					}
 				}(cAddr, sess, connID)
@@ -1752,7 +1774,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 			mu.Unlock()
 
 			// 上行：Local Client -> XHTTP Server (UDP)
-			logger.Debug("🔼 [UDP] 转发上行数据", zap.String("client", cAddr.String()), zap.Int("bytes", n))
+			//logger.Debug("🔼 [UDP] 转发上行数据", zap.String("client", cAddr.String()), zap.Int("bytes", n))
 			// 发送数据给服务端，刷新活跃时间
 			atomic.StoreInt64(&sess.lastActive, time.Now().Unix())
 			if err := writeUDPFrame(sess.conn, buf[:n]); err != nil {
@@ -1881,6 +1903,12 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 					return
 				}
 				defer rc.Close()
+				if dump {
+					rc = &DumpConn{
+						Conn: rc,
+						Prefix:     "Server Target[UDP] - " + connID,
+					}
+				}
 				logger.Debug("✅ UDP 目标服务连接成功", zap.String("id", connID), zap.String("target", target))
 
 				// 上行：Client -> Target (UDP)
@@ -1896,7 +1924,7 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 							}
 							return
 						}
-						logger.Debug("🔼 转发 UDP 上行数据", zap.String("id", connID), zap.Int("bytes", n)) // 流量大时可注释掉
+						//logger.Debug("🔼 转发 UDP 上行数据", zap.String("id", connID), zap.Int("bytes", n)) // 流量大时可注释掉
 						rc.Write(uBuf[:n])
 					}
 				}()
@@ -1913,7 +1941,7 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 						}
 						return
 					}
-					logger.Debug("🔽 转发 UDP 下行数据", zap.String("id", connID), zap.Int("bytes", n)) // 流量大时可注释掉
+					//logger.Debug("🔽 转发 UDP 下行数据", zap.String("id", connID), zap.Int("bytes", n)) // 流量大时可注释掉
 					writeUDPFrame(xc, dBuf[:n])
 				}
 			} else {
