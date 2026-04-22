@@ -17,13 +17,13 @@ We provide a one-click installation script that automatically installs dependenc
 ### Option 1: Fully Automatic Installation (Recommended)
 Automatically generates a random PSK key and a random 2-level Path route to enhance security:
 ```bash
-bash -c "$(curl -L [https://raw.githubusercontent.com/NNdroid/xhttptunnel/refs/heads/main/scripts/install.sh](https://raw.githubusercontent.com/NNdroid/xhttptunnel/refs/heads/main/scripts/install.sh))" @ install
+bash -c "$(curl -L https://raw.githubusercontent.com/NNdroid/xhttptunnel/refs/heads/main/scripts/install.sh)" @ install
 ```
 
 ### Option 2: Custom Parameter Installation
 Manually specify your desired PSK key and proxy path:
 ```bash
-bash -c "$(curl -L [https://raw.githubusercontent.com/NNdroid/xhttptunnel/refs/heads/main/scripts/install.sh](https://raw.githubusercontent.com/NNdroid/xhttptunnel/refs/heads/main/scripts/install.sh))" @ install --psk your_psk --path /your/path
+bash -c "$(curl -L https://raw.githubusercontent.com/NNdroid/xhttptunnel/refs/heads/main/scripts/install.sh)" @ install --psk your_psk --path /your/path
 ```
 
 > **Note:** The script also supports `uninstall` (complete removal) and `update` (updates the core program while retaining configuration) commands.
