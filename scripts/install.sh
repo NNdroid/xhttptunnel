@@ -1,5 +1,32 @@
 #!/bin/bash
 
+# ================= 全局参数解析 =================
+ACTION=""
+CUSTOM_PSK=""
+CUSTOM_PATH=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --psk)
+            CUSTOM_PSK="$2"
+            shift 2
+            ;;
+        --path)
+            CUSTOM_PATH="$2"
+            shift 2
+            ;;
+        install|uninstall|update)
+            ACTION="$1"
+            shift
+            ;;
+        *)
+            echo "错误: 未知的指令或参数 '$1'"
+            echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>]"
+            exit 1
+            ;;
+    esac
+done
+
 # ================= 全局权限检测 =================
 if [ "$(id -u)" -eq 0 ]; then
     SUDO=""
@@ -180,15 +207,27 @@ setup_xhttptunnel_env() {
         fi
     fi
 
-    # ================= 安全参数随机生成 =================
-    # 生成随机 8 位 2 层路径
-    local random_path="/$(openssl rand -hex 2)/$(openssl rand -hex 2)"
-    echo "=> 已自动生成随机 2 层路径: ${random_path}"
+    # ================= 动态应用 PSK 和 Path =================
+    local final_path
+    if [ -n "$CUSTOM_PATH" ]; then
+        final_path="$CUSTOM_PATH"
+        # 确保以 / 开头，提升容错率
+        [[ "$final_path" != /* ]] && final_path="/${final_path}"
+        echo "=> 使用指定的路径: ${final_path}"
+    else
+        final_path="/$(openssl rand -hex 2)/$(openssl rand -hex 2)"
+        echo "=> 已自动生成随机 2 层路径: ${final_path}"
+    fi
 
-    # 生成随机 12 位 PSK (6 bytes = 12 hex chars)
-    local random_psk=$(openssl rand -hex 6)
-    echo "=> 已自动生成随机 12 位 PSK 密钥: ${random_psk}"
-    # ====================================================
+    local final_psk
+    if [ -n "$CUSTOM_PSK" ]; then
+        final_psk="$CUSTOM_PSK"
+        echo "=> 使用指定的 PSK: ${final_psk}"
+    else
+        final_psk=$(openssl rand -hex 6)
+        echo "=> 已自动生成随机 12 位 PSK 密钥: ${final_psk}"
+    fi
+    # ========================================================
 
     echo "=> 正在写入 systemd 服务文件到: $SERVICE_PATH"
     
@@ -201,7 +240,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/xhttptunnel -mode server -default-target tcp://127.0.0.1:22 -listen :443 -path ${random_path} -cert /usr/local/etc/xhttptunnel/crt.crt -key /usr/local/etc/xhttptunnel/crt.key -psk ${random_psk} -loglevel warn
+ExecStart=/usr/local/bin/xhttptunnel -mode server -default-target tcp://127.0.0.1:22 -listen :443 -path ${final_path} -cert /usr/local/etc/xhttptunnel/crt.crt -key /usr/local/etc/xhttptunnel/crt.key -psk ${final_psk} -loglevel warn
 
 Restart=on-failure
 RestartSec=5s
@@ -224,8 +263,8 @@ EOF
     echo "======================================================"
     echo "=> xhttptunnel 基础环境已配置完成！"
     echo "=> 【重要】请记录以下信息用于客户端配置："
-    echo "   随机路径: ${random_path}"
-    echo "   PSK 密钥: ${random_psk}"
+    echo "   当前路径: ${final_path}"
+    echo "   PSK 密钥: ${final_psk}"
     echo "------------------------------------------------------"
     echo "=> 常用操作命令："
     echo "   启动服务: $SUDO systemctl start xhttptunnel"
@@ -266,15 +305,15 @@ clear_xhttptunnel_env() {
 }
 
 # ================= 主程序入口 =================
-if [ -z "$1" ]; then
-    echo "用法: bash $0 {install|uninstall|update}"
+if [ -z "$ACTION" ]; then
+    echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>]"
     echo "  install   - 安装依赖、下载最新版本、配置证书和服务，并启动"
     echo "  uninstall - 停止服务、删除二进制文件、清理证书和配置"
     echo "  update    - 安装依赖、停止当前服务、更新二进制文件并重启服务"
     exit 1
 fi
 
-case "$1" in
+case "$ACTION" in
     install)
         echo "======================================================"
         echo "=> 开始执行安装流程..."
@@ -328,8 +367,8 @@ case "$1" in
         ;;
         
     *)
-        echo "错误：未知的指令 '$1'"
-        echo "用法: bash $0 {install|uninstall|update}"
+        echo "错误：未知的指令 '$ACTION'"
+        echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>]"
         exit 1
         ;;
 esac
