@@ -41,12 +41,12 @@ import (
 )
 
 var (
-	logger         *zap.Logger
-	maxsendBufSize = 900 * 1000
-	maxframeSize   = 990 * 1000
+	logger          *zap.Logger
+	maxsendBufSize  = 900 * 1000
+	maxframeSize    = 990 * 1000
 	maxUDPFrameSize = 65535
-	padPoolLen     = 64 * 1024
-	padPool        []byte
+	padPoolLen      = 64 * 1024
+	padPool         []byte
 	// 适配 GetSlice 的最大请求量 (Server 端请求了 900K)
 	sendBuf = sync.Pool{
 		New: func() interface{} {
@@ -131,33 +131,33 @@ func readUDPFrameInto(r io.Reader, buf []byte) (int, error) {
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		return 0, err
 	}
-	
+
 	length := int(binary.BigEndian.Uint16(lenBuf[:]))
-	
+
 	// 检查传入的 buf 是否足够大
 	if length > len(buf) {
 		return 0, fmt.Errorf("buffer too small: need %d, got %d. Stream is corrupted", length, len(buf))
 	}
-	
+
 	// 读取实际载荷
 	if length > 0 {
 		if _, err := io.ReadFull(r, buf[:length]); err != nil {
 			return 0, err
 		}
 	}
-	
+
 	// 读取成功后，打印详细的 Hex Dump
 	fmt.Printf("\n--- [UDP] ⬇️ 读取 %d 字节 ---\n%s\n", length, hex.Dump(buf[:length]))
-	
+
 	return length, nil
 }
 
 func writeUDPFrame(w io.Writer, payload []byte) error {
 	payloadLen := len(payload)
-	
+
 	// 发送前，打印详细的 Hex Dump (修正了箭头方向为 ⬆️)
 	fmt.Printf("\n--- [UDP] ⬆️ 发送 %d 字节 ---\n%s\n", payloadLen, hex.Dump(payload))
-	
+
 	// 防御性检查
 	if payloadLen > maxUDPFrameSize {
 		return fmt.Errorf("payload too large: %d bytes (max %d)", payloadLen, maxUDPFrameSize)
@@ -405,8 +405,8 @@ func (c *xhttpFramedConn) WriteCloseFrame() error {
 }
 
 func (c *xhttpFramedConn) heartbeatLoop() {
-	// 巡逻周期设为 5 秒（不用频繁唤醒），但判断阈值依然是 20 秒
-	ticker := time.NewTicker(5 * time.Second)
+	// 巡逻周期设为 10 秒（不用频繁唤醒）
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -414,8 +414,8 @@ func (c *xhttpFramedConn) heartbeatLoop() {
 			// 获取上次真实发送数据的时间
 			last := atomic.LoadInt64(&c.lastWriteTime)
 
-			// 如果距离上次发包已经过去了 20 秒，说明连接处于绝对空闲状态
-			if time.Now().Unix()-last >= 20 {
+			// 如果距离上次发包已经过去了 60 秒，说明连接处于绝对空闲状态
+			if time.Now().Unix()-last >= 60 {
 				c.Write(nil) // 发送空，这会自动触发上面的 StoreInt64 刷新时间
 			}
 		case <-c.closeCh:
@@ -835,8 +835,8 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 					upData, currentSeq, upBufPtr := virtualConn.writeBuf.GetSlice(currentAck, dispatchSeq, maxsendBufSize)
 					// 空载限流
 					if len(upData) == 0 {
-						// 如果没有上行数据，只允许最多 2 个 Worker 去服务端进行长轮询
-						if atomic.LoadInt32(&emptyPollers) >= 2 {
+						// 如果没有上行数据，只允许最多 1 个 Worker 去服务端进行长轮询
+						if atomic.LoadInt32(&emptyPollers) >= 1 {
 							windowMu.Unlock()
 							time.Sleep(50 * time.Millisecond) // 其他 Worker 本地待命，不发 HTTP 请求
 							continue
@@ -1285,10 +1285,10 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			// 如果是客户端的空载心跳/拉取请求，触发长轮询等待下行数据
 			startWait := time.Now()
 			for {
-				if fetchDownData() || time.Since(startWait) > 2*time.Second || vConn.closed {
+				if fetchDownData() || time.Since(startWait) > 15*time.Second || vConn.closed {
 					break
 				}
-				time.Sleep(20 * time.Millisecond)
+				time.Sleep(50 * time.Millisecond)
 			}
 		}
 
@@ -1314,11 +1314,10 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		}
 	})
 
-
 	tracker := NewActiveTracker()
 	// wrap your mux with the tracker middleware
 	wrapped := tracker.Middleware(mux)
-	
+
 	server := &http.Server{
 		IdleTimeout: 1 * time.Hour,
 		// 初始化时不设置 Handler，在下面根据条件设置，确保一定使用 wrapped
@@ -1414,7 +1413,7 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		// 非 TLS 情况：保留原来的 h2c（明文 HTTP/2 over TCP）行为
 		// 修复：必须使用 wrapped 包装 mux
 		server.Handler = h2c.NewHandler(wrapped, &http2.Server{IdleTimeout: 1 * time.Hour})
-		
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1596,10 +1595,35 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 				if dump {
 					clientConn = &DumpConn{Conn: conn, Prefix: "Client Local - " + connID}
 				}
+				
+				// 只要客户端 5 分钟不发数据，我们就主动断掉这个 TCP 连接，释放背后的 HTTP 轮询资源
+				clientConn.SetDeadline(time.Now().Add(5 * time.Minute))
 
 				// 上行：Local Client -> XHTTP Server
 				go func() {
-					n, err := io.Copy(xc, clientConn)
+					// 每次拷贝数据时，动态刷新存活时间
+					buf := make([]byte, 32*1024)
+					var written int64
+					for {
+						nr, er := clientConn.Read(buf)
+						if nr > 0 {
+							clientConn.SetDeadline(time.Now().Add(5 * time.Minute)) // 有数据，续命 5 分钟
+							nw, ew := xc.Write(buf[:nr])
+							if nw > 0 {
+								written += int64(nw)
+							}
+							if ew != nil {
+								err = ew
+								break
+							}
+						}
+						if er != nil {
+							err = er
+							break
+						}
+					}
+					n := written
+
 					if err != nil && err != io.EOF {
 						logger.Debug("⚠️ [TCP] 上行转发 (Local->Server) 异常结束", zap.String("id", connID), zap.Int64("bytes", n), zap.Error(err))
 					} else {
@@ -1635,8 +1659,37 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 			pc.Close()
 		}()
 
-		sessionMap := make(map[string]net.Conn)
+		type udpSession struct {
+			conn       net.Conn
+			lastActive int64
+		}
+		sessionMap := make(map[string]*udpSession)
 		var mu sync.Mutex
+		
+		// 启动本地 UDP 僵尸会话清理协程 (每 5 秒巡查一次)
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					now := time.Now().Unix()
+					mu.Lock()
+					for addr, sess := range sessionMap {
+						// 如果一个 UDP 会话 30 秒没有收发数据，直接断开隧道
+						if now-atomic.LoadInt64(&sess.lastActive) > 30 {
+							logger.Debug("🧹 [UDP] 清理长时间空闲的本地 UDP 会话", zap.String("client", addr))
+							sess.conn.Close() // 这会通知内部的数据泵退出
+							delete(sessionMap, addr)
+						}
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+
 		buf := make([]byte, maxUDPFrameSize)
 
 		for {
@@ -1651,12 +1704,12 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 			}
 
 			mu.Lock()
-			xc, exists := sessionMap[cAddr.String()]
+			sess, exists := sessionMap[cAddr.String()]
 			if !exists {
 				connID := generateRandomHex(4)
 				logger.Debug("🔌 [UDP] 发现新本地客户端，准备建立隧道", zap.String("id", connID), zap.String("client", cAddr.String()))
 
-				xc, err = DialXHTTP(ctx, serverURL, cfg, forwardTarget, "udp")
+				xc, err := DialXHTTP(ctx, serverURL, cfg, forwardTarget, "udp")
 				if err != nil {
 					logger.Error("❌ [UDP] XHTTP 隧道拨号失败", zap.String("id", connID), zap.Error(err))
 					mu.Unlock()
@@ -1664,11 +1717,13 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 				}
 				logger.Debug("✅ [UDP] XHTTP 隧道拨号成功", zap.String("id", connID))
 
-				sessionMap[cAddr.String()] = xc
+				// 创建新 Session 并记录当前时间
+				sess = &udpSession{conn: xc, lastActive: time.Now().Unix()}
+				sessionMap[cAddr.String()] = sess
 
 				// 下行：XHTTP Server -> Local Client (UDP)
-				go func(addr net.Addr, conn net.Conn, id string) {
-					defer conn.Close()
+				go func(addr net.Addr, session *udpSession, id string) {
+					defer session.conn.Close()
 					defer func() {
 						mu.Lock()
 						delete(sessionMap, addr.String())
@@ -1678,7 +1733,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 
 					dBuf := make([]byte, maxUDPFrameSize)
 					for {
-						l, err := readUDPFrameInto(conn, dBuf)
+						l, err := readUDPFrameInto(session.conn, dBuf)
 						if err != nil {
 							if err != io.EOF && !strings.Contains(err.Error(), "closed network connection") {
 								logger.Debug("⚠️ [UDP] 下行读取 Frame 失败", zap.String("id", id), zap.Error(err))
@@ -1687,16 +1742,20 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 							}
 							return
 						}
+						// 收到服务端数据，刷新活跃时间
+						atomic.StoreInt64(&session.lastActive, time.Now().Unix())
 						logger.Debug("🔽 [UDP] 转发下行数据", zap.String("id", id), zap.Int("bytes", l))
 						pc.WriteTo(dBuf[:l], addr)
 					}
-				}(cAddr, xc, connID)
+				}(cAddr, sess, connID)
 			}
 			mu.Unlock()
 
 			// 上行：Local Client -> XHTTP Server (UDP)
 			logger.Debug("🔼 [UDP] 转发上行数据", zap.String("client", cAddr.String()), zap.Int("bytes", n))
-			if err := writeUDPFrame(xc, buf[:n]); err != nil {
+			// 发送数据给服务端，刷新活跃时间
+			atomic.StoreInt64(&sess.lastActive, time.Now().Unix())
+			if err := writeUDPFrame(sess.conn, buf[:n]); err != nil {
 				logger.Debug("⚠️ [UDP] 写入上行 Frame 失败", zap.String("client", cAddr.String()), zap.Error(err))
 			}
 		}
