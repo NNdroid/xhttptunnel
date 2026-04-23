@@ -187,80 +187,157 @@ func writeUDPFrame(w io.Writer, payload []byte) error {
 }
 
 // ==========================================
-// 2. 高性能可靠传输缓冲区 (Seq/Ack 机制)
+// 1. 高性能可靠傳輸環形緩衝區 (Ring Buffer + Seq/Ack)
 // ==========================================
 
 type reliableBuffer struct {
-	mu         sync.RWMutex
-	data       []byte // 原始数据缓冲区
-	baseOffset uint64 // 当前 data[0] 对应的绝对偏移量 (Seq)
+	mu         sync.Mutex // RWMutex 在這種頻繁更新狀態的場景下沒有優勢，統一使用 Mutex 最安全
+	cond       *sync.Cond
+	buf        []byte // 預先分配的固定大小陣列，永不擴容
+	head       int    // 寫入游標
+	tail       int    // 讀取/清理游標
+	count      int    // 緩衝區內目前的有效資料長度
+	baseOffset uint64 // tail 所對應的絕對網路序號 (Seq)
+	maxSize    int
+	closed     bool
+}
+
+func newReliableBuffer(maxSize int) *reliableBuffer {
+	rb := &reliableBuffer{
+		maxSize: maxSize,
+		buf:     make([]byte, maxSize), // 🚀 一次性分配 4MB，程式運行期間不再產生 GC
+	}
+	// 將 Cond 綁定到內部的 Mutex，避免原代碼中雙重鎖的潛在死結風險
+	rb.cond = sync.NewCond(&rb.mu)
+	return rb
 }
 
 func (rb *reliableBuffer) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	rb.data = append(rb.data, p...)
-	return len(p), nil
+
+	written := 0
+	pLen := len(p)
+
+	// 如果資料大於可用空間，分批阻塞寫入
+	for written < pLen {
+		for rb.count >= rb.maxSize && !rb.closed {
+			rb.cond.Wait() // 滿了就釋放鎖並等待 (Backpressure)
+		}
+		if rb.closed {
+			return written, io.ErrClosedPipe
+		}
+
+		avail := rb.maxSize - rb.count
+		toWrite := pLen - written
+		if toWrite > avail {
+			toWrite = avail // 這次只能寫入剩下能容納的大小
+		}
+
+		// 🚀 核心環形寫入邏輯
+		firstPart := rb.maxSize - rb.head
+		if toWrite <= firstPart {
+			// 一次性寫入不用繞回頭
+			copy(rb.buf[rb.head:], p[written:written+toWrite])
+			rb.head = (rb.head + toWrite) % rb.maxSize
+		} else {
+			// 空間跨越了陣列尾端，需要分兩段寫入繞回頭部
+			copy(rb.buf[rb.head:], p[written:written+firstPart])
+			copy(rb.buf[0:], p[written+firstPart:written+toWrite])
+			rb.head = toWrite - firstPart
+		}
+
+		rb.count += toWrite
+		written += toWrite
+	}
+
+	return written, nil
 }
 
-// GetSlice 获取从指定偏移量开始的数据，并清理掉已被对端确认 (Ack) 的旧数据
+// GetSlice 獲取從指定偏移量開始的資料，並清理掉已被對端確認 (Ack) 的舊資料
 func (rb *reliableBuffer) GetSlice(remoteAck uint64, dispatchSeq uint64, maxLen int) ([]byte, uint64, *[]byte) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	// 1. 清理对端已经确认收到的数据
+	// 1. 清理對端已經確認收到的資料 (推進 tail 游標)
+	freed := false
 	if remoteAck > rb.baseOffset {
-		skip := remoteAck - rb.baseOffset
-		if skip <= uint64(len(rb.data)) {
-			rb.data = rb.data[skip:]
-			rb.baseOffset = remoteAck
-
-			// 【惰性緊縮】：如果底層陣列膨脹超過 4MB 且空間浪費過半，才真正釋放記憶體
-			if cap(rb.data) > 4*1024*1024 && len(rb.data) < cap(rb.data)/2 {
-				newData := make([]byte, len(rb.data))
-				copy(newData, rb.data)
-				rb.data = newData
-			}
-		} else {
-			rb.data = nil
-			rb.baseOffset = remoteAck
+		skip := int(remoteAck - rb.baseOffset)
+		// 防禦性編程：防止錯誤的 Ack 導致越界
+		if skip > rb.count {
+			skip = rb.count
+		}
+		if skip > 0 {
+			rb.tail = (rb.tail + skip) % rb.maxSize
+			rb.count -= skip
+			rb.baseOffset += uint64(skip)
+			freed = true
 		}
 	}
 
-	// 修正派发起点：如果派发指针落后于已确认位置（说明发生了重传重置），则从当前最老的数据开始
+	// 如果騰出了空間，喚醒被阻塞的 Write
+	if freed {
+		rb.cond.Broadcast()
+	}
+
+	// 2. 修正派發起點 (發生重傳回退)
 	if dispatchSeq < rb.baseOffset {
 		dispatchSeq = rb.baseOffset
 	}
 
-	// 计算相对于当前缓冲区头部的偏移量
-	offsetInBuf := dispatchSeq - rb.baseOffset
-	if offsetInBuf >= uint64(len(rb.data)) {
-		return nil, dispatchSeq, nil // 没有新数据可以派发
+	// 計算相對於目前 baseOffset 的邏輯偏移量
+	offsetInBuf := int(dispatchSeq - rb.baseOffset)
+	if offsetInBuf >= rb.count {
+		return nil, dispatchSeq, nil // 沒有新資料可以派發
 	}
 
-	// 截取分片
-	availLen := uint64(len(rb.data)) - offsetInBuf
-	length := int(availLen)
+	// 3. 計算這次要擷取的長度
+	availLen := rb.count - offsetInBuf
+	length := availLen
 	if length > maxLen {
 		length = maxLen
 	}
 
-	// 使用内存池进行拷贝
+	// 🚀 4. 使用記憶體池獲取 Buffer，執行環形拷貝
 	bufPtr := sendBuf.Get().(*[]byte)
+	// 【安全檢查】：如果從池子裡拿出來的切片容量小於我們需要的長度，主動重新分配
+	if cap(*bufPtr) < length {
+		newBuf := make([]byte, length)
+		bufPtr = &newBuf
+	}
 	res := (*bufPtr)[:length]
-	copy(res, rb.data[offsetInBuf:offsetInBuf+uint64(length)])
 
-	// 返回：数据切片, 本次实际使用的Seq, 内存池指针
+	// 映射到實體陣列的起始位置
+	startIdx := (rb.tail + offsetInBuf) % rb.maxSize
+	firstPart := rb.maxSize - startIdx
+
+	if length <= firstPart {
+		// 連續記憶體，一次拷貝
+		copy(res, rb.buf[startIdx:startIdx+length])
+	} else {
+		// 跨越陣列尾端，分兩段拷貝拼接
+		copy(res[:firstPart], rb.buf[startIdx:startIdx+firstPart])
+		copy(res[firstPart:], rb.buf[0:length-firstPart])
+	}
+
 	return res, dispatchSeq, bufPtr
 }
 
 func (rb *reliableBuffer) Len() int {
-	rb.mu.RLock()
-	defer rb.mu.RUnlock()
-	return len(rb.data)
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return rb.count
+}
+
+func (rb *reliableBuffer) Close() {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.closed = true
+	rb.cond.Broadcast()
 }
 
 // ==========================================
@@ -291,7 +368,7 @@ func newMeekVirtualConn(sessionID string, local, remote net.Addr) *meekVirtualCo
 		local:      local,
 		remote:     remote,
 		readCond:   sync.NewCond(&sync.Mutex{}),
-		writeBuf:   &reliableBuffer{},
+		writeBuf:   newReliableBuffer(4 * 1024 * 1024),// 最大4M缓存
 		lastActive: time.Now().Unix(),
 		oooBuf:     make(map[uint64][]byte),
 	}
@@ -790,7 +867,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 				ServerName:         cfg.SNI,
-				NextProtos:         []string{"h3", "h3-32", "h3-31", "h3-30", "h3-29"},
+				NextProtos:         []string{"h3"},
 			},
 			QUICConfig: &quic.Config{
 				KeepAlivePeriod: 90 * time.Second,
@@ -816,6 +893,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 	client := &http.Client{Transport: rt, Timeout: 90 * time.Second}
 	virtualConn := newMeekVirtualConn(sessionID, firstConn.LocalAddr(), firstConn.RemoteAddr())
 
+	pumpCtx, pumpCancel := context.WithCancel(ctx)
 	logger.Debug("🚀 启动客户端 HTTP 数据泵", zap.String("session", sessionID), zap.String("target", targetAddr), zap.String("transport", fmt.Sprintf("%T", rt)))
 
 	// 客户端数据泵
@@ -872,7 +950,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 						bodyReader = http.NoBody
 					}
 
-					req, _ := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
+					req, _ := http.NewRequestWithContext(pumpCtx, method, reqURL, bodyReader)
 
 					if len(upData) > 0 {
 						req.ContentLength = int64(len(upData))
@@ -933,6 +1011,10 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 					if err != nil {
 						if upBufPtr != nil {
 							sendBuf.Put(upBufPtr)
+						}
+						if pumpCtx.Err() != nil {
+							logger.Debug("🛑 [Pump] 收到 Context 取消信號，Worker 退出", zap.Int("worker", id))
+							break
 						}
 						logger.Debug("⚠️ [Pump] HTTP 轮询失败，准备重试", zap.String("session", sessionID), zap.Error(err))
 						// 【并发核心策略】：一旦出错，重置派发游标到已确认点，触发重传
@@ -1056,7 +1138,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 		}
 	}()
 
-	return newXhttpFramedConn(virtualConn, virtualConn, virtualConn.Close, virtualConn.local, virtualConn.remote), nil
+	return newXhttpFramedConn(virtualConn, virtualConn, func() error { pumpCancel(); return virtualConn.Close(); }, virtualConn.local, virtualConn.remote), nil
 }
 
 // ==========================================
@@ -1609,7 +1691,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 				if dump {
 					clientConn = &DumpConn{Conn: conn, Prefix: "Client Local - " + connID}
 				}
-				
+
 				// 只要客户端 5 分钟不发数据，我们就主动断掉这个 TCP 连接，释放背后的 HTTP 轮询资源
 				clientConn.SetDeadline(time.Now().Add(5 * time.Minute))
 
@@ -1665,14 +1747,14 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 		if err != nil {
 			logger.Fatal("UDP监听失败", zap.Error(err))
 		}
-		
+
 		if dump {
 			pc = &DumpPacketConn{
 				PacketConn: pc,
 				Prefix:     "Client Local[UDP]",
 			}
 		}
-		
+
 		logger.Info("🚀 Client(UDP) 启动成功", zap.String("addr", u.Host))
 		//监听退出信号，打断 pc.ReadFrom()
 		go func() {
@@ -1687,7 +1769,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 		}
 		sessionMap := make(map[string]*udpSession)
 		var mu sync.Mutex
-		
+
 		// 启动本地 UDP 僵尸会话清理协程 (每 5 秒巡查一次)
 		go func() {
 			ticker := time.NewTicker(5 * time.Second)
@@ -1905,8 +1987,8 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 				defer rc.Close()
 				if dump {
 					rc = &DumpConn{
-						Conn: rc,
-						Prefix:     "Server Target[UDP] - " + connID,
+						Conn:   rc,
+						Prefix: "Server Target[UDP] - " + connID,
 					}
 				}
 				logger.Debug("✅ UDP 目标服务连接成功", zap.String("id", connID), zap.String("target", target))
