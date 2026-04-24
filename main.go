@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -18,6 +19,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
@@ -91,6 +93,7 @@ type Config struct {
 	Host     string
 	Password string
 	ALPN     string
+	CertificateFingerprint string
 }
 
 type stringAddr string
@@ -102,6 +105,54 @@ func generateRandomHex(n int) string {
 	b := make([]byte, n)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// verifyFingerprint 验证服务器证书指纹防 MITM
+func verifyFingerprint(expectedHex string) func([][]byte, [][]*x509.Certificate) error {
+	if expectedHex == "" {
+		return nil
+	}
+	expectedHex = strings.ReplaceAll(expectedHex, ":", "")
+	expectedHex = strings.ReplaceAll(expectedHex, " ", "")
+	expectedBytes, err := hex.DecodeString(expectedHex)
+	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		if err != nil {
+			return fmt.Errorf("invalid expected fingerprint format: %v", err)
+		}
+		if len(rawCerts) == 0 {
+			return fmt.Errorf("no certificates presented")
+		}
+		hash := sha256.Sum256(rawCerts[0])
+		if !bytes.Equal(hash[:], expectedBytes) {
+			return fmt.Errorf("certificate fingerprint mismatch:\nGot: %x\nExp: %x", hash, expectedBytes)
+		}
+		return nil
+	}
+}
+
+// printCertFingerprint 读取证书文件并打印 SHA-256 指纹
+func printCertFingerprint(certFile string) {
+	certPEM, err := os.ReadFile(certFile)
+	if err != nil {
+		logger.Warn("⚠️ 无法读取证书以计算指纹", zap.Error(err))
+		return
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		logger.Warn("⚠️ 无法解析证书的 PEM 块")
+		return
+	}
+	
+	hash := sha256.Sum256(block.Bytes)
+	fingerprint := strings.ToUpper(hex.EncodeToString(hash[:]))
+	
+	// 格式化为带冒号的形式 (XX:XX:XX...) 方便阅读
+	var formatted []string
+	for i := 0; i < len(fingerprint); i += 2 {
+		formatted = append(formatted, fingerprint[i:i+2])
+	}
+	
+	logger.Info("🔑 服务端证书指纹 (SHA-256)", zap.String("fingerprint", strings.Join(formatted, ":")))
 }
 
 type DumpConn struct {
@@ -675,23 +726,23 @@ func buildNextProtos(alpn string) []string {
 	case "h2":
 		return []string{"h2", "http/1.1"}
 	case "h3":
-		// 针对 QUIC/HTTP3，包含常见 h3 变体以提高兼容性
-		return []string{"h3", "h3-32", "h3-31", "h3-30", "h3-29", "h2", "http/1.1"}
+		return []string{"h3", "h2", "http/1.1"}
 	default: // auto
-		return []string{"h3", "h3-32", "h3-31", "h3-30", "h3-29", "h2", "http/1.1"}
+		return []string{"h3", "h2", "http/1.1"}
 	}
 }
 
 // probeHTTP3: 使用 quic.DialAddr 尝试一次轻量的 QUIC/TLS 握手探测（短超时）。
 // hostPort 格式 "example.com:443"，sni 为 TLS ServerName，timeout 推荐 1500-2500ms。
-func probeHTTP3(ctx context.Context, hostPort, sni string, timeout time.Duration) (bool, error) {
+func probeHTTP3(ctx context.Context, hostPort, sni string, timeout time.Duration, fingerprint string) (bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         sni,
-		NextProtos:         []string{"h3", "h3-32", "h3-31", "h3-30", "h3-29"},
+		NextProtos:         []string{"h3"},
+		VerifyPeerCertificate: verifyFingerprint(fingerprint),
 	}
 
 	qconf := &quic.Config{}
@@ -755,7 +806,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 		if alpnPref == "h3" || alpnPref == "auto" {
 			hostPort := net.JoinHostPort(serverURL.Hostname(), basePort) // 默认 UDP 端口与 TCP 端口相同，通常是 443
 			logger.Debug("尝试使用 QUIC/HTTP3 探测", zap.String("hostport", hostPort), zap.String("sni", cfg.SNI))
-			ok, perr := probeHTTP3(context.Background(), hostPort, cfg.SNI, 1800*time.Millisecond)
+			ok, perr := probeHTTP3(context.Background(), hostPort, cfg.SNI, 1800*time.Millisecond, cfg.CertificateFingerprint)
 			if ok && perr == nil {
 				protocol = "h3"
 				logger.Debug("QUIC/HTTP3 探测成功，使用 HTTP/3", zap.String("host", serverURL.Hostname()))
@@ -766,7 +817,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 
 		// 如果尚未确定为 h3，就继续做 TCP+TLS(uTLS) 探测以判断 h2/h1
 		if protocol == "" {
-			utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos}
+			utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos, VerifyPeerCertificate: verifyFingerprint(cfg.CertificateFingerprint)}
 			tlsConn := utls.UClient(firstConn, utlsConfig, utls.HelloChrome_Auto)
 
 			// 提前构建握手状态
@@ -824,7 +875,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 			return nil, err
 		}
 		if isTLS {
-			utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos}
+			utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos, VerifyPeerCertificate: verifyFingerprint(cfg.CertificateFingerprint)}
 			tlsC := utls.UClient(c, utlsConfig, utls.HelloChrome_Auto)
 
 			// 提前构建握手状态
@@ -868,6 +919,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 				InsecureSkipVerify: true,
 				ServerName:         cfg.SNI,
 				NextProtos:         []string{"h3"},
+				VerifyPeerCertificate: verifyFingerprint(cfg.CertificateFingerprint),
 			},
 			QUICConfig: &quic.Config{
 				KeepAlivePeriod: 90 * time.Second,
@@ -1225,7 +1277,7 @@ func (t *ActiveTracker) Wait(ctx context.Context) error {
 // Optional: get current active count.
 func (t *ActiveTracker) Active() int64 { return atomic.LoadInt64(&t.n) }
 
-func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile string) (*XHTTPListener, error) {
+func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile, fallbackURL string) (*XHTTPListener, error) {
 	listenAddr = strings.TrimPrefix(listenAddr, "tcp://")
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -1258,15 +1310,40 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			}
 		}()
 	})
+	
+	// 初始化 Fallback 反向代理
+	var fallbackProxy *httputil.ReverseProxy
+	if fallbackURL != "" {
+		if u, err := url.Parse(fallbackURL); err == nil {
+			fallbackProxy = httputil.NewSingleHostReverseProxy(u)
+			originalDirector := fallbackProxy.Director
+			fallbackProxy.Director = func(req *http.Request) {
+				originalDirector(req)
+				req.Host = u.Host // 覆盖 Host 头，确保目标服务器正常接受请求
+			}
+			logger.Info("🛡️ 伪装站点 (Fallback) 已启用", zap.String("target", fallbackURL))
+		} else {
+			logger.Warn("❌ 伪装站点 URL 解析失败", zap.Error(err))
+		}
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		logger.Debug("👀 [HTTP] 收到原始 HTTP 请求",
 			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
 			zap.String("remote", r.RemoteAddr),
 			zap.String("session", r.Header.Get("X-Session-ID")),
 			zap.String("auth", r.Header.Get("Proxy-Authorization")),
 		)
+		if r.URL.Path != path {
+			if fallbackProxy != nil {
+				fallbackProxy.ServeHTTP(w, r)
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
 		atomic.AddUint64(&xl.RequestCount, 1)
 
 		target := r.Header.Get("X-Target")
@@ -1591,6 +1668,8 @@ func main() {
 	logLevelFlag := flag.String("loglevel", "debug", "Log level") // 增强默认为 debug
 	dumpFlag := flag.Bool("dump", false, "Dump Hex")
 	selfSignFlag := flag.Bool("selfsign", false, "Auto generate self-signed certificate (Server only)")
+	fallbackFlag := flag.String("fallback", "", "Fallback URL for unauthorized requests (Server only, e.g., https://www.bing.com)")
+	fingerprintFlag := flag.String("fingerprint", "", "Expected server certificate SHA256 fingerprint for MITM protection (Client only)")
 	flag.Parse()
 
 	initLogger(*logLevelFlag)
@@ -1600,7 +1679,7 @@ func main() {
 	defer cancel()
 
 	if *mode == "client" {
-		runClient(ctx, *listen, *serverURLFlag, *forward, *psk, *sniFlag, *hostFlag, *alpnFlag, *dumpFlag)
+		runClient(ctx, *listen, *serverURLFlag, *forward, *psk, *sniFlag, *hostFlag, *alpnFlag, *dumpFlag, *fingerprintFlag)
 	} else if *mode == "server" {
 		cert, key := *certFlag, *keyFlag
 		if *selfSignFlag && (cert == "" && key == "") {
@@ -1616,13 +1695,16 @@ func main() {
 			*certFlag = cert
 			*keyFlag = key
 		}
-		runServer(ctx, *listen, *path, *defaultTarget, *psk, *certFlag, *keyFlag, *dumpFlag)
+		if *certFlag != "" {
+			printCertFingerprint(*certFlag)
+		}
+		runServer(ctx, *listen, *path, *defaultTarget, *psk, *certFlag, *keyFlag, *dumpFlag, *fallbackFlag)
 	} else {
 		logger.Fatal("请指定模式: -mode client 或 -mode server")
 	}
 }
 
-func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk, customSNI, customHost, alpn string, dump bool) {
+func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk, customSNI, customHost, alpn string, dump bool, fingerprint string) {
 	if !strings.Contains(listenStr, "://") {
 		listenStr = "tcp://" + listenStr
 	}
@@ -1645,8 +1727,8 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 		host = customHost
 	}
 
-	cfg := &Config{Password: psk, Path: serverURL.Path, SNI: sni, Host: host, ALPN: alpn}
-	logger.Debug("🔧 客户端配置初始化", zap.String("SNI", cfg.SNI), zap.String("Host", cfg.Host), zap.String("Target", forwardTarget), zap.String("ALPN", cfg.ALPN))
+	cfg := &Config{Password: psk, Path: serverURL.Path, SNI: sni, Host: host, ALPN: alpn, CertificateFingerprint: fingerprint}
+	logger.Debug("🔧 客户端配置初始化", zap.String("SNI", cfg.SNI), zap.String("Host", cfg.Host), zap.String("Target", forwardTarget), zap.String("ALPN", cfg.ALPN), zap.String("CertificateFingerprint", fingerprint))
 
 	if u.Scheme == "tcp" {
 		ln, err := net.Listen("tcp", u.Host)
@@ -1866,7 +1948,7 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 	}
 }
 
-func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, certFile, keyFile string, dump bool) {
+func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, certFile, keyFile string, dump bool, fallback string) {
 	defURL, err := url.Parse(defaultTargetStr)
 	if err != nil {
 		logger.Fatal("解析失败", zap.Error(err))
@@ -1881,7 +1963,7 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 		host = listenAddr
 	}
 
-	xl, err := ListenXHTTP(ctx, host, path, psk, certFile, keyFile)
+	xl, err := ListenXHTTP(ctx, host, path, psk, certFile, keyFile, fallback)
 	if err != nil {
 		logger.Fatal("Server 监听失败", zap.Error(err))
 	}
