@@ -54,6 +54,7 @@ CONFIG_DIR="/usr/local/etc/xhttptunnel"
 CERT_PATH="$CONFIG_DIR/crt.crt"
 KEY_PATH="$CONFIG_DIR/crt.key"
 SERVICE_PATH="/etc/systemd/system/xhttptunnel.service"
+RUN_USER="xhttptunnel"
 
 # ================= 依赖检查与安装 =================
 install_dependencies() {
@@ -193,6 +194,12 @@ remove_xhttptunnel() {
 setup_xhttptunnel_env() {
     echo "=> 正在配置 xhttptunnel 环境..."
 
+    # 创建独立的非特权系统用户
+    if ! id -u "$RUN_USER" >/dev/null 2>&1; then
+        echo "=> 正在创建非特权系统用户: $RUN_USER"
+        $SUDO useradd -r -s /usr/sbin/nologin "$RUN_USER"
+    fi
+
     if [ ! -d "$CONFIG_DIR" ]; then
         echo "=> 检测到配置目录不存在，正在创建: $CONFIG_DIR"
         $SUDO mkdir -p "$CONFIG_DIR"
@@ -211,6 +218,13 @@ setup_xhttptunnel_env() {
             return 1
         fi
     fi
+
+    # 设置目录和证书的所有权为 xhttptunnel 用户，限制其他用户读取私钥
+    echo "=> 设置配置文件和证书权限..."
+    $SUDO chown -R "$RUN_USER:$RUN_USER" "$CONFIG_DIR"
+    $SUDO chmod 750 "$CONFIG_DIR"
+    $SUDO chmod 644 "$CERT_PATH" 2>/dev/null || true
+    $SUDO chmod 600 "$KEY_PATH" 2>/dev/null || true
 
     # 提取证书指纹
     local cert_fingerprint=""
@@ -260,8 +274,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-ExecStart=/usr/local/bin/xhttptunnel -mode server -default-target tcp://127.0.0.1:22 -listen :443 -path ${final_path} -cert /usr/local/etc/xhttptunnel/crt.crt -key /usr/local/etc/xhttptunnel/crt.key -psk ${final_psk} -fallback ${final_fallback} -loglevel warn
+User=${RUN_USER}
+Group=${RUN_USER}
+# 允许非 root 用户绑定特权端口 (如 80, 443)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+ExecStart=/usr/local/bin/xhttptunnel server -default-target tcp://127.0.0.1:22 -listen :443 -path ${final_path} -cert /usr/local/etc/xhttptunnel/crt.crt -key /usr/local/etc/xhttptunnel/crt.key -psk ${final_psk} -fallback ${final_fallback} -loglevel warn
 
 Restart=on-failure
 RestartSec=5s
@@ -283,6 +303,7 @@ EOF
 
     echo "======================================================"
     echo "=> xhttptunnel 基础环境已配置完成！"
+    echo "=> 【安全】当前服务将以非特权用户 (${RUN_USER}) 身份运行。"
     echo "=> 【重要】请记录以下信息用于客户端配置："
     echo "   当前路径: ${final_path}"
     echo "   PSK 密钥: ${final_psk}"
@@ -322,6 +343,11 @@ clear_xhttptunnel_env() {
         $SUDO rm -rf "$CONFIG_DIR"
     else
         echo "=> 提示：配置目录已不存在 ($CONFIG_DIR)。"
+    fi
+
+    if id -u "$RUN_USER" >/dev/null 2>&1; then
+        echo "=> 正在删除非特权系统用户: $RUN_USER"
+        $SUDO userdel "$RUN_USER" 2>/dev/null || true
     fi
 
     echo "======================================================"
