@@ -4,6 +4,7 @@
 ACTION=""
 CUSTOM_PSK=""
 CUSTOM_PATH=""
+CUSTOM_FALLBACK=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -15,13 +16,17 @@ while [[ $# -gt 0 ]]; do
             CUSTOM_PATH="$2"
             shift 2
             ;;
+        --fallback)
+            CUSTOM_FALLBACK="$2"
+            shift 2
+            ;;
         install|uninstall|update)
             ACTION="$1"
             shift
             ;;
         *)
             echo "错误: 未知的指令或参数 '$1'"
-            echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>]"
+            echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>] [--fallback <URL>]"
             exit 1
             ;;
     esac
@@ -207,7 +212,14 @@ setup_xhttptunnel_env() {
         fi
     fi
 
-    # ================= 动态应用 PSK 和 Path =================
+    # 提取证书指纹
+    local cert_fingerprint=""
+    if [ -f "$CERT_PATH" ]; then
+        # 提取 SHA256 指纹，使用 cut 去掉前缀 "sha256 Fingerprint="
+        cert_fingerprint=$($SUDO openssl x509 -noout -fingerprint -sha256 -in "$CERT_PATH" | cut -d'=' -f2)
+    fi
+
+    # ================= 动态应用 PSK、Path 和 Fallback =================
     local final_path
     if [ -n "$CUSTOM_PATH" ]; then
         final_path="$CUSTOM_PATH"
@@ -227,6 +239,15 @@ setup_xhttptunnel_env() {
         final_psk=$(openssl rand -hex 6)
         echo "=> 已自动生成随机 12 位 PSK 密钥: ${final_psk}"
     fi
+
+    local final_fallback
+    if [ -n "$CUSTOM_FALLBACK" ]; then
+        final_fallback="$CUSTOM_FALLBACK"
+        echo "=> 使用指定的 Fallback 伪装站点: ${final_fallback}"
+    else
+        final_fallback="http://ec2.amazonaws.com"
+        echo "=> 使用默认的 Fallback 伪装站点: ${final_fallback}"
+    fi
     # ========================================================
 
     echo "=> 正在写入 systemd 服务文件到: $SERVICE_PATH"
@@ -240,7 +261,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/xhttptunnel -mode server -default-target tcp://127.0.0.1:22 -listen :443 -path ${final_path} -cert /usr/local/etc/xhttptunnel/crt.crt -key /usr/local/etc/xhttptunnel/crt.key -psk ${final_psk} -loglevel warn
+ExecStart=/usr/local/bin/xhttptunnel -mode server -default-target tcp://127.0.0.1:22 -listen :443 -path ${final_path} -cert /usr/local/etc/xhttptunnel/crt.crt -key /usr/local/etc/xhttptunnel/crt.key -psk ${final_psk} -fallback ${final_fallback} -loglevel warn
 
 Restart=on-failure
 RestartSec=5s
@@ -265,6 +286,10 @@ EOF
     echo "=> 【重要】请记录以下信息用于客户端配置："
     echo "   当前路径: ${final_path}"
     echo "   PSK 密钥: ${final_psk}"
+    echo "   伪装站点: ${final_fallback}"
+    if [ -n "$cert_fingerprint" ]; then
+        echo "   证书指纹: ${cert_fingerprint}"
+    fi
     echo "------------------------------------------------------"
     echo "=> 常用操作命令："
     echo "   启动服务: $SUDO systemctl start xhttptunnel"
@@ -306,7 +331,7 @@ clear_xhttptunnel_env() {
 
 # ================= 主程序入口 =================
 if [ -z "$ACTION" ]; then
-    echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>]"
+    echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>] [--fallback <URL>]"
     echo "  install   - 安装依赖、下载最新版本、配置证书和服务，并启动"
     echo "  uninstall - 停止服务、删除二进制文件、清理证书和配置"
     echo "  update    - 安装依赖、停止当前服务、更新二进制文件并重启服务"
@@ -368,7 +393,7 @@ case "$ACTION" in
         
     *)
         echo "错误：未知的指令 '$ACTION'"
-        echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>]"
+        echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>] [--fallback <URL>]"
         exit 1
         ;;
 esac

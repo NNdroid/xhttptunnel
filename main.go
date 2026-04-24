@@ -43,6 +43,7 @@ import (
 )
 
 var (
+	Version         = "dev"
 	logger          *zap.Logger
 	maxsendBufSize  = 900 * 1000
 	maxframeSize    = 990 * 1000
@@ -1653,54 +1654,90 @@ func generateSelfSignedCert(certPath, keyPath string) error {
 // ==========================================
 
 func main() {
-	mode := flag.String("mode", "", "client or server")
-	listen := flag.String("listen", "127.0.0.1:1080 (Server) tcp://127.0.0.1:1080 (Client)", "Listen addr")
-	serverURLFlag := flag.String("server", "https://abc.com/stream", "Server URL")
-	forward := flag.String("forward", "8.8.8.8:53", "Forward target")
-	defaultTarget := flag.String("default-target", "tcp://127.0.0.1:80", "Default target")
-	psk := flag.String("psk", "my-secret-token", "PSK")
-	sniFlag := flag.String("sni", "www.bing.com", "Custom TLS SNI")
-	path := flag.String("path", "/stream", "Custom Path (Server Only)")
-	hostFlag := flag.String("host", "www.bing.com", "Custom HTTP Host header")
-	alpnFlag := flag.String("alpn", "auto", "Force ALPN protocol (h3/h2/h1/auto)")
-	certFlag := flag.String("cert", "", "TLS Cert")
-	keyFlag := flag.String("key", "", "TLS Key")
-	logLevelFlag := flag.String("loglevel", "debug", "Log level") // 增强默认为 debug
-	dumpFlag := flag.Bool("dump", false, "Dump Hex")
-	selfSignFlag := flag.Bool("selfsign", false, "Auto generate self-signed certificate (Server only)")
-	fallbackFlag := flag.String("fallback", "", "Fallback URL for unauthorized requests (Server only, e.g., https://www.bing.com)")
-	fingerprintFlag := flag.String("fingerprint", "", "Expected server certificate SHA256 fingerprint for MITM protection (Client only)")
-	flag.Parse()
+	// 定义子命令集合
+	serverCmd := flag.NewFlagSet("server", flag.ExitOnError)
+	clientCmd := flag.NewFlagSet("client", flag.ExitOnError)
 
-	initLogger(*logLevelFlag)
-	defer logger.Sync()
+	// ================= 服务器端 (Server) 参数 =================
+	serverListen := serverCmd.String("listen", "127.0.0.1:1080", "Listen addr")
+	serverPath := serverCmd.String("path", "/stream", "Custom Path")
+	serverDefaultTarget := serverCmd.String("default-target", "tcp://127.0.0.1:80", "Default target")
+	serverPsk := serverCmd.String("psk", "my-secret-token", "PSK")
+	serverCert := serverCmd.String("cert", "", "TLS Cert")
+	serverKey := serverCmd.String("key", "", "TLS Key")
+	serverSelfSign := serverCmd.Bool("selfsign", false, "Auto generate self-signed certificate")
+	serverFallback := serverCmd.String("fallback", "", "Fallback URL for unauthorized requests (e.g., https://www.bing.com)")
+	serverLogLevel := serverCmd.String("loglevel", "debug", "Log level")
+	serverDump := serverCmd.Bool("dump", false, "Dump Hex")
 
+	// ================= 客户端 (Client) 参数 =================
+	clientListen := clientCmd.String("listen", "tcp://127.0.0.1:1080", "Listen addr")
+	clientServerURL := clientCmd.String("server", "https://modern-stack-42d9.trycloudflare.com/stream", "Server URL")
+	clientForward := clientCmd.String("forward", "8.8.8.8:53", "Forward target")
+	clientPsk := clientCmd.String("psk", "my-secret-token", "PSK")
+	clientSni := clientCmd.String("sni", "www.bing.com", "Custom TLS SNI")
+	clientHost := clientCmd.String("host", "www.bing.com", "Custom HTTP Host header")
+	clientAlpn := clientCmd.String("alpn", "auto", "Force ALPN protocol (h3/h2/h1/auto)")
+	clientFingerprint := clientCmd.String("fingerprint", "", "Expected server certificate SHA256 fingerprint for MITM protection")
+	clientLogLevel := clientCmd.String("loglevel", "debug", "Log level")
+	clientDump := clientCmd.Bool("dump", false, "Dump Hex")
+
+	// ================= 解析与路由 =================
+	if len(os.Args) < 2 {
+		fmt.Println("用法: xhttptunnel <command> [args]")
+		fmt.Println("支持的 command:")
+		fmt.Println("  server   启动服务端")
+		fmt.Println("  client   启动客户端")
+		fmt.Println("  version  打印版本信息")
+		os.Exit(1)
+	}
+
+	// 全局上下文监听 (Ctrl+C 退出)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if *mode == "client" {
-		runClient(ctx, *listen, *serverURLFlag, *forward, *psk, *sniFlag, *hostFlag, *alpnFlag, *dumpFlag, *fingerprintFlag)
-	} else if *mode == "server" {
-		cert, key := *certFlag, *keyFlag
-		if *selfSignFlag && (cert == "" && key == "") {
+	switch os.Args[1] {
+	case "server":
+		serverCmd.Parse(os.Args[2:])
+		initLogger(*serverLogLevel)
+		defer logger.Sync()
+
+		cert, key := *serverCert, *serverKey
+		if *serverSelfSign && (cert == "" && key == "") {
 			cert = "cert.pem"
 			key = "key.pem"
-			// 检查文件是否已存在，不存在则生成
 			if _, err := os.Stat(cert); os.IsNotExist(err) {
 				if err := generateSelfSignedCert(cert, key); err != nil {
 					logger.Fatal("❌ 自动生成自签名证书失败", zap.Error(err))
 				}
 				logger.Info("I 已自动生成自签名证书", zap.String("cert", cert), zap.String("key", key))
 			}
-			*certFlag = cert
-			*keyFlag = key
+			*serverCert = cert
+			*serverKey = key
 		}
-		if *certFlag != "" {
-			printCertFingerprint(*certFlag)
+		
+		// 如果有证书，打印指纹
+		if *serverCert != "" {
+			printCertFingerprint(*serverCert)
 		}
-		runServer(ctx, *listen, *path, *defaultTarget, *psk, *certFlag, *keyFlag, *dumpFlag, *fallbackFlag)
-	} else {
-		logger.Fatal("请指定模式: -mode client 或 -mode server")
+		
+		runServer(ctx, *serverListen, *serverPath, *serverDefaultTarget, *serverPsk, *serverCert, *serverKey, *serverDump, *serverFallback)
+
+	case "client":
+		clientCmd.Parse(os.Args[2:])
+		initLogger(*clientLogLevel)
+		defer logger.Sync()
+
+		runClient(ctx, *clientListen, *clientServerURL, *clientForward, *clientPsk, *clientSni, *clientHost, *clientAlpn, *clientDump, *clientFingerprint)
+
+	case "version":
+		fmt.Printf("xhttptunnel %s\n", Version)
+		os.Exit(0)
+
+	default:
+		fmt.Printf("❌ 未知的命令: %s\n", os.Args[1])
+		fmt.Println("请使用 'server', 'client' 或 'version'")
+		os.Exit(1)
 	}
 }
 
