@@ -15,7 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	mbig "math/big"
+	"math/big"
 	mrand "math/rand"
 	"net"
 	"net/http"
@@ -307,6 +307,11 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 		written += toWrite
 	}
 
+	// 唤醒可能在等待数据的消费者 (例如，服务器端的长轮询)
+	if written > 0 {
+		rb.cond.Broadcast()
+	}
+
 	return written, nil
 }
 
@@ -440,16 +445,12 @@ func (c *meekVirtualConn) Read(p []byte) (int, error) {
 
 func (c *meekVirtualConn) Write(p []byte) (int, error) {
 	// TCP 背壓限制 (Flow Control)
-	// 防止本地端上傳過快導致記憶體暴漲 100MB+，限制積壓上限為 4MB
-	for {
-		if c.closed {
-			return 0, io.ErrClosedPipe
-		}
-		if c.writeBuf.Len() < 4*1024*1024 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond) // 阻塞，強迫本地 VPN/代理 客戶端減速
+	// 底层的 reliableBuffer 通过 sync.Cond 高效地处理背压。
+	// 之前带有 time.Sleep 的忙等待循环是多余且低效的。
+	if c.closed {
+		return 0, io.ErrClosedPipe
 	}
+	// 对 reliableBuffer 的写入操作在缓冲区满时会自动阻塞。
 	return c.writeBuf.Write(p)
 }
 
@@ -548,18 +549,24 @@ func (c *xhttpFramedConn) WriteCloseFrame() error {
 }
 
 func (c *xhttpFramedConn) heartbeatLoop() {
-	// 巡逻周期设为 10 秒（不用频繁唤醒）
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	// 自适应心跳定时器
+	idleTimeout := 60 * time.Second
+	timer := time.NewTimer(idleTimeout)
+	defer timer.Stop()
+
 	for {
 		select {
-		case <-ticker.C:
-			// 获取上次真实发送数据的时间
+		case <-timer.C:
 			last := atomic.LoadInt64(&c.lastWriteTime)
+			now := time.Now().Unix()
+			elapsed := now - last
 
-			// 如果距离上次发包已经过去了 60 秒，说明连接处于绝对空闲状态
-			if time.Now().Unix()-last >= 60 {
-				c.Write(nil) // 发送空，这会自动触发上面的 StoreInt64 刷新时间
+			if elapsed >= 60 {
+				c.Write(nil) // 发送空心跳，Write 内部会自动刷新 lastWriteTime
+				timer.Reset(idleTimeout)
+			} else {
+				// 连接活跃中，根据真实剩余时间动态推迟下一次唤醒
+				timer.Reset(time.Duration(60-elapsed) * time.Second)
 			}
 		case <-c.closeCh:
 			return
@@ -957,18 +964,47 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 		var ackedByServer uint64    // 记录服务端已经确认的 Seq
 		var dispatchSeq uint64      // 任务派发线（发送线）
 		var windowMu sync.Mutex     // 保护两个游标的并发操作
-		var consecutiveErrors int32 // 错误计数
 		var triggerRetry int32      // 是否携带 X-Retry
 		var emptyPollers int32      // 当前正在空手去服务端拉取数据的 Worker 数量
 
 		workerCount := 8
-		var wg sync.WaitGroup
 
-		for i := 0; i < workerCount; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				for !virtualConn.closed {
+		restartCount := 0
+
+		for !virtualConn.closed {
+			if restartCount > 0 {
+				if restartCount > 6 {
+					logger.Error("❌ [Pump] 数据泵重启次数达到上限 (超过 90 秒)，放弃恢复，关闭隧道", zap.String("session", sessionID))
+					break
+				}
+
+				// 指数退避逻辑：2s, 4s, 8s, 16s, 30s, 30s
+				backoff := time.Duration(1<<restartCount) * time.Second
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				logger.Warn("⚠️ [Pump] 发生严重网络错误，数据泵已退出，准备指数退避后自动重启",
+					zap.String("session", sessionID),
+					zap.Int("restarts", restartCount),
+					zap.Duration("backoff", backoff),
+				)
+				select {
+				case <-time.After(backoff):
+				case <-pumpCtx.Done():
+				}
+			}
+			if virtualConn.closed || pumpCtx.Err() != nil {
+				break
+			}
+
+			var consecutiveErrors int32 // 本次重启生命周期内的错误计数
+			var wg sync.WaitGroup
+
+			for i := 0; i < workerCount; i++ {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					for !virtualConn.closed {
 					// 抢占任务：从写缓冲中划走一段数据
 					windowMu.Lock()
 					currentAck := atomic.LoadUint64(&ackedByServer)
@@ -983,7 +1019,11 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 						// 如果没有上行数据，只允许最多 1 个 Worker 去服务端进行长轮询
 						if atomic.LoadInt32(&emptyPollers) >= 1 {
 							windowMu.Unlock()
-							time.Sleep(50 * time.Millisecond) // 其他 Worker 本地待命，不发 HTTP 请求
+							// 其他 Worker 在此等待，直到被新数据或轮询结束的信号唤醒。
+							// 这比 time.Sleep() 效率高得多，避免了空转 CPU。
+							virtualConn.writeBuf.mu.Lock()
+							virtualConn.writeBuf.cond.Wait()
+							virtualConn.writeBuf.mu.Unlock()
 							continue
 						}
 						atomic.AddInt32(&emptyPollers, 1) // 登记为一个空载探子
@@ -1022,6 +1062,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 					} else if cfg.SNI != "" {
 						req.Host = cfg.SNI
 					}
+					req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.5410.0 Safari/537.36 Client/"+Version)
 					if cfg.Password != "" {
 						req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Password)
 					}
@@ -1059,6 +1100,10 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 					// 请求结束，注销空载探子身份
 					if len(upData) == 0 {
 						atomic.AddInt32(&emptyPollers, -1)
+						// 唤醒一个可能在等待成为下一个轮询者的 Worker。
+						// 使用 Broadcast 是为了确保在复杂场景下（例如多个 worker 同时被其他事件唤醒）
+						// 逻辑的健壮性，尽管 Signal 通常也足够。
+						virtualConn.writeBuf.cond.Broadcast()
 					}
 
 					if err != nil {
@@ -1077,6 +1122,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 						// 激活重传求救信号，通知服务端也回退下行游标！
 						atomic.StoreInt32(&triggerRetry, 1)
 						if atomic.AddInt32(&consecutiveErrors, 1) > 20 {
+							logger.Warn("❌ [Pump] 连续错误过多，Worker 退出准备触发数据泵重启", zap.Int("worker", id))
 							break
 						}
 						time.Sleep(300 * time.Millisecond)
@@ -1134,16 +1180,33 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 					sSeqStr := resp.Header.Get("X-Seq")
 					sSeq, _ := strconv.ParseUint(sSeqStr, 10, 64)
 
-					downBuf := bytesBufPool.Get().(*bytes.Buffer)
-					downBuf.Reset()
-					_, errBody := downBuf.ReadFrom(resp.Body)
-					downData := downBuf.Bytes()
-					resp.Body.Close()
+					// 流式边读边解包，极大降低首字节延迟
+					bufPtr := sendBuf.Get().(*[]byte)
+					readChunk := *bufPtr
+					var totalDownBytes int
+					var errBody error
+					downSeq := sSeq
 
-					// 严格校验下行数据的完整性
+					for {
+						n, err := resp.Body.Read(readChunk)
+						if n > 0 {
+							// 实时写入数据，让本地客户端立刻拿到响应，无需等待完整 HTTP 包
+							virtualConn.PutReadData(downSeq, readChunk[:n])
+							downSeq += uint64(n)
+							totalDownBytes += n
+						}
+						if err != nil {
+							if err != io.EOF {
+								errBody = err
+							}
+							break
+						}
+					}
+					resp.Body.Close()
+					sendBuf.Put(bufPtr) // 提早释放复用内存
+
 					if errBody != nil {
-						logger.Warn("⚠️ [Pump] 读取下行 Body 失败，触发安全重传", zap.Error(errBody))
-						bytesBufPool.Put(downBuf)
+						logger.Warn("⚠️ [Pump] 读取下行 Body 失败或异常中断，触发安全重传", zap.Error(errBody))
 						if upBufPtr != nil {
 							sendBuf.Put(upBufPtr)
 						}
@@ -1161,21 +1224,20 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 						zap.String("session", sessionID),
 						zap.Uint64("Server_Seq", sSeq),
 						zap.Uint64("Server_Ack", sAck),
-						zap.Int("Down_Bytes", len(downData)),
+						zap.Int("Down_Bytes", totalDownBytes),
 					)
 
-					if len(downData) > 0 || sSeqStr != "" {
-						virtualConn.PutReadData(sSeq, downData)
+					if totalDownBytes == 0 && sSeqStr != "" {
+						virtualConn.PutReadData(sSeq, nil) // 驱动空包心跳
 					}
 
 					// 归还pool
-					bytesBufPool.Put(downBuf)
 					if upBufPtr != nil {
 						sendBuf.Put(upBufPtr)
 					}
 
 					// 如果当前轮询是完全空载的（没发也没收），稍微歇一下防止榨干 CPU
-					if len(upData) == 0 && len(downData) == 0 && virtualConn.writeBuf.Len() == 0 {
+					if len(upData) == 0 && totalDownBytes == 0 && virtualConn.writeBuf.Len() == 0 {
 						time.Sleep(100 * time.Millisecond)
 					}
 				}
@@ -1183,6 +1245,9 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 		}
 		//在这里等待 8 个 Worker 退出
 		wg.Wait()
+
+		restartCount++
+		}
 
 		// 如果使用的是 http3.Transport，需要在退出时调用 Close
 		if rt3, ok := rt.(*http3.Transport); ok {
@@ -1199,9 +1264,11 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *Config, targetAddr,
 // ==========================================
 
 var (
-	meekSessions = make(map[string]*meekVirtualConn)
-	meekMutex    sync.RWMutex
-	cleanerOnce  sync.Once
+	meekSessions      = make(map[string]*meekVirtualConn)
+	meekMutex         sync.RWMutex
+	cleanerOnce       sync.Once
+	maxGlobalSessions = 2000 // 最大并发会话数限制，防止内存被恶意耗尽
+	maxClientSessions = 2000 // 客户端最大并发连接数限制，防止本地端口/内存被耗尽
 )
 
 type XHTTPListener struct {
@@ -1278,6 +1345,33 @@ func (t *ActiveTracker) Wait(ctx context.Context) error {
 // Optional: get current active count.
 func (t *ActiveTracker) Active() int64 { return atomic.LoadInt64(&t.n) }
 
+// nginxError sends an Nginx-style error page.
+func nginxError(w http.ResponseWriter, code int) {
+	statusText := http.StatusText(code)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Server", "nginx")
+	w.WriteHeader(code)
+	fmt.Fprintf(w, "<html>\n<head><title>%d %s</title></head>\n", code, statusText)
+	fmt.Fprintln(w, "<body>")
+	fmt.Fprintf(w, "<center><h1>%d %s</h1></center>\n", code, statusText)
+	fmt.Fprintln(w, "<hr><center>nginx</center>")
+	fmt.Fprintln(w, "</body>")
+	fmt.Fprintln(w, "</html>")
+}
+
+// panicRecoveryMiddleware recovers from panics in the handler chain and returns a disguised 500 error.
+func panicRecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				logger.Error("💀 [HTTP] Handler recovered from panic", zap.Any("panic", err), zap.Stack("stack"))
+				nginxError(w, http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile, fallbackURL string) (*XHTTPListener, error) {
 	listenAddr = strings.TrimPrefix(listenAddr, "tcp://")
 	ln, err := net.Listen("tcp", listenAddr)
@@ -1342,7 +1436,8 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 				fallbackProxy.ServeHTTP(w, r)
 				return
 			}
-			http.NotFound(w, r)
+			// 使用统一的 Nginx 错误页面函数来处理 404
+			nginxError(w, http.StatusNotFound)
 			return
 		}
 		atomic.AddUint64(&xl.RequestCount, 1)
@@ -1353,7 +1448,7 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 
 		if sessionID == "" {
 			logger.Warn("❌ [HTTP] 拒绝请求: 缺少 Session ID", zap.String("remote", r.RemoteAddr))
-			http.Error(w, "Bad Request", http.StatusBadRequest)
+			nginxError(w, http.StatusBadRequest)
 			return
 		}
 		if xl.expectedToken != "" && r.Header.Get("Proxy-Authorization") != "Bearer "+xl.expectedToken {
@@ -1362,13 +1457,20 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 				zap.String("got_token", r.Header.Get("Proxy-Authorization")),
 				zap.String("expected", "Bearer "+xl.expectedToken),
 			)
-			http.Error(w, "Proxy Auth Required", http.StatusProxyAuthRequired)
+			nginxError(w, http.StatusProxyAuthRequired)
 			return
 		}
 
 		meekMutex.Lock()
 		vConn, exists := meekSessions[sessionID]
 		if !exists {
+			// 资源限制：防止恶意连接耗尽内存
+			if len(meekSessions) >= maxGlobalSessions {
+				meekMutex.Unlock()
+				logger.Warn("❌ [Server] 拒绝连接: 达到最大并发会话数限制", zap.Int("limit", maxGlobalSessions), zap.String("remote", r.RemoteAddr))
+				nginxError(w, http.StatusServiceUnavailable) // 返回 503 伪装页
+				return
+			}
 			vConn = newMeekVirtualConn(sessionID, stringAddr(r.Host), stringAddr(r.RemoteAddr))
 			meekSessions[sessionID] = vConn
 			meekMutex.Unlock()
@@ -1390,39 +1492,55 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			meekMutex.Unlock()
 		}
 
-		// 1. 处理上行请求 (包含 Seq 和 Ack)
+		// 处理上行请求 (包含 Seq 和 Ack)
 		cSeq, _ := strconv.ParseUint(r.Header.Get("X-Seq"), 10, 64)
 		cAck, _ := strconv.ParseUint(r.Header.Get("X-Ack"), 10, 64)
 
-		upBuf := bytesBufPool.Get().(*bytes.Buffer)
-		upBuf.Reset()
-		_, errBody := upBuf.ReadFrom(r.Body)
-		upData := upBuf.Bytes()
-		r.Body.Close()
+		// 服务端流式解包
+		bufPtr := sendBuf.Get().(*[]byte)
+		readChunk := *bufPtr
+		var totalUpBytes int
+		var errBody error
+		currentSeq := cSeq
+		var myUpAck uint64
 
-		// 如果读取 Body 报错（如 Nginx 提前切断），绝不能把残缺数据送进状态机！
+		for {
+			n, err := r.Body.Read(readChunk)
+			if n > 0 {
+				myUpAck = vConn.PutReadData(currentSeq, readChunk[:n])
+				currentSeq += uint64(n)
+				totalUpBytes += n
+			}
+			if err != nil {
+				if err != io.EOF {
+					errBody = err
+				}
+				break
+			}
+		}
+		r.Body.Close()
+		sendBuf.Put(bufPtr) // 提早释放复用内存
+
 		if errBody != nil {
-			logger.Warn("⚠️ [HTTP] 读取上行 Body 失败或不完整，丢弃该包", zap.Error(errBody))
-			bytesBufPool.Put(upBuf)
-			http.Error(w, "Bad Request", http.StatusBadRequest)
+			logger.Warn("⚠️ [HTTP] 读取上行 Body 失败或异常中断", zap.Error(errBody))
+			nginxError(w, http.StatusBadRequest)
 			return // 直接退出，客户端会超时并触发 Go-Back-N 完美重传
 		}
 
-		// 写入数据并获取服务端的确认号 (我的期望读指针)
-		myUpAck := vConn.PutReadData(cSeq, upData)
+		// 如果是空包心跳，依旧要获取一次最新的 Ack
+		if totalUpBytes == 0 {
+			myUpAck = vConn.PutReadData(cSeq, nil)
+		}
 
 		logger.Debug("📥 [HTTP] 解析上行请求",
 			zap.String("session", sessionID),
 			zap.Uint64("Client_Seq", cSeq),
 			zap.Uint64("Client_Ack", cAck),
-			zap.Int("Up_Bytes", len(upData)),
+			zap.Int("Up_Bytes", totalUpBytes),
 			zap.Uint64("Server_Expect_Ack", myUpAck),
 		)
 
-		// 归还pool
-		bytesBufPool.Put(upBuf)
-
-		// 2. 准备下行数据
+		// 准备下行数据
 		// 只有当接收到有效心跳或数据时，才进行延迟回包优化
 		var downData []byte
 		var myDownSeq uint64
@@ -1452,17 +1570,40 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			return false
 		}
 
-		if len(upData) > 0 {
+		if totalUpBytes > 0 {
 			// 如果客户端带来了上行数据，我们就顺便尝试带一点下行数据回去
 			fetchDownData()
 		} else {
 			// 如果是客户端的空载心跳/拉取请求，触发长轮询等待下行数据
-			startWait := time.Now()
-			for {
-				if fetchDownData() || time.Since(startWait) > 15*time.Second || vConn.closed {
-					break
+			if !fetchDownData() && !vConn.closed {
+				// 无可用数据，执行一次带超时的等待。
+				// 这比使用 time.Sleep() 的忙等待循环效率高得多，可以显著降低空闲时的 CPU 使用率。
+				vConn.writeBuf.mu.Lock()
+				// 在锁下再次检查，避免竞态条件
+				if vConn.writeBuf.count == 0 {
+					// 修复：绝对不能在未持有锁的 Goroutine 中调用 cond.Wait()！
+					// 使用 Timer 延时触发 Broadcast 来实现安全的高效超时等待。
+					timer := time.AfterFunc(15*time.Second, func() {
+						vConn.writeBuf.cond.Broadcast()
+					})
+					ctxDone := make(chan struct{})
+					go func() {
+						select {
+						case <-r.Context().Done(): // 客户端主动断开
+							vConn.writeBuf.cond.Broadcast()
+						case <-ctxDone:
+						}
+					}()
+
+					vConn.writeBuf.cond.Wait() // 安全地在当前拥有锁的上下文中 Wait
+
+					timer.Stop()
+					close(ctxDone)
 				}
-				time.Sleep(50 * time.Millisecond)
+				vConn.writeBuf.mu.Unlock()
+
+				// 等待结束后，最后尝试一次获取数据
+				fetchDownData()
 			}
 		}
 
@@ -1477,6 +1618,7 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		w.Header().Set("X-Seq", strconv.FormatUint(myDownSeq, 10))
 		w.Header().Set("Content-Length", strconv.Itoa(len(downData)))
 		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Server", "nginx")
 		w.WriteHeader(http.StatusOK)
 		if len(downData) > 0 {
 			w.Write(downData)
@@ -1489,15 +1631,15 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 	})
 
 	tracker := NewActiveTracker()
-	// wrap your mux with the tracker middleware
-	wrapped := tracker.Middleware(mux)
+	// Chain middlewares: first panic recovery, then active tracking
+	handler := panicRecoveryMiddleware(tracker.Middleware(mux))
 
 	server := &http.Server{
-		IdleTimeout: 1 * time.Hour,
+		IdleTimeout:       1 * time.Hour,
+		ReadHeaderTimeout: 10 * time.Second, // 防御 Slowloris 慢速请求攻击
 		// 初始化时不设置 Handler，在下面根据条件设置，确保一定使用 wrapped
 	}
 
-	// 1. 完善 ConnState tracking
 	var (
 		connsMu sync.Mutex
 		conns   = make(map[net.Conn]struct{})
@@ -1516,7 +1658,6 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 	// 引入 WaitGroup 来管理所有服务器 goroutine 的生命周期
 	var wg sync.WaitGroup
 
-	// 2. 补全优雅关闭与强制关闭逻辑
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1544,14 +1685,14 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		// HTTP/3 (QUIC) server 配置
 		h3Server := &http3.Server{
 			Addr:    listenAddr,
-			Handler: wrapped, // 修复：必须使用 wrapped 才能让中间件生效
+			Handler: handler,
 		}
 
 		// 3. 为 TCP/TLS 服务添加 Alt-Svc 头部，引导客户端使用 HTTP/3
 		server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// quic-go 的 SetQUICHeaders 会在 Response 中写入 Alt-Svc: h3=":port"
 			_ = h3Server.SetQUICHeaders(w.Header())
-			wrapped.ServeHTTP(w, r) // 同样使用 wrapped
+			handler.ServeHTTP(w, r)
 		})
 
 		// 启动 TCP/TLS HTTP 服务器 （支持 h2）
@@ -1585,8 +1726,7 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 
 	} else {
 		// 非 TLS 情况：保留原来的 h2c（明文 HTTP/2 over TCP）行为
-		// 修复：必须使用 wrapped 包装 mux
-		server.Handler = h2c.NewHandler(wrapped, &http2.Server{IdleTimeout: 1 * time.Hour})
+		server.Handler = h2c.NewHandler(handler, &http2.Server{IdleTimeout: 1 * time.Hour})
 
 		wg.Add(1)
 		go func() {
@@ -1602,18 +1742,38 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 }
 
 // generateSelfSignedCert 生成一个有效期为 10 年的自签名证书并保存到指定路径
-func generateSelfSignedCert(certPath, keyPath string) error {
+func generateSelfSignedCert(certPath, keyPath, commonName string) error {
+	// 生成 RSA 私钥
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return err
 	}
 
+	// 生成随机的证书序列号 (避免固定为 1 导致客户端缓存冲突)
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return err
+	}
+
+	// 如果未提供 CN，则使用一个合理的默认值
+	if commonName == "" {
+		commonName = "ec2.amazonaws.com"
+	}
+
+	// 配置证书模板 (贴合 AWS 信息)
 	template := x509.Certificate{
-		SerialNumber: mbig.NewInt(1),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"xhttptunnel-selfsigned"},
-			CommonName:   "localhost",
+			Country:            []string{"US"},                  // C=US
+			Province:           []string{"Washington"},          // ST=Washington
+			Locality:           []string{"Seattle"},             // L=Seattle
+			Organization:       []string{"Amazon.com, Inc."},    // O=Amazon.com, Inc.
+			OrganizationalUnit: []string{"Amazon Web Services"}, // OU=Amazon Web Services
+			CommonName:         commonName,                      // CN
 		},
+		// 关键补充：现代客户端校验域名依赖 SAN (Subject Alternative Name)
+		DNSNames:              []string{commonName, "*." + commonName},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(time.Hour * 24 * 365 * 10), // 10 年有效期
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
@@ -1621,12 +1781,13 @@ func generateSelfSignedCert(certPath, keyPath string) error {
 		BasicConstraintsValid: true,
 	}
 
+	// 创建证书
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
 		return err
 	}
 
-	// 写入证书文件
+	// 写入证书文件 (PEM 格式)
 	certOut, err := os.Create(certPath)
 	if err != nil {
 		return err
@@ -1636,7 +1797,7 @@ func generateSelfSignedCert(certPath, keyPath string) error {
 		return err
 	}
 
-	// 写入私钥文件
+	// 写入私钥文件 (PEM 格式)
 	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
@@ -1666,9 +1827,11 @@ func main() {
 	serverCert := serverCmd.String("cert", "", "TLS Cert")
 	serverKey := serverCmd.String("key", "", "TLS Key")
 	serverSelfSign := serverCmd.Bool("selfsign", false, "Auto generate self-signed certificate")
+	serverSelfSignCN := serverCmd.String("selfsign-cn", "www.bing.com", "Common Name for self-signed certificate")
 	serverFallback := serverCmd.String("fallback", "", "Fallback URL for unauthorized requests (e.g., https://www.bing.com)")
 	serverLogLevel := serverCmd.String("loglevel", "debug", "Log level")
 	serverDump := serverCmd.Bool("dump", false, "Dump Hex")
+	serverMaxSessions := serverCmd.Int("max-sessions", 2000, "Max concurrent sessions limit (protects memory)")
 
 	// ================= 客户端 (Client) 参数 =================
 	clientListen := clientCmd.String("listen", "tcp://127.0.0.1:1080", "Listen addr")
@@ -1681,6 +1844,7 @@ func main() {
 	clientFingerprint := clientCmd.String("fingerprint", "", "Expected server certificate SHA256 fingerprint for MITM protection")
 	clientLogLevel := clientCmd.String("loglevel", "debug", "Log level")
 	clientDump := clientCmd.Bool("dump", false, "Dump Hex")
+	clientMaxConns := clientCmd.Int("max-conns", 2000, "Max concurrent connections limit (protects local ports)")
 
 	// ================= 解析与路由 =================
 	if len(os.Args) < 2 {
@@ -1699,6 +1863,7 @@ func main() {
 	switch os.Args[1] {
 	case "server":
 		serverCmd.Parse(os.Args[2:])
+		maxGlobalSessions = *serverMaxSessions
 		initLogger(*serverLogLevel)
 		defer logger.Sync()
 
@@ -1707,7 +1872,7 @@ func main() {
 			cert = "cert.pem"
 			key = "key.pem"
 			if _, err := os.Stat(cert); os.IsNotExist(err) {
-				if err := generateSelfSignedCert(cert, key); err != nil {
+				if err := generateSelfSignedCert(cert, key, *serverSelfSignCN); err != nil {
 					logger.Fatal("❌ 自动生成自签名证书失败", zap.Error(err))
 				}
 				logger.Info("I 已自动生成自签名证书", zap.String("cert", cert), zap.String("key", key))
@@ -1725,6 +1890,7 @@ func main() {
 
 	case "client":
 		clientCmd.Parse(os.Args[2:])
+		maxClientSessions = *clientMaxConns
 		initLogger(*clientLogLevel)
 		defer logger.Sync()
 
@@ -1780,6 +1946,8 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 			ln.Close()
 		}()
 
+		var activeTCPConns int32
+
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -1792,7 +1960,15 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 				continue
 			}
 
+			if atomic.LoadInt32(&activeTCPConns) >= int32(maxClientSessions) {
+				logger.Warn("❌ [TCP] 拒绝本地连接: 达到最大并发连接数限制", zap.Int("limit", maxClientSessions), zap.String("client", conn.RemoteAddr().String()))
+				conn.Close()
+				continue
+			}
+			atomic.AddInt32(&activeTCPConns, 1)
+
 			go func() {
+				defer atomic.AddInt32(&activeTCPConns, -1)
 				defer conn.Close()
 				connID := generateRandomHex(4)
 				logger.Debug("🔌 [TCP] 收到本地客户端连接", zap.String("id", connID), zap.String("client", conn.RemoteAddr().String()))
@@ -1929,6 +2105,12 @@ func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk,
 			mu.Lock()
 			sess, exists := sessionMap[cAddr.String()]
 			if !exists {
+				if len(sessionMap) >= maxClientSessions {
+					mu.Unlock()
+					logger.Warn("❌ [UDP] 拒绝本地新会话: 达到最大并发限制", zap.Int("limit", maxClientSessions), zap.String("client", cAddr.String()))
+					continue
+				}
+
 				connID := generateRandomHex(4)
 				logger.Debug("🔌 [UDP] 发现新本地客户端，准备建立隧道", zap.String("id", connID), zap.String("client", cAddr.String()))
 
