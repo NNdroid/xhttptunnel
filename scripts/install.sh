@@ -1,425 +1,307 @@
 #!/bin/bash
+set -e
 
-# ================= 全局参数解析 =================
-ACTION=""
-CUSTOM_PSK=""
-CUSTOM_PATH=""
-CUSTOM_FALLBACK=""
+APP_NAME="xhttptunnel"
+GITHUB_REPO="NNdroid/${APP_NAME}"
+INSTALL_DIR="/usr/local/bin"
+CONFIG_DIR="/etc/${APP_NAME}"
+SYSTEMD_DIR="/etc/systemd/system"
+SERVICE_FILE="${SYSTEMD_DIR}/${APP_NAME}.service"
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --psk)
-            CUSTOM_PSK="$2"
-            shift 2
-            ;;
-        --path)
-            CUSTOM_PATH="$2"
-            shift 2
-            ;;
-        --fallback)
-            CUSTOM_FALLBACK="$2"
-            shift 2
-            ;;
-        install|uninstall|update)
-            ACTION="$1"
-            shift
-            ;;
-        *)
-            echo "错误: 未知的指令或参数 '$1'"
-            echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>] [--fallback <URL>]"
-            exit 1
-            ;;
-    esac
-done
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+PLAIN="\033[0m"
 
-# ================= 全局权限检测 =================
-if [ "$(id -u)" -eq 0 ]; then
-    SUDO=""
-elif command -v sudo >/dev/null 2>&1; then
-    SUDO="sudo"
-    echo "=> 检测到非 root 用户，此脚本需要管理员权限，正在请求 sudo..."
-    if ! $SUDO -v; then
-        echo "错误：获取 sudo 权限失败，请检查您的密码或权限配置。"
-        exit 1
-    fi
-else
-    echo "错误：此脚本需要 root 权限，但系统中未找到 sudo 命令。请切换到 root 用户后重试。"
+check_root() {
+  if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Error: Please run as root (sudo)!${PLAIN}" >&2
     exit 1
-fi
-
-# ================= 全局变量定义 =================
-REPO="NNdroid/xhttptunnel"
-BIN_PATH="/usr/local/bin/xhttptunnel"
-CONFIG_DIR="/usr/local/etc/xhttptunnel"
-CERT_PATH="$CONFIG_DIR/crt.crt"
-KEY_PATH="$CONFIG_DIR/crt.key"
-SERVICE_PATH="/etc/systemd/system/xhttptunnel.service"
-RUN_USER="xhttptunnel"
-
-# ================= 依赖检查与安装 =================
-install_dependencies() {
-    if command -v curl >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
-        echo "=> 系统依赖检查通过 (curl, openssl 已安装)。"
-        return 0
-    fi
-
-    echo "=> 正在检查并安装必要的依赖 (curl, openssl, ca-certificates)..."
-
-    local os_type
-    os_type=$(uname -s | tr '[:upper:]' '[:lower:]')
-
-    if [ "$os_type" != "linux" ]; then
-        echo "=> 非 Linux 系统，跳过自动安装依赖，请确保已手动安装 curl 和 openssl。"
-        return 0
-    fi
-
-    if command -v apt-get >/dev/null 2>&1; then
-        echo "=> 检测到 Debian/Ubuntu (apt-get)，正在执行安装..."
-        $SUDO apt-get update -qq
-        $SUDO apt-get install -y curl openssl ca-certificates >/dev/null 2>&1
-    elif command -v dnf >/dev/null 2>&1; then
-        echo "=> 检测到 Fedora/RHEL8+ (dnf)，正在执行安装..."
-        $SUDO dnf install -y curl openssl ca-certificates >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        echo "=> 检测到 CentOS/RHEL7 及更低版本 (yum)，正在执行安装..."
-        $SUDO yum install -y curl openssl ca-certificates >/dev/null 2>&1
-    elif command -v pacman >/dev/null 2>&1; then
-        echo "=> 检测到 Arch Linux (pacman)，正在执行安装..."
-        $SUDO pacman -Sy --noconfirm curl openssl ca-certificates >/dev/null 2>&1
-    elif command -v apk >/dev/null 2>&1; then
-        echo "=> 检测到 Alpine Linux (apk)，正在执行安装..."
-        $SUDO apk add --no-cache curl openssl ca-certificates >/dev/null 2>&1
-    else
-        echo "=> 警告：未检测到受支持的包管理器，请手动确认 curl 和 openssl 已安装。"
-    fi
+  fi
 }
 
-# ================= 核心功能函数 =================
-download_latest_xhttptunnel() {
-    local os
-    local arch
-    local ext=""
-    local filename
-    local download_url
-    local tmp_file
-
-    echo "=> 正在检测操作系统和架构..."
-
-    os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    if [[ "$os" == *mingw* || "$os" == *cygwin* || "$os" == *msys* ]]; then
-        os="windows"
-        ext=".exe"
-    elif [[ "$os" != "linux" && "$os" != "darwin" ]]; then
-        echo "错误：不支持的操作系统: $os"
-        return 1
-    fi
-
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64 | amd64)
-            arch="amd64"
-            ;;
-        aarch64 | arm64)
-            arch="arm64"
-            ;;
-        armv* | arm)
-            arch="arm"
-            ;;
-        *)
-            echo "错误：不支持的系统架构: $arch"
-            return 1
-            ;;
-    esac
-
-    filename="xhttptunnel-${os}-${arch}${ext}"
-    download_url="https://github.com/${REPO}/releases/latest/download/${filename}"
-    tmp_file="/tmp/${filename}"
-
-    echo "=> 匹配到的版本为: ${filename}"
-    echo "=> 正在从 ${download_url} 下载..."
-
-    if ! curl -L -f -o "$tmp_file" "$download_url"; then
-        echo "错误：下载失败，请检查网络或确认该架构的 release 存在 ($download_url)"
-        return 1
-    fi
-
-    chmod +x "$tmp_file"
-
-    echo "=> 准备安装到 ${BIN_PATH}..."
-    local dest_dir
-    dest_dir=$(dirname "$BIN_PATH")
-
-    if [ -w "$dest_dir" ]; then
-        mv "$tmp_file" "$BIN_PATH"
-        chmod +x "$BIN_PATH"
-    else
-        echo "=> 正在使用管理员权限移动文件..."
-        $SUDO mv "$tmp_file" "$BIN_PATH"
-        $SUDO chmod +x "$BIN_PATH"
-    fi
-
-    if [ -f "$BIN_PATH" ]; then
-        echo "=> 安装成功！可执行文件已放置在: $BIN_PATH"
-    else
-        echo "错误：移动文件到 $BIN_PATH 失败。"
-        return 1
-    fi
+get_arch() {
+  local arch
+  arch=$(uname -m)
+  case "${arch}" in
+    x86_64)  echo "amd64" ;;
+    aarch64) echo "arm64" ;;
+    armv7l)  echo "arm" ;;
+    i386|i686) echo "386" ;;
+    *)       echo "amd64" ;;
+  esac
 }
 
-remove_xhttptunnel() {
-    echo "=> 准备卸载核心程序..."
-
-    if [ ! -f "$BIN_PATH" ]; then
-        echo "=> 提示：xhttptunnel 未安装在 $BIN_PATH，无需执行删除操作。"
-        return 0
-    fi
-
-    local dest_dir
-    dest_dir=$(dirname "$BIN_PATH")
-
-    if [ -w "$dest_dir" ] && [ -w "$BIN_PATH" ]; then
-        rm "$BIN_PATH"
-    else
-        $SUDO rm "$BIN_PATH"
-    fi
-
-    if [ ! -f "$BIN_PATH" ]; then
-        echo "=> 卸载成功！已彻底清理: $BIN_PATH"
-    else
-        echo "错误：删除 $BIN_PATH 失败，请检查文件占用或权限。"
-        return 1
-    fi
+# 生成分享 URI 时的额外参数：
+#   GEN_URI_PIN   —— 指定固定的 6 位分享 PIN（默认留空=每次随机生成，需在输出中抄下）。
+#   GEN_URI_HOST  —— 覆盖分享 URI 中的服务器公网 IP/域名（server 配置通常只有 listen 端口，
+#                     不包含公网地址；不设置时占位为 your-server-ip，客户端无法连接）。
+gen_uri_extra_args() {
+  local args=""
+  if [ -n "${GEN_URI_PIN:-}" ]; then
+    args="${args} -pin ${GEN_URI_PIN}"
+  fi
+  if [ -n "${GEN_URI_HOST:-}" ]; then
+    args="${args} -host ${GEN_URI_HOST}"
+  fi
+  echo "${args}"
 }
 
-setup_xhttptunnel_env() {
-    echo "=> 正在配置 xhttptunnel 环境..."
+install_binary() {
+  local goarch
+  goarch=$(get_arch)
+  mkdir -p "${INSTALL_DIR}"
 
-    # 创建独立的非特权系统用户
-    if ! id -u "$RUN_USER" >/dev/null 2>&1; then
-        echo "=> 正在创建非特权系统用户: $RUN_USER"
-        $SUDO useradd -r -s /usr/sbin/nologin "$RUN_USER"
+  if [ -f "./bin/${APP_NAME}_linux_${goarch}" ]; then
+    echo -e "${CYAN}--> Using local prebuilt binary (linux/${goarch})...${PLAIN}"
+    cp "./bin/${APP_NAME}_linux_${goarch}" "${INSTALL_DIR}/${APP_NAME}"
+  elif [ -f "./${APP_NAME}" ]; then
+    echo -e "${CYAN}--> Using local binary...${PLAIN}"
+    cp "./${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}"
+  elif command -v go >/dev/null 2>&1 && [ -f "./main.go" ]; then
+    echo -e "${CYAN}--> Building from source with Go...${PLAIN}"
+    CGO_ENABLED=0 go build -ldflags "-s -w" -o "${INSTALL_DIR}/${APP_NAME}" .
+  else
+    echo -e "${CYAN}--> Downloading latest release binary (${goarch})...${PLAIN}"
+    local download_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${APP_NAME}_linux_${goarch}"
+    if ! curl -fsSL "${download_url}" -o "${INSTALL_DIR}/${APP_NAME}"; then
+      echo -e "${RED}Failed to download release binary from GitHub!${PLAIN}"
+      exit 1
     fi
+  fi
 
-    if [ ! -d "$CONFIG_DIR" ]; then
-        echo "=> 检测到配置目录不存在，正在创建: $CONFIG_DIR"
-        $SUDO mkdir -p "$CONFIG_DIR"
-    fi
+  chmod +x "${INSTALL_DIR}/${APP_NAME}"
+  echo -e "${GREEN}--> Binary installed to ${INSTALL_DIR}/${APP_NAME}${PLAIN}"
+}
 
-    if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
-        echo "=> 提示：证书已存在 ($CERT_PATH)，跳过生成步骤。"
+get_config_file() {
+  local mode="$1"
+  if [ "${mode}" == "client" ]; then
+    echo "${CONFIG_DIR}/config.client.json"
+  else
+    echo "${CONFIG_DIR}/config.server.json"
+  fi
+}
+
+install_config() {
+  local mode="$1"
+  local config_file
+  config_file=$(get_config_file "${mode}")
+  mkdir -p "${CONFIG_DIR}"
+
+  if [ ! -f "${config_file}" ]; then
+    if [ "${mode}" == "client" ]; then
+      if [ -f "./config.client.json" ]; then
+        cp "./config.client.json" "${config_file}"
+      else
+        echo -e "${CYAN}--> Fetching config.client.json from GitHub...${PLAIN}"
+        curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/master/config.client.json" -o "${config_file}" || true
+      fi
     else
-        echo "=> 正在生成自签 TLS 证书..."
-        if $SUDO openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-            -keyout "$KEY_PATH" -out "$CERT_PATH" \
-            -subj "/C=US/ST=Washington/L=Seattle/O=Amazon.com, Inc./OU=Amazon Web Services/CN=ec2.amazonaws.com"  >/dev/null 2>&1; then
-            echo "=> 证书生成成功！"
-        else
-            echo "错误：证书生成失败。请确保系统中已安装 openssl。"
-            return 1
-        fi
+      if [ -f "./config.server.json" ]; then
+        cp "./config.server.json" "${config_file}"
+      else
+        echo -e "${CYAN}--> Fetching config.server.json from GitHub...${PLAIN}"
+        curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/master/config.server.json" -o "${config_file}" || true
+      fi
     fi
+    echo -e "${GREEN}--> Created ${mode} configuration at ${config_file}${PLAIN}"
+  else
+    echo -e "${YELLOW}--> Existing configuration preserved at ${config_file}${PLAIN}"
+  fi
+}
 
-    # 设置目录和证书的所有权为 xhttptunnel 用户，限制其他用户读取私钥
-    echo "=> 设置配置文件和证书权限..."
-    $SUDO chown -R "$RUN_USER:$RUN_USER" "$CONFIG_DIR"
-    $SUDO chmod 750 "$CONFIG_DIR"
-    $SUDO chmod 644 "$CERT_PATH" 2>/dev/null || true
-    $SUDO chmod 600 "$KEY_PATH" 2>/dev/null || true
+install_systemd() {
+  local mode="$1"
+  local config_file
+  config_file=$(get_config_file "${mode}")
+  local desc="Split-HTTP / Meek Tunnel Server"
+  if [ "${mode}" == "client" ]; then
+    desc="Split-HTTP / Meek Tunnel Client"
+  fi
 
-    # 提取证书指纹
-    local cert_fingerprint=""
-    if [ -f "$CERT_PATH" ]; then
-        # 提取 SHA256 指纹，使用 cut 去掉前缀 "sha256 Fingerprint="
-        cert_fingerprint=$($SUDO openssl x509 -noout -fingerprint -sha256 -in "$CERT_PATH" | cut -d'=' -f2)
-    fi
-
-    # ================= 动态应用 PSK、Path 和 Fallback =================
-    local final_path
-    if [ -n "$CUSTOM_PATH" ]; then
-        final_path="$CUSTOM_PATH"
-        # 确保以 / 开头，提升容错率
-        [[ "$final_path" != /* ]] && final_path="/${final_path}"
-        echo "=> 使用指定的路径: ${final_path}"
-    else
-        final_path="/$(openssl rand -hex 2)/$(openssl rand -hex 2)"
-        echo "=> 已自动生成随机 2 层路径: ${final_path}"
-    fi
-
-    local final_psk
-    if [ -n "$CUSTOM_PSK" ]; then
-        final_psk="$CUSTOM_PSK"
-        echo "=> 使用指定的 PSK: ${final_psk}"
-    else
-        final_psk=$(openssl rand -hex 6)
-        echo "=> 已自动生成随机 12 位 PSK 密钥: ${final_psk}"
-    fi
-
-    local final_fallback
-    if [ -n "$CUSTOM_FALLBACK" ]; then
-        final_fallback="$CUSTOM_FALLBACK"
-        echo "=> 使用指定的 Fallback 伪装站点: ${final_fallback}"
-    else
-        final_fallback="http://ec2.amazonaws.com"
-        echo "=> 使用默认的 Fallback 伪装站点: ${final_fallback}"
-    fi
-    # ========================================================
-
-    echo "=> 正在写入 systemd 服务文件到: $SERVICE_PATH"
-    
-    $SUDO tee "$SERVICE_PATH" > /dev/null << EOF
+  cat <<EOF > "${SERVICE_FILE}"
 [Unit]
-Description=xHTTP Tunnel Server
-After=network.target network-online.target nss-lookup.target
-Wants=network-online.target
+Description=${APP_NAME} ${desc}
+After=network.target
 
 [Service]
 Type=simple
-User=${RUN_USER}
-Group=${RUN_USER}
-# 允许非 root 用户绑定特权端口 (如 80, 443)
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=yes
-
-ExecStart=/usr/local/bin/xhttptunnel server -default-target tcp://127.0.0.1:22 -listen :443 -path ${final_path} -cert /usr/local/etc/xhttptunnel/crt.crt -key /usr/local/etc/xhttptunnel/crt.key -psk ${final_psk} -fallback ${final_fallback} -loglevel warn
-
-Restart=on-failure
-RestartSec=5s
-StartLimitInterval=60s
-StartLimitBurst=10
-
+User=root
+WorkingDirectory=${CONFIG_DIR}
+ExecStart=${INSTALL_DIR}/${APP_NAME} -c ${config_file}
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=always
+RestartSec=3s
 LimitNOFILE=1048576
-LimitNPROC=1048576
-MemoryHigh=512M
-MemoryMax=1G
-OOMScoreAdjust=100
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    echo "=> 正在重载 systemd 守护进程以应用新服务..."
-    $SUDO systemctl daemon-reload
-
-    echo "======================================================"
-    echo "=> xhttptunnel 基础环境已配置完成！"
-    echo "=> 【安全】当前服务将以非特权用户 (${RUN_USER}) 身份运行。"
-    echo "=> 【重要】请记录以下信息用于客户端配置："
-    echo "   当前路径: ${final_path}"
-    echo "   PSK 密钥: ${final_psk}"
-    echo "   伪装站点: ${final_fallback}"
-    if [ -n "$cert_fingerprint" ]; then
-        echo "   证书指纹: ${cert_fingerprint}"
-    fi
-    echo "------------------------------------------------------"
-    echo "=> 常用操作命令："
-    echo "   启动服务: $SUDO systemctl start xhttptunnel"
-    echo "   开机自启: $SUDO systemctl enable xhttptunnel"
-    echo "   查看状态: $SUDO systemctl status xhttptunnel"
-    echo "   查看日志: $SUDO journalctl -u xhttptunnel -f"
-    echo "======================================================"
+  systemctl daemon-reload
+  systemctl enable "${APP_NAME}" >/dev/null 2>&1 || true
+  echo -e "${GREEN}--> Systemd service registered: ${APP_NAME}.service (${mode} mode)${PLAIN}"
 }
 
-clear_xhttptunnel_env() {
-    echo "=> 准备清理 xhttptunnel 运行环境..."
+do_install() {
+  local mode="${1:-server}"
+  local config_file
+  config_file=$(get_config_file "${mode}")
 
-    if systemctl list-unit-files | grep -q "^xhttptunnel.service"; then
-        echo "=> 正在停止并禁用 xhttptunnel 服务..."
-        $SUDO systemctl stop xhttptunnel
-        $SUDO systemctl disable xhttptunnel
+  check_root
+  echo -e "${GREEN}========================================${PLAIN}"
+  echo -e "${GREEN}  Installing ${APP_NAME} (${mode} mode)...${PLAIN}"
+  echo -e "${GREEN}========================================${PLAIN}"
+
+  install_binary
+  install_config "${mode}"
+  install_systemd "${mode}"
+
+  systemctl restart "${APP_NAME}" || true
+
+  echo ""
+  echo -e "${GREEN}=== Installation Complete (${mode} mode)! ===${PLAIN}"
+  echo -e "Configuration: ${CYAN}${config_file}${PLAIN}"
+  echo -e "Service Name:  ${CYAN}${APP_NAME}${PLAIN}"
+  echo -e "Start:         ${CYAN}systemctl start ${APP_NAME}${PLAIN}"
+  echo -e "Status:        ${CYAN}systemctl status ${APP_NAME}${PLAIN}"
+  echo -e "View Logs:     ${CYAN}journalctl -u ${APP_NAME} -f${PLAIN}"
+  echo ""
+
+  if [ "${mode}" != "client" ]; then
+    echo -e "${GREEN}=== Stun Node Sharing URI & QR ===${PLAIN}"
+    "${INSTALL_DIR}/${APP_NAME}" gen-uri -c "${config_file}" $(gen_uri_extra_args) || true
+    if [ -n "${GEN_URI_PIN:-}" ]; then
+      echo -e "${YELLOW}    Share PIN (via GEN_URI_PIN): ${GEN_URI_PIN}${PLAIN}"
     else
-        echo "=> 提示：未检测到注册的 xhttptunnel 服务状态。"
+      echo -e "${YELLOW}    A random PIN was printed above — note it to import the URI.${PLAIN}"
     fi
-
-    if [ -f "$SERVICE_PATH" ]; then
-        echo "=> 正在删除系统服务配置文件: $SERVICE_PATH"
-        $SUDO rm -f "$SERVICE_PATH"
-        echo "=> 重新加载 systemd 守护进程..."
-        $SUDO systemctl daemon-reload
-    fi
-
-    if [ -d "$CONFIG_DIR" ]; then
-        echo "=> 正在删除配置目录及其包含的证书: $CONFIG_DIR"
-        $SUDO rm -rf "$CONFIG_DIR"
-    else
-        echo "=> 提示：配置目录已不存在 ($CONFIG_DIR)。"
-    fi
-
-    if id -u "$RUN_USER" >/dev/null 2>&1; then
-        echo "=> 正在删除非特权系统用户: $RUN_USER"
-        $SUDO userdel "$RUN_USER" 2>/dev/null || true
-    fi
-
-    echo "======================================================"
-    echo "=> 环境清理完毕！"
-    echo "======================================================"
+  fi
 }
 
-# ================= 主程序入口 =================
-if [ -z "$ACTION" ]; then
-    echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>] [--fallback <URL>]"
-    echo "  install   - 安装依赖、下载最新版本、配置证书和服务，并启动"
-    echo "  uninstall - 停止服务、删除二进制文件、清理证书和配置"
-    echo "  update    - 安装依赖、停止当前服务、更新二进制文件并重启服务"
+do_upgrade() {
+  check_root
+  echo -e "${YELLOW}========================================${PLAIN}"
+  echo -e "${YELLOW}  Upgrading ${APP_NAME}...${PLAIN}"
+  echo -e "${YELLOW}========================================${PLAIN}"
+
+  install_binary
+  systemctl daemon-reload
+  systemctl restart "${APP_NAME}" || true
+
+  echo -e "${GREEN}=== Upgrade Completed! Service restarted. ===${PLAIN}"
+  "${INSTALL_DIR}/${APP_NAME}" version || true
+}
+
+do_uninstall() {
+  check_root
+  echo -e "${RED}========================================${PLAIN}"
+  echo -e "${RED}  Uninstalling ${APP_NAME}...${PLAIN}"
+  echo -e "${RED}========================================${PLAIN}"
+
+  systemctl stop "${APP_NAME}" >/dev/null 2>&1 || true
+  systemctl disable "${APP_NAME}" >/dev/null 2>&1 || true
+  rm -f "${SERVICE_FILE}"
+  systemctl daemon-reload
+
+  rm -f "${INSTALL_DIR}/${APP_NAME}"
+
+  echo -e "${GREEN}--> Binary and service removed.${PLAIN}"
+  echo -e "${YELLOW}Note: Configuration directory (${CONFIG_DIR}) was kept for safety.${PLAIN}"
+  echo -e "To delete configuration permanently: ${CYAN}rm -rf ${CONFIG_DIR}${PLAIN}"
+  echo -e "${GREEN}=== ${APP_NAME} Uninstalled Successfully! ===${PLAIN}"
+}
+
+do_start() {
+  check_root
+  systemctl start "${APP_NAME}"
+  echo -e "${GREEN}${APP_NAME} started.${PLAIN}"
+}
+
+do_stop() {
+  check_root
+  systemctl stop "${APP_NAME}"
+  echo -e "${YELLOW}${APP_NAME} stopped.${PLAIN}"
+}
+
+do_restart() {
+  check_root
+  systemctl restart "${APP_NAME}"
+  echo -e "${GREEN}${APP_NAME} restarted.${PLAIN}"
+}
+
+do_status() {
+  systemctl status "${APP_NAME}"
+}
+
+do_logs() {
+  journalctl -u "${APP_NAME}" -f -n 50
+}
+
+do_uri() {
+  local config_file="${CONFIG_DIR}/config.server.json"
+  if [ ! -f "${config_file}" ]; then
+    config_file="${CONFIG_DIR}/config.json"
+  fi
+  "${INSTALL_DIR}/${APP_NAME}" gen-uri -c "${config_file}" $(gen_uri_extra_args)
+}
+
+action="${1:-install}"
+target_mode="${2:-server}"
+
+case "${action}" in
+  server)
+    action="install"
+    target_mode="server"
+    ;;
+  client)
+    action="install"
+    target_mode="client"
+    ;;
+  install-server)
+    action="install"
+    target_mode="server"
+    ;;
+  install-client)
+    action="install"
+    target_mode="client"
+    ;;
+esac
+
+case "${action}" in
+  install)
+    do_install "${target_mode}"
+    ;;
+  upgrade|update)
+    do_upgrade
+    ;;
+  uninstall|remove)
+    do_uninstall
+    ;;
+  start)
+    do_start
+    ;;
+  stop)
+    do_stop
+    ;;
+  restart)
+    do_restart
+    ;;
+  status)
+    do_status
+    ;;
+  logs|log)
+    do_logs
+    ;;
+  uri|qr)
+    do_uri
+    ;;
+  *)
+    echo "Usage: $0 {install [server|client]|upgrade|uninstall|start|stop|restart|status|logs|uri}"
     exit 1
-fi
-
-case "$ACTION" in
-    install)
-        echo "======================================================"
-        echo "=> 开始执行安装流程..."
-        echo "======================================================"
-        install_dependencies
-        download_latest_xhttptunnel
-        setup_xhttptunnel_env
-        
-        echo "=> 正在启动并设置开机自启 xhttptunnel 服务..."
-        $SUDO systemctl enable --now xhttptunnel
-        
-        echo "=> xhttptunnel 安装并启动完成！"
-        ;;
-        
-    uninstall)
-        echo "======================================================"
-        echo "=> 开始执行卸载流程..."
-        echo "======================================================"
-        
-        if systemctl list-unit-files | grep -q "^xhttptunnel.service"; then
-            echo "=> 正在停止并禁用服务..."
-            $SUDO systemctl disable --now xhttptunnel
-        fi
-        
-        remove_xhttptunnel
-        clear_xhttptunnel_env
-        
-        echo "=> xhttptunnel 已完全卸载！"
-        ;;
-        
-    update)
-        echo "======================================================"
-        echo "=> 开始执行更新流程..."
-        echo "======================================================"
-        install_dependencies
-        
-        if systemctl is-active --quiet xhttptunnel; then
-            echo "=> 正在停止运行中的 xhttptunnel 服务..."
-            $SUDO systemctl stop xhttptunnel
-        fi
-        
-        download_latest_xhttptunnel
-        
-        if systemctl list-unit-files | grep -q "^xhttptunnel.service"; then
-            echo "=> 正在重启 xhttptunnel 服务..."
-            $SUDO systemctl start xhttptunnel
-            echo "=> 更新完成！服务已重新启动。"
-        else
-            echo "=> 更新完成！(提示：未检测到系统服务，请确认是否需要执行 install)"
-        fi
-        ;;
-        
-    *)
-        echo "错误：未知的指令 '$ACTION'"
-        echo "用法: bash $0 {install|uninstall|update} [--psk <密码>] [--path <路径>] [--fallback <URL>]"
-        exit 1
-        ;;
+    ;;
 esac

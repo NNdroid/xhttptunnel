@@ -178,7 +178,28 @@ func TestReliableBuffer_Close(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// 關閉緩衝區，必須能立刻喚醒並中斷上面的 Goroutine
+	// 關閉緩衝區，必須能立刻喚醒並中断上面的 Goroutine
 	rb.Close()
 	wg.Wait()
+}
+
+// 測試 6：併發關閉與 PutReadData 競爭測試 (防範 nil map panic)
+func TestMeekVirtualConn_ConcurrentClosePutReadData(t *testing.T) {
+	conn := newMeekVirtualConn("test-race", stringAddr("127.0.0.1:1"), stringAddr("127.0.0.1:2"))
+	var wg sync.WaitGroup
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				conn.PutReadData(uint64(idx*100+j), []byte("race-test-data"))
+			}
+		}(i)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	_ = conn.Close()
+	wg.Wait()
+	t.Log("✅ 併發關閉下 PutReadData 零 Panic 成功通過！")
 }

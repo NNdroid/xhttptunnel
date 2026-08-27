@@ -1,0 +1,29 @@
+{
+  "_description": "xhttptunnel Split-HTTP / Meek Streaming Client Configuration",
+  "_fields": {
+    "mode": "Operational mode: 'client'",
+    "listen": "Local TCP listening address for applications to connect to (e.g. tcp://127.0.0.1:1080)",
+    "server": "Remote xhttptunnel server streaming URL (e.g. https://example.com:8443/stream)",
+    "target": "Target backend service to connect through the tunnel (e.g. 127.0.0.1:22)",
+    "psk": "Pre-shared key / token matching server (aliases: token, auth_token)",
+    "sni": "TLS Server Name Indication (SNI) disguise domain",
+    "host": "HTTP Host header disguise domain",
+    "alpn": "HTTP protocol ALPN negotiation: 'auto', 'h3', 'h2', 'http/1.1'",
+    "fingerprint": "Expected SHA256 hex fingerprint of server certificate (optional certificate pinning)",
+    "max_conns": "Maximum concurrent client connections allowed",
+    "dump": "Dump raw packet hex data in logs for low-level debugging",
+    "log_level": "Logging verbosity: debug, info, warn, error"
+  },
+  "mode": "client",
+  "listen": "tcp://127.0.0.1:1080",
+  "server": "https://example.com:8443/stream",
+  "target": "127.0.0.1:22",
+  "psk": "my-secret-token",
+  "sni": "www.bing.com",
+  "host": "www.bing.com",
+  "alpn": "auto",
+  "fingerprint": "",
+  "max_conns": 512,
+  "dump": false,
+  "log_level": "info"
+}

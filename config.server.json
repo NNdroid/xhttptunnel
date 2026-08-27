@@ -1,0 +1,31 @@
+{
+  "_description": "xhttptunnel Split-HTTP / Meek Streaming Server Configuration",
+  "_fields": {
+    "mode": "Operational mode: 'server'",
+    "listen": "Server listening address (e.g. :8443)",
+    "path": "Custom Split-HTTP endpoint path (e.g. /stream)",
+    "target": "Default backend service to forward tunnel traffic to (e.g. tcp://127.0.0.1:22 or udp://127.0.0.1:51820)",
+    "psk": "Pre-shared key / token for authentication (aliases: token, auth_token)",
+    "selfsign": "Automatically generate simulated Amazon/Bing CDN self-signed TLS certificate if cert/key omitted",
+    "selfsign_cn": "Common Name for auto self-signed certificate (e.g. www.bing.com)",
+    "cert": "Optional path to custom TLS certificate file",
+    "key": "Optional path to custom TLS private key file",
+    "fallback": "Decoy URL to transparently proxy unauthorized requests to (e.g. https://www.bing.com)",
+    "max_sessions": "Maximum concurrent tunnel sessions allowed on server",
+    "dump": "Dump raw packet hex data in logs for low-level debugging",
+    "log_level": "Logging verbosity: debug, info, warn, error"
+  },
+  "mode": "server",
+  "listen": ":8443",
+  "path": "/stream",
+  "target": "tcp://127.0.0.1:22",
+  "psk": "my-secret-token",
+  "selfsign": true,
+  "selfsign_cn": "www.bing.com",
+  "cert": "",
+  "key": "",
+  "fallback": "https://www.bing.com",
+  "max_sessions": 2000,
+  "dump": false,
+  "log_level": "info"
+}

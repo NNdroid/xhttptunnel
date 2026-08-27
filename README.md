@@ -1,36 +1,71 @@
 # xhttptunnel
 
-xhttptunnel is a high-performance, anti-censorship HTTP/2 & HTTP/3 tunnel tool designed for complex network environments. It effectively obfuscates traffic signatures and bypasses Deep Packet Inspection (DPI) through dynamic padding, sliding windows, and long-polling mechanisms.
+High-Performance Bidirectional Split-HTTP / Meek Streaming Tunnel Server & Client with Session Multiplexing.
 
-## ✨ Core Features
+## Features
 
-* **Multi-Protocol Transport Engine**: Supports plain text H2C, TLS (HTTP/2), and QUIC-based HTTP/3 transport.
-* **Full-Stack Traffic Proxying**: Native support for efficient multiplexing and forwarding of both TCP and UDP traffic, with built-in automatic recycling of idle UDP sessions.
-* **Deep Traffic Obfuscation (DPI Bypass)**: Built-in frame-level dynamic Padding and 0xFFFF signaling armor completely break traffic fingerprinting.
-* **Connection State Optimization**: Uses a custom high-performance reliable transport buffer (Seq/Ack mechanism), combined with intelligent server-side long-polling and heartbeat back-off algorithms, achieving `0` latency with extremely low CPU and network overhead.
-* **Minimalist Deployment**: Comes with a one-click installation script, supporting automated configuration of systemd services and self-signed certificates.
-
-## 🚀 Quick Installation (Server)
-
-We provide a one-click installation script that automatically installs dependencies, pulls the latest release, and configures the background daemon.
-
-### Option 1: Fully Automatic Installation (Recommended)
-Automatically generates a random PSK key and a random 2-level Path route to enhance security:
-```bash
-bash -c "$(curl -L https://raw.githubusercontent.com/NNdroid/xhttptunnel/refs/heads/main/scripts/install.sh)" @ install
-```
-
-### Option 2: Custom Parameter Installation
-Manually specify your desired PSK key and proxy path:
-```bash
-bash -c "$(curl -L https://raw.githubusercontent.com/NNdroid/xhttptunnel/refs/heads/main/scripts/install.sh)" @ install --psk your_psk --path /your/path
-```
-
-> **Note:** The script also supports `uninstall` (complete removal) and `update` (updates the core program while retaining configuration) commands.
-
-## 📱 Client Support
-
-* [**Stun**](https://github.com/NNdroid/Stun) - Official Android client implementation, supporting VpnService-based and underlying Root-level global transparent proxying.
+- **Split-HTTP Bidirectional Streaming**: High-throughput uplink POST chunking and downlink streaming with automatic sequence reconstruction.
+- **Reliable Packet Ring Buffer**: Zero-lock concurrent ring buffer preventing chunk drop and memory leak.
+- **Auto Self-Signed TLS & Domain Camouflage**: Auto-generates simulated ECDSA TLS certificates matching Amazon / Bing CDN profiles.
+- **Health Check Probe (`/healthz`)**: Built-in HTTP probe endpoint for load balancers.
+- **Stun Node Sharing (`gen-uri`)**: One-click sharing URI (`xhttp://`) and terminal ASCII QR code generation for Android & TV.
+- **Active Fallback Camouflage**: Transparent reverse proxy forwarding to decoy web services for unauthorized probes.
 
 ---
-*© NNdroid 2026*
+
+## One-Key Management (Linux Server & Client)
+
+### 1. Server Installation (Default)
+```bash
+curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/master/scripts/install.sh | sudo bash -s install server
+```
+
+### 2. Client Installation (Linux)
+```bash
+curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/master/scripts/install.sh | sudo bash -s install client
+```
+
+### 3. Upgrade / Uninstall
+```bash
+# One-key Upgrade (Keeps existing config.json)
+curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/master/scripts/install.sh | sudo bash -s upgrade
+
+# One-key Uninstall
+curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/master/scripts/install.sh | sudo bash -s uninstall
+```
+
+### 4. Service Management
+```bash
+systemctl start xhttptunnel    # Start service
+systemctl stop xhttptunnel     # Stop service
+systemctl restart xhttptunnel  # Restart service
+systemctl status xhttptunnel   # Check status
+journalctl -u xhttptunnel -f   # View live logs
+```
+
+---
+
+## Configuration Reference (`config.json`)
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `mode` | `string` | `"server"` | Operational mode: `"server"` or `"client"`. |
+| `listen` | `string` | `":8443"` | Listen address (`":8443"` for server; `"tcp://127.0.0.1:1080"` for client). |
+| `server` | `string` | `""` | Server endpoint URL for client mode (e.g. `"https://example.com:8443/stream"`). |
+| `target` | `string` | `"tcp://127.0.0.1:22"` | Target service address (`tcp://127.0.0.1:22` or `udp://127.0.0.1:51820`). |
+| `path` | `string` | `"/stream"` | Custom Split-HTTP proxy path. |
+| `psk` | `string` | `"my-secret-token"` | Pre-shared key / token for authentication (aliases `token`/`auth_token`). |
+| `selfsign` | `bool` | `true` | Auto-generate self-signed TLS certificate if `cert`/`key` omitted. |
+| `selfsign_cn` | `string` | `"www.bing.com"` | Common Name (SNI) for generated certificate. |
+| `fallback` | `string` | `""` | Fallback URL or host for unauthorized requests. |
+| `log_level` | `string` | `"info"` | Logging output level: `debug`, `info`, `warn`, `error`. |
+| `max_sessions` | `int` | `2000` | Server max concurrent sessions. |
+
+---
+
+## Quick Start
+
+### 1. Export Stun QR Code & Sharing Link
+```bash
+xhttptunnel gen-uri -c /etc/xhttptunnel/config.json
+```
