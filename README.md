@@ -17,21 +17,21 @@ High-Performance Bidirectional Split-HTTP / Meek Streaming Tunnel Server & Clien
 
 ### 1. Server Installation (Default)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/master/scripts/install.sh | sudo bash -s install server
+curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/main/scripts/install.sh | sudo bash -s install server
 ```
 
 ### 2. Client Installation (Linux)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/master/scripts/install.sh | sudo bash -s install client
+curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/main/scripts/install.sh | sudo bash -s install client
 ```
 
 ### 3. Upgrade / Uninstall
 ```bash
 # One-key Upgrade (Keeps existing config.json)
-curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/master/scripts/install.sh | sudo bash -s upgrade
+curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/main/scripts/install.sh | sudo bash -s upgrade
 
 # One-key Uninstall
-curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/master/scripts/install.sh | sudo bash -s uninstall
+curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/main/scripts/install.sh | sudo bash -s uninstall
 ```
 
 ### 4. Service Management

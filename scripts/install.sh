@@ -55,20 +55,38 @@ install_binary() {
 
   if [ -f "./bin/${APP_NAME}_linux_${goarch}" ]; then
     echo -e "${CYAN}--> Using local prebuilt binary (linux/${goarch})...${PLAIN}"
-    cp "./bin/${APP_NAME}_linux_${goarch}" "${INSTALL_DIR}/${APP_NAME}"
+    cp -f "./bin/${APP_NAME}_linux_${goarch}" "${INSTALL_DIR}/${APP_NAME}"
   elif [ -f "./${APP_NAME}" ]; then
     echo -e "${CYAN}--> Using local binary...${PLAIN}"
-    cp "./${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}"
+    cp -f "./${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}"
   elif command -v go >/dev/null 2>&1 && [ -f "./main.go" ]; then
     echo -e "${CYAN}--> Building from source with Go...${PLAIN}"
     CGO_ENABLED=0 go build -ldflags "-s -w" -o "${INSTALL_DIR}/${APP_NAME}" .
   else
     echo -e "${CYAN}--> Downloading latest release binary (${goarch})...${PLAIN}"
     local download_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${APP_NAME}_linux_${goarch}"
-    if ! curl -fsSL "${download_url}" -o "${INSTALL_DIR}/${APP_NAME}"; then
-      echo -e "${RED}Failed to download release binary from GitHub!${PLAIN}"
+    local tmp_bin
+    tmp_bin=$(mktemp "/tmp/${APP_NAME}.XXXXXX" 2>/dev/null || echo "/tmp/${APP_NAME}.$$")
+
+    # Check if target path is accidentally a directory
+    if [ -d "${INSTALL_DIR}/${APP_NAME}" ]; then
+      echo -e "${RED}Error: ${INSTALL_DIR}/${APP_NAME} is a directory! Please remove it first.${PLAIN}" >&2
+      rm -f "${tmp_bin}"
       exit 1
     fi
+
+    # Direct download from GitHub Releases
+    if ! curl -fL --retry 3 --connect-timeout 15 -o "${tmp_bin}" "${download_url}" || [ ! -s "${tmp_bin}" ]; then
+      rm -f "${tmp_bin}"
+      echo -e "${RED}Failed to download release binary from GitHub!${PLAIN}"
+      echo -e "${YELLOW}Download URL: ${download_url}${PLAIN}"
+      echo -e "${YELLOW}Please check network connectivity or disk space.${PLAIN}"
+      exit 1
+    fi
+
+    chmod +x "${tmp_bin}"
+    # Atomically replace target binary using mv (handles running process / ETXTBSY)
+    mv -f "${tmp_bin}" "${INSTALL_DIR}/${APP_NAME}"
   fi
 
   chmod +x "${INSTALL_DIR}/${APP_NAME}"
@@ -90,20 +108,66 @@ install_config() {
   config_file=$(get_config_file "${mode}")
   mkdir -p "${CONFIG_DIR}"
 
-  if [ ! -f "${config_file}" ]; then
+  if [ ! -f "${config_file}" ] || [ ! -s "${config_file}" ]; then
+    local fetched=0
     if [ "${mode}" == "client" ]; then
       if [ -f "./config.client.json" ]; then
-        cp "./config.client.json" "${config_file}"
+        cp -f "./config.client.json" "${config_file}"
+        fetched=1
       else
         echo -e "${CYAN}--> Fetching config.client.json from GitHub...${PLAIN}"
-        curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/master/config.client.json" -o "${config_file}" || true
+        if curl -fsSL --retry 2 "https://raw.githubusercontent.com/${GITHUB_REPO}/main/config.client.json" -o "${config_file}" 2>/dev/null && [ -s "${config_file}" ]; then
+          fetched=1
+        fi
+      fi
+      if [ "${fetched}" -ne 1 ]; then
+        echo -e "${CYAN}--> Generating default client configuration...${PLAIN}"
+        cat <<'EOF' > "${config_file}"
+{
+  "mode": "client",
+  "listen": "tcp://127.0.0.1:1080",
+  "server": "https://example.com:8443/stream",
+  "target": "127.0.0.1:22",
+  "psk": "my-secret-token",
+  "sni": "www.bing.com",
+  "host": "www.bing.com",
+  "alpn": "auto",
+  "fingerprint": "",
+  "max_conns": 512,
+  "dump": false,
+  "log_level": "info"
+}
+EOF
       fi
     else
       if [ -f "./config.server.json" ]; then
-        cp "./config.server.json" "${config_file}"
+        cp -f "./config.server.json" "${config_file}"
+        fetched=1
       else
         echo -e "${CYAN}--> Fetching config.server.json from GitHub...${PLAIN}"
-        curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/master/config.server.json" -o "${config_file}" || true
+        if curl -fsSL --retry 2 "https://raw.githubusercontent.com/${GITHUB_REPO}/main/config.server.json" -o "${config_file}" 2>/dev/null && [ -s "${config_file}" ]; then
+          fetched=1
+        fi
+      fi
+      if [ "${fetched}" -ne 1 ]; then
+        echo -e "${CYAN}--> Generating default server configuration...${PLAIN}"
+        cat <<'EOF' > "${config_file}"
+{
+  "mode": "server",
+  "listen": ":8443",
+  "path": "/stream",
+  "target": "tcp://127.0.0.1:22",
+  "psk": "my-secret-token",
+  "selfsign": true,
+  "selfsign_cn": "www.bing.com",
+  "cert": "",
+  "key": "",
+  "fallback": "https://www.bing.com",
+  "max_sessions": 2000,
+  "dump": false,
+  "log_level": "info"
+}
+EOF
       fi
     fi
     echo -e "${GREEN}--> Created ${mode} configuration at ${config_file}${PLAIN}"
