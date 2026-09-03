@@ -182,3 +182,83 @@ func TestXHTTPTunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 
 	t.Logf("✅ Live E2E XHTTPTunnel via JSON Config PASSED!")
 }
+
+func TestApplyChunkSizeClamping(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       int
+		wantSize int // bytes
+	}{
+		{"default", 0, 256 * 1000},
+		{"in-range", 512, 512 * 1000},
+		{"too-small-clamps-to-16k", 1, 16 * 1000},
+		{"negative-treats-as-default", -5, 256 * 1000},
+		{"too-big-clamps-to-900k", 10000, 900 * 1000},
+		{"exact-max", 900, 900 * 1000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			applyChunkSize(tc.in)
+			if maxsendBufSize != tc.wantSize {
+				t.Fatalf("maxsendBufSize = %d, want %d", maxsendBufSize, tc.wantSize)
+			}
+			if maxframeSize != maxsendBufSize+framePaddingBudget {
+				t.Fatalf("maxframeSize = %d, want %d", maxframeSize, maxsendBufSize+framePaddingBudget)
+			}
+		})
+	}
+	// Restore defaults so parallel tests are not affected.
+	applyChunkSize(0)
+}
+
+func TestApplyServerOptions(t *testing.T) {
+	// allowed_targets + trust_proxy_headers are wired through to the globals.
+	applyServerOptions(&FileConfig{
+		AllowedTargets:    []string{"127.0.0.1:22", ":8080", "db:"},
+		TrustProxyHeaders: true,
+	})
+	if len(allowedTargets) != 3 {
+		t.Fatalf("allowedTargets = %v, want 3 entries", allowedTargets)
+	}
+	if !trustProxyHeaders {
+		t.Fatal("trustProxyHeaders not applied")
+	}
+	// targetAllowed must honour the allowlist forms.
+	if !targetAllowed("127.0.0.1:22") {
+		t.Error("exact host:port should be allowed")
+	}
+	if !targetAllowed("10.0.0.5:8080") {
+		t.Error(":port form should allow any host on that port")
+	}
+	if !targetAllowed("db:5432") {
+		t.Error("host: form should allow any port on that host")
+	}
+	if targetAllowed("evil.com:443") {
+		t.Error("non-listed target must be rejected")
+	}
+	// Empty allowlist = allow all. At startup the global is nil; an empty
+	// config must not restrict anything.
+	allowedTargets = nil
+	if !targetAllowed("anything:1") {
+		t.Error("empty allowlist must allow everything")
+	}
+	// Restore defaults: the E2E suite creates servers via ListenXHTTP directly
+	// (bypassing applyServerOptions) and relies on allow-all.
+	allowedTargets = nil
+	trustProxyHeaders = false
+}
+
+func TestApplyClientOptions(t *testing.T) {
+	// idle_timeout is applied as a duration.
+	applyClientOptions(&FileConfig{IdleTimeout: 42})
+	if clientIdleTimeout != 42*time.Second {
+		t.Fatalf("clientIdleTimeout = %v, want %v", clientIdleTimeout, 42*time.Second)
+	}
+	// Zero (unset) keeps the default.
+	applyClientOptions(&FileConfig{})
+	if clientIdleTimeout != 42*time.Second {
+		t.Fatalf("clientIdleTimeout changed when field unset: %v", clientIdleTimeout)
+	}
+	// Restore the default to avoid leaking state into other tests.
+	applyClientOptions(&FileConfig{IdleTimeout: 900})
+}

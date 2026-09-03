@@ -25,6 +25,19 @@ const (
 	shareKeyLen     = 32
 )
 
+// Security note on the share PIN:
+//
+// The default PIN space is 6 decimal digits (~20 bits) with PBKDF2-HMAC-SHA256
+// at 10k iterations — strong enough against casual offline guessing of a
+// short-lived share link, but NOT against a determined attacker who captures
+// the stun:// URI and brute-forces offline. This is a deliberate trade-off:
+// both the length and the iteration count are pinned by ShareCryptoUtils on
+// the Android / TV side, so they CANNOT be changed unilaterally here — the two
+// implementations would silently lose interoperability.
+//
+// If a future protocol bump ("v": 2) is coordinated with the app, prefer
+// longer numeric/alphanumeric PINs AND raising shareIterations together.
+
 // shareEnvelope mirrors the JSON envelope produced by ShareCryptoUtils.encrypt:
 //
 //	{ "v": 1, "g": 0|1, "s": base64(salt), "i": base64(iv), "c": base64(ciphertext) }
@@ -131,7 +144,10 @@ func encryptStunURI(plainText []byte, pin string) (uri, usedPin string, err erro
 // and any future import tooling. Accepts the URI with or without the "stun://" scheme.
 func decryptStunURI(payload, pin string) (string, error) {
 	clean := payload
-	if len(clean) > 7 && clean[:7] == "stun://" {
+	// >= not >: a bare "stun://" (exactly 7 bytes) must still have the scheme
+	// stripped, otherwise it is handed to the base64 decoder and surfaces as a
+	// confusing "illegal base64 data" error instead of "empty payload".
+	if len(clean) >= 7 && clean[:7] == "stun://" {
 		clean = clean[7:]
 	}
 	// Strip whitespace / BOM the way the Android client does before decoding.

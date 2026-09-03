@@ -13,15 +13,31 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 var (
+	// version may be injected at link time with
+	//   -ldflags "-X main.version=<semver>"
+	// It intentionally shadows Version (kept for backward compatibility) so a
+	// build script can stamp the binary without editing source.
+	version string
+
+	// Version is the human-facing version string. Prefer versionString() so a
+	// linker-injected version wins over the source default.
 	Version = "1.1.0"
 	logger  *zap.Logger
 )
+
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	return Version
+}
 
 func initLogger(levelStr string) {
 	config := zap.NewProductionConfig()
@@ -67,6 +83,21 @@ type FileConfig struct {
 	Dump          bool   `json:"dump"`           // Dump hex traffic
 	MaxSessions   int    `json:"max_sessions"`   // Server max concurrent sessions
 	MaxConns      int    `json:"max_conns"`      // Client max concurrent connections
+	// ChunkSizeKB caps the upstream payload carried by one poll request. The
+	// default (256) leaves headroom under the 1MB body limit that nginx and
+	// many CDN/WAF tiers enforce. Must be raised on BOTH ends together.
+	ChunkSizeKB int `json:"chunk_size_kb"`
+	// IdleTimeout (client) drops a local connection after this many seconds
+	// without traffic. Default 900. Idle SSH sessions need keepalives below it.
+	IdleTimeout int `json:"idle_timeout"`
+	// AllowedTargets (server) restricts which targets clients may request.
+	// Entries may be "host:port", ":port" or "host:". Empty = allow all.
+	AllowedTargets []string `json:"allowed_targets"`
+	// TrustProxyHeaders (server) makes the client address logged via
+	// CF-Connecting-IP / X-Forwarded-For / X-Real-IP headers instead of the
+	// socket peer. Those headers are spoofable, so keep this OFF unless the
+	// server is reachable only through a trusted CDN/proxy that strips them.
+	TrustProxyHeaders bool `json:"trust_proxy_headers"`
 }
 
 func (fc *FileConfig) UnmarshalJSON(data []byte) error {
@@ -173,10 +204,11 @@ func runGenURI(args []string) {
 	pin := fs.String("pin", "", "Share PIN (6 digits). Empty = auto-generate a random PIN")
 	_ = fs.Parse(args)
 
-	// 配置优先于内置默认，但命令行 flag 可覆盖配置中的任意字段
+	// The config file takes precedence over built-in defaults, but command-line
+	// flags can override any field of the config.
 	if *cfgPath != "" {
 		if fileCfg, err := loadConfigFile(*cfgPath); err == nil {
-			// 优先从 client 配置的 server URL 反解出公网 host/port
+			// Prefer deriving the public host/port from the client config's server URL
 			if *host == "" && fileCfg.ServerURL != "" {
 				if u, err := url.Parse(fileCfg.ServerURL); err == nil && u.Host != "" {
 					*host = u.Hostname()
@@ -205,7 +237,7 @@ func runGenURI(args []string) {
 		}
 	}
 
-	// 内置默认兜底
+	// Built-in defaults as a last resort
 	if *host == "" {
 		*host = "your-server-ip"
 	}
@@ -225,6 +257,41 @@ func runGenURI(args []string) {
 	uri := GenerateXHTTPTunnelURI(*host, *port, *path, *target, *psk, *sni, *remark, *pin, *insecure)
 	fmt.Printf("=== 📱 xhttptunnel Sharing URI (encrypted stun://) ===\n\n%s\n", uri)
 	PrintTerminalQR(uri)
+}
+
+// applyChunkSize clamps the user-supplied chunk size and recomputes the
+// derived wire limits. 16KB is the smallest useful block, 900KB keeps a frame
+// safely under a 1MB request-body ceiling once headers and padding are added.
+func applyChunkSize(kb int) {
+	if kb <= 0 {
+		kb = defaultChunkSize / 1000
+	}
+	if kb < 16 {
+		kb = 16
+	}
+	if kb > 900 {
+		kb = 900
+	}
+	maxsendBufSize = kb * 1000
+	maxframeSize = maxsendBufSize + framePaddingBudget
+}
+
+// applyServerOptions wires server-side tunables from the config file. Must run
+// before ListenXHTTP, because the session registry reads these at startup.
+func applyServerOptions(cfg *FileConfig) {
+	if len(cfg.AllowedTargets) > 0 {
+		allowedTargets = cfg.AllowedTargets
+	}
+	trustProxyHeaders = cfg.TrustProxyHeaders
+	applyChunkSize(cfg.ChunkSizeKB)
+}
+
+// applyClientOptions wires client-side tunables from the config file.
+func applyClientOptions(cfg *FileConfig) {
+	if cfg.IdleTimeout > 0 {
+		clientIdleTimeout = time.Duration(cfg.IdleTimeout) * time.Second
+	}
+	applyChunkSize(cfg.ChunkSizeKB)
 }
 
 func loadConfigFile(path string) (*FileConfig, error) {
@@ -272,11 +339,12 @@ func main() {
 	case "gen-systemd":
 		runGenSystemd(os.Args[2:])
 	case "version", "-v", "--version":
-		fmt.Printf("xhttptunnel version %s\n", Version)
+		fmt.Printf("xhttptunnel version %s\n", versionString())
 	case "help", "-h", "--help":
 		printUsage()
 	case "server":
 		cfg := resolveConfig(os.Args[2:])
+		applyServerOptions(cfg)
 		maxGlobalSessions = cfg.MaxSessions
 		if maxGlobalSessions == 0 {
 			maxGlobalSessions = 2000
@@ -325,6 +393,7 @@ func main() {
 
 	case "client":
 		cfg := resolveConfig(os.Args[2:])
+		applyClientOptions(cfg)
 		maxClientSessions = cfg.MaxConns
 		if maxClientSessions == 0 {
 			maxClientSessions = 2000
@@ -414,6 +483,7 @@ func runFromConfig(path string) {
 	defer logger.Sync()
 
 	if strings.ToLower(cfg.Mode) == "client" {
+		applyClientOptions(cfg)
 		if cfg.MaxConns > 0 {
 			maxClientSessions = cfg.MaxConns
 		}
@@ -441,6 +511,7 @@ func runFromConfig(path string) {
 		}
 		runClient(ctx, listen, serverURL, forward, cfg.PSK, cfg.SNI, cfg.Host, alpn, cfg.Dump, cfg.Fingerprint)
 	} else {
+		applyServerOptions(cfg)
 		if cfg.MaxSessions > 0 {
 			maxGlobalSessions = cfg.MaxSessions
 		}

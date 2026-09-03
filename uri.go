@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
+
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 type StunProfile struct {
@@ -93,7 +96,74 @@ func GenerateXHTTPTunnelURI(host, port, path, target, psk, sni, remark, pin stri
 	return stunURI
 }
 
+// PrintTerminalQR renders text as a scannable QR code on the terminal.
+//
+// The QR is drawn with unicode half-block glyphs plus explicit ANSI black/white
+// colors, so the polarity is correct regardless of the terminal theme (a plain
+// foreground-color rendering would come out inverted on dark-background
+// terminals and many scanners reject inverted codes). Falls back to printing
+// the raw text if the payload is too large to encode.
 func PrintTerminalQR(text string) {
 	fmt.Println("Scan in Stun Android / TV App (Supports stun:// and direct scan):")
-	fmt.Printf("\n  %s\n\n", text)
+
+	s, err := renderTerminalQR(text)
+	if err != nil {
+		fmt.Printf("\n  %s\n\n", text)
+		return
+	}
+	fmt.Print(s)
+}
+
+// renderTerminalQR encodes text into an ANSI-colored half-block QR string.
+// Each '▀' glyph covers a vertical pair of modules: its upper half takes the
+// foreground color (top module) and its lower half the background color
+// (bottom module). Dark modules are black, light modules are white.
+func renderTerminalQR(text string) (string, error) {
+	qr, err := qrcode.New(text, qrcode.Low)
+	if err != nil {
+		return "", err
+	}
+	bits := qr.Bitmap()
+
+	const (
+		fgBlack = "\x1b[30m"
+		fgWhite = "\x1b[97m"
+		bgBlack = "\x1b[40m"
+		bgWhite = "\x1b[47m"
+		reset   = "\x1b[0m"
+	)
+	fgColor := func(dark bool) string {
+		if dark {
+			return fgBlack
+		}
+		return fgWhite
+	}
+	bgColor := func(dark bool) string {
+		if dark {
+			return bgBlack
+		}
+		return bgWhite
+	}
+
+	// Pad an odd-height grid with one light row so the half-block pairing
+	// below stays uniform; the extra row is quiet zone below the bottom
+	// border and does not alter the code.
+	if len(bits)%2 == 1 {
+		bits = append(bits, make([]bool, len(bits[0])))
+	}
+
+	var b strings.Builder
+	b.WriteString("\n")
+	for y := 0; y < len(bits)-1; y += 2 {
+		b.WriteString("  ")
+		for x := range bits[y] {
+			b.WriteString(fgColor(bits[y][x]))
+			b.WriteString(bgColor(bits[y+1][x]))
+			b.WriteString("▀")
+		}
+		b.WriteString(reset)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	return b.String(), nil
 }

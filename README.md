@@ -61,6 +61,8 @@ journalctl -u xhttptunnel -f   # View live logs
 | `log_level` | `string` | `"info"` | Logging output level: `debug`, `info`, `warn`, `error`. |
 | `max_sessions` | `int` | `2000` | Server max concurrent sessions. |
 
+For a direct TLS deployment, `:8443` (or `tcp+udp://:8443`) starts HTTPS and HTTP/3 on the same port. Use `tcp://127.0.0.1:8443` for a cleartext CDN origin; without a certificate/key the server intentionally does not bind UDP or advertise HTTP/3.
+
 ---
 
 ## Quick Start

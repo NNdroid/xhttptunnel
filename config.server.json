@@ -2,11 +2,11 @@
   "_description": "xhttptunnel Split-HTTP / Meek Streaming Server Configuration",
   "_fields": {
     "mode": "Operational mode: 'server'",
-    "listen": "Server listening address (e.g. :8443)",
+    "listen": "Server address. Plain address or tcp+udp:// enables H3 only with TLS; tcp:// disables H3 for a CDN HTTP origin.",
     "path": "Custom Split-HTTP endpoint path (e.g. /stream)",
     "target": "Default backend service to forward tunnel traffic to (e.g. tcp://127.0.0.1:22 or udp://127.0.0.1:51820)",
     "psk": "Pre-shared key / token for authentication (aliases: token, auth_token)",
-    "selfsign": "Automatically generate simulated Amazon/Bing CDN self-signed TLS certificate if cert/key omitted",
+    "selfsign": "Automatically generate simulated Amazon/Bing CDN self-signed TLS certificate if cert/key omitted (set false for plain HTTP behind CDN)",
     "selfsign_cn": "Common Name for auto self-signed certificate (e.g. www.bing.com)",
     "cert": "Optional path to custom TLS certificate file",
     "key": "Optional path to custom TLS private key file",

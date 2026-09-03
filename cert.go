@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// verifyFingerprint 验证服务器证书指纹防 MITM
+// verifyFingerprint validates the server certificate fingerprint to prevent MITM.
 func verifyFingerprint(expectedHex string) func([][]byte, [][]*x509.Certificate) error {
 	if expectedHex == "" {
 		return nil
@@ -39,7 +39,8 @@ func verifyFingerprint(expectedHex string) func([][]byte, [][]*x509.Certificate)
 	}
 }
 
-// generateSelfSignedCert 生成有效期为 10 年的高仿真自签名证书并保存
+// generateSelfSignedCert generates a realistic-looking self-signed certificate
+// valid for 10 years and saves it to disk.
 func generateSelfSignedCert(certPath, keyPath, commonName string) error {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -56,9 +57,17 @@ func generateSelfSignedCert(certPath, keyPath, commonName string) error {
 		commonName = "localhost"
 	}
 
-	// Use a neutral SAN. Do NOT impersonate third-party domains (e.g. amazonaws.com)
-	// — that only invites phishing / MITM confusion; SNI disguise is handled separately
-	// via configuration, not the certificate subject.
+	// The SAN is neutral: it derives from the configured common name and never
+	// claims a third-party domain, so nothing here can be mistaken for a real
+	// certificate for someone else's host.
+	//
+	// The Subject/Issuer fields below are deliberately dressed to look like a
+	// public CA so a passive observer fingerprinting the certificate sees
+	// something boring. That is cosmetic ONLY. This is a self-signed
+	// certificate, so no client can build a trusted chain to it and the
+	// disguise buys no authentication whatsoever — real server authentication
+	// is done by pinning `fingerprint`, and the SNI/Host disguise is carried by
+	// configuration, not by the certificate.
 	dnsNames := []string{commonName, "*." + commonName}
 
 	template := x509.Certificate{

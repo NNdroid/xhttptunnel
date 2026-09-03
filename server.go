@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -22,11 +23,45 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
+const (
+	// longPollTimeout is how long a poll request parks on the server waiting
+	// for downlink data. It has to stay well below CDN/nginx idle timeouts
+	// (Cloudflare 524 fires at 100s, nginx proxy_read_timeout defaults to 60s)
+	// while being long enough to amortise request overhead. The client's
+	// close-flush grace is derived from this value.
+	longPollTimeout = 5 * time.Second
+	// serverDrainTimeout bounds how long a closing session waits for an
+	// in-flight poll to pick up its final bytes (the close frame) before it is
+	// removed from the registry and freed.
+	serverDrainTimeout = 2 * time.Second
+	// cleanerInterval is how often the session reaper sweeps the registry.
+	cleanerInterval = 1 * time.Minute
+	// sessionIdleTimeout is how long a session may go without a single poll
+	// before the reaper drops it. It has to exceed the client's poll cadence
+	// by a wide margin so a merely quiet tunnel is never mistaken for a dead
+	// one.
+	sessionIdleTimeout = 120 * time.Second
+)
+
 var (
 	meekSessions      = make(map[string]*meekVirtualConn)
 	meekMutex         sync.RWMutex
 	cleanerOnce       sync.Once
 	maxGlobalSessions = 2000
+
+	// allowedTargets restricts which forwarding targets a client may request.
+	// An entry matches when it equals the target exactly, ends with ":port"
+	// (any host on that port), or starts with "host:" (any port on that host).
+	// An empty list means every target is allowed. Written once at startup.
+	allowedTargets []string
+
+	// trustProxyHeaders controls whether client-supplied proxy headers
+	// (CF-Connecting-IP, X-Forwarded-For, X-Real-IP) are honoured when logging
+	// the client address. They are trivially spoofable, so this is OFF by
+	// default: RemoteAddr is used instead. Turn it on ONLY when the server is
+	// reachable exclusively through a trusted reverse proxy / CDN that strips
+	// these headers on ingress. Never enable it for direct public exposure.
+	trustProxyHeaders bool
 )
 
 type XHTTPListener struct {
@@ -50,8 +85,55 @@ func (l *XHTTPListener) Accept(ctx context.Context) (net.Conn, error) {
 		return nil, ctx.Err()
 	}
 }
-func (l *XHTTPListener) Close() error   { return l.ln.Close() }
-func (l *XHTTPListener) Addr() net.Addr { return l.ln.Addr() }
+func (l *XHTTPListener) Close() error {
+	// A udp://-only listener never touches l.ln; guard both handles so
+	// shutdown does not panic and always tears down what is open.
+	var err error
+	if l.ln != nil {
+		err = l.ln.Close()
+	}
+	if l.uln != nil {
+		if e := l.uln.Close(); err == nil {
+			err = e
+		}
+	}
+	return err
+}
+
+func (l *XHTTPListener) Addr() net.Addr {
+	if l.ln != nil {
+		return l.ln.Addr()
+	}
+	if l.uln != nil {
+		return l.uln.LocalAddr()
+	}
+	return nil
+}
+
+// targetAllowed reports whether a client-requested forwarding target may be
+// dialed. Allowlist entries support three forms: "host:port" (exact),
+// ":port" (any host on that port) and "host:" (any port on that host).
+func targetAllowed(target string) bool {
+	if len(allowedTargets) == 0 {
+		return true
+	}
+	for _, entry := range allowedTargets {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.HasSuffix(entry, ":") && strings.HasPrefix(target, entry) {
+			return true
+		}
+		if strings.HasPrefix(entry, ":") && strings.HasSuffix(target, entry) {
+			return true
+		}
+		if target == entry {
+			return true
+		}
+	}
+	return false
+}
 
 type ActiveTracker struct {
 	wg    sync.WaitGroup
@@ -142,9 +224,64 @@ func ParseListenAddr(listenAddr string) (string, string) {
 	return listenAddr, NetBoth
 }
 
+// constTimeEqual compares two strings without leaking where they first differ.
+func constTimeEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// redactAuth renders a credential header safe for logging as "<scheme> <n bytes>".
+// The header carries the shared PSK in cleartext ("Bearer <token>"), and debug
+// logs routinely end up in bug reports and log collectors, so it must never be
+// written out verbatim — the length is all a human ever needs to tell whether
+// a client sent credentials at all.
+func redactAuth(header string) string {
+	if header == "" {
+		return "-"
+	}
+	scheme, token, found := strings.Cut(header, " ")
+	if !found {
+		return fmt.Sprintf("<%d bytes>", len(header))
+	}
+	return fmt.Sprintf("%s <%d bytes>", scheme, len(token))
+}
+
+func getClientIP(r *http.Request) string {
+	// Proxy headers are client-controlled and therefore untrusted. Only read
+	// them when the operator has explicitly opted in via trust_proxy_headers
+	// (meaning a trusted CDN/proxy is known to strip them on ingress).
+	if trustProxyHeaders {
+		if cfIP := r.Header.Get("CF-Connecting-IP"); cfIP != "" {
+			return cfIP
+		}
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			return strings.TrimSpace(parts[0])
+		}
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return xri
+		}
+	}
+	return r.RemoteAddr
+}
+
 func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile, fallbackURL string) (*XHTTPListener, error) {
+	if (certFile == "") != (keyFile == "") {
+		return nil, fmt.Errorf("TLS requires both cert and key files")
+	}
+	tlsEnabled := certFile != ""
+
 	xl := &XHTTPListener{connCh: make(chan *xhttpFramedConn, 256), expectedToken: token}
 	rListenAddr, rNetwork := ParseListenAddr(listenAddr)
+	// HTTP/3 always uses QUIC over TLS. A cleartext origin behind a
+	// TLS-terminating CDN must only bind TCP; keeping a UDP socket open there
+	// wastes a port and falsely suggests that H3 is available.
+	if !tlsEnabled {
+		if rNetwork == NetUDP {
+			return nil, fmt.Errorf("udp listener requires TLS because HTTP/3 requires TLS")
+		}
+		rNetwork = NetTCP
+	}
+
 	if rNetwork == NetTCP || rNetwork == NetBoth {
 		ln, err := net.Listen("tcp", rListenAddr)
 		if err != nil {
@@ -154,34 +291,43 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		xl.srvTCP = true
 	}
 	if rNetwork == NetUDP || rNetwork == NetBoth {
-		ln, err := net.ListenPacket("udp", rListenAddr)
+		udpListenAddr := rListenAddr
+		// Independent TCP and UDP :0 binds choose unrelated ports. H3 has to
+		// use the same externally advertised port as HTTPS.
+		if xl.ln != nil {
+			udpListenAddr = xl.ln.Addr().String()
+		}
+		ln, err := net.ListenPacket("udp", udpListenAddr)
 		if err != nil {
+			if xl.ln != nil {
+				_ = xl.ln.Close()
+			}
 			return nil, err
 		}
 		xl.uln = ln
 		xl.srvUDP = true
 	}
 
+	// The session registry is process-global, so the reaper deliberately runs
+	// detached from any listener context: binding it to one meant that the
+	// first server to shut down (a test, a graceful restart) killed the only
+	// reaper for the lifetime of the process, after which stale sessions
+	// accumulated forever.
 	cleanerOnce.Do(func() {
 		go func() {
-			ticker := time.NewTicker(1 * time.Minute)
+			ticker := time.NewTicker(cleanerInterval)
 			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					now := time.Now().Unix()
-					meekMutex.Lock()
-					for id, v := range meekSessions {
-						if now-atomic.LoadInt64(&v.lastActive) > 120 {
-							logger.Debug("🧹 [Cleaner] 发现过期会话，清理释放资源", zap.String("session", id))
-							v.Close()
-							delete(meekSessions, id)
-						}
+			for range ticker.C {
+				now := time.Now().Unix()
+				meekMutex.Lock()
+				for id, v := range meekSessions {
+					if now-atomic.LoadInt64(&v.lastActive) > int64(sessionIdleTimeout.Seconds()) {
+						logger.Debug("🧹 [Cleaner] 发现过期会话，清理释放资源", zap.String("session", id))
+						v.Close()
+						delete(meekSessions, id)
 					}
-					meekMutex.Unlock()
 				}
+				meekMutex.Unlock()
 			}
 		}()
 	})
@@ -203,12 +349,13 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		clientIP := getClientIP(r)
 		logger.Debug("👀 [HTTP] 收到原始 HTTP 请求",
 			zap.String("method", r.Method),
 			zap.String("path", r.URL.Path),
-			zap.String("remote", r.RemoteAddr),
+			zap.String("remote", clientIP),
 			zap.String("session", r.Header.Get("X-Session-ID")),
-			zap.String("auth", r.Header.Get("Proxy-Authorization")),
+			zap.String("auth", redactAuth(r.Header.Get("Proxy-Authorization"))),
 		)
 		if r.URL.Path != path {
 			if fallbackProxy != nil {
@@ -225,7 +372,7 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		sessionID := r.Header.Get("X-Session-ID")
 
 		if sessionID == "" {
-			logger.Warn("❌ [HTTP] 拒绝请求: 缺少 Session ID", zap.String("remote", r.RemoteAddr))
+			logger.Warn("❌ [HTTP] 拒绝请求: 缺少 Session ID", zap.String("remote", clientIP))
 			nginxError(w, http.StatusBadRequest)
 			return
 		}
@@ -239,7 +386,15 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			authed := false
 			for _, tok := range tokens {
 				cleanTok := strings.TrimSpace(tok)
-				if cleanTok != "" && (authHeader == "Bearer "+cleanTok || authHeader == cleanTok || customTokenHeader == cleanTok) {
+				if cleanTok == "" {
+					continue
+				}
+				// Compared in constant time: a plain == short-circuits on the
+				// first differing byte, which hands an attacker a byte-at-a-
+				// time oracle on the shared secret.
+				if constTimeEqual(authHeader, "Bearer "+cleanTok) ||
+					constTimeEqual(authHeader, cleanTok) ||
+					constTimeEqual(customTokenHeader, cleanTok) {
 					authed = true
 					break
 				}
@@ -256,6 +411,14 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		meekMutex.Lock()
 		vConn, exists := meekSessions[sessionID]
 		if !exists {
+			// Policy check happens before a session is registered, otherwise
+			// a rejected target would still leave a phantom session behind.
+			if !targetAllowed(target) {
+				meekMutex.Unlock()
+				logger.Warn("❌ [Server] 拒绝连接: 目标不在允许列表", zap.String("target", target), zap.String("remote", r.RemoteAddr))
+				nginxError(w, http.StatusForbidden)
+				return
+			}
 			if len(meekSessions) >= maxGlobalSessions {
 				meekMutex.Unlock()
 				logger.Warn("❌ [Server] 拒绝连接: 达到最大并发会话数限制", zap.Int("limit", maxGlobalSessions), zap.String("remote", r.RemoteAddr))
@@ -267,6 +430,11 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			meekMutex.Unlock()
 
 			xConn := newXhttpFramedConn(vConn, vConn, func() error {
+				// Give an in-flight poll a moment to pick up the queued
+				// close frame before the session vanishes from the registry;
+				// otherwise the client keeps re-creating the session and the
+				// target connection lingers until the idle cleaner fires.
+				vConn.waitDrained(serverDrainTimeout)
 				meekMutex.Lock()
 				delete(meekSessions, sessionID)
 				meekMutex.Unlock()
@@ -276,7 +444,19 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			xConn.targetAddr = target
 			xConn.network = network
 
-			xl.connCh <- xConn
+			// Never block the HTTP handler on the accept backlog: a stalled
+			// accept loop would strand handlers and freeze every session.
+			select {
+			case xl.connCh <- xConn:
+			default:
+				meekMutex.Lock()
+				delete(meekSessions, sessionID)
+				meekMutex.Unlock()
+				vConn.Close()
+				logger.Warn("❌ [Server] 会话队列已满，拒绝新会话", zap.String("session", sessionID), zap.String("remote", r.RemoteAddr))
+				nginxError(w, http.StatusServiceUnavailable)
+				return
+			}
 			logger.Debug("🆕 [Server] 收到并创建全新隧道会话", zap.String("session", sessionID), zap.String("target", target))
 		} else {
 			vConn.updateActive()
@@ -354,25 +534,25 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		if totalUpBytes > 0 {
 			fetchDownData()
 		} else {
-			if !fetchDownData() && !vConn.closed {
-				vConn.writeBuf.mu.Lock()
-				if vConn.writeBuf.count == 0 {
-					stopCtx := context.AfterFunc(r.Context(), func() {
-						vConn.writeBuf.cond.Broadcast()
-					})
-					timer := time.AfterFunc(15*time.Second, func() {
-						vConn.writeBuf.cond.Broadcast()
-					})
-
-					vConn.writeBuf.cond.Wait()
-
-					timer.Stop()
-					stopCtx()
-				}
-				vConn.writeBuf.mu.Unlock()
-
+			if !fetchDownData() && !vConn.isClosed() {
+				vConn.writeBuf.waitLongPoll(r.Context(), longPollTimeout)
 				fetchDownData()
 			}
+		}
+
+		// HTTP/3 cannot write straight out of the pooled buffer. quic-go's
+		// send stream holds on to the slice given to ResponseWriter.Write
+		// until it has been packetised, which happens after this handler
+		// returns — so recycling it here would hand the buffer to another
+		// session while QUIC is still reading from it. Give QUIC a private
+		// copy and put the pooled one back immediately.
+		// HTTP/1.1 (copies into the bufio writer) and HTTP/2 (writeDataFrom-
+		// Handler blocks until the frame is on the wire) are both safe.
+		if r.ProtoMajor == 3 && len(downData) > 0 {
+			owned := make([]byte, len(downData))
+			copy(owned, downData)
+			safelyPutSendBuf(downBufPtr)
+			downData, downBufPtr = owned, nil
 		}
 
 		logger.Debug("📤 [HTTP] 准备发送下行响应",
@@ -381,6 +561,14 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			zap.Uint64("Server_Ack", myUpAck),
 			zap.Int("Down_Bytes", len(downData)),
 		)
+
+		// Key CDN / reverse-proxy traversal headers: disable CDN edge caching and intermediate buffering
+		w.Header().Set("Cache-Control", "no-cache, no-store, no-transform, must-revalidate, max-age=0")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, Content-Length")
 
 		w.Header().Set("X-Ack", strconv.FormatUint(myUpAck, 10))
 		w.Header().Set("X-Seq", strconv.FormatUint(myDownSeq, 10))
@@ -401,6 +589,11 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 	server := &http.Server{
 		IdleTimeout:       1 * time.Hour,
 		ReadHeaderTimeout: 10 * time.Second,
+		// ReadTimeout covers reading the request body, which is bounded by the
+		// chunk size; WriteTimeout must comfortably exceed the long poll below
+		// so parked requests are not cut off mid-flight.
+		ReadTimeout:  120 * time.Second,
+		WriteTimeout: 120 * time.Second,
 	}
 
 	var (
@@ -441,10 +634,8 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		}
 	}()
 
-	var err error
-	if certFile != "" && keyFile != "" {
-		var cert tls.Certificate
-		cert, err = tls.LoadX509KeyPair(certFile, keyFile)
+	if tlsEnabled {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			logger.Fatal("❌ 加载 TLS 证书失败", zap.Error(err), zap.String("cert", certFile))
 		}
@@ -454,14 +645,21 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			MinVersion:   tls.VersionTLS13,
 		}
 		server.TLSConfig = tlsConfig
-		h3Server := &http3.Server{
-			Addr:      listenAddr,
-			Handler:   handler,
-			TLSConfig: tlsConfig,
+		var h3Server *http3.Server
+		if xl.srvUDP {
+			h3Server = &http3.Server{
+				Addr:      xl.uln.LocalAddr().String(),
+				Handler:   handler,
+				TLSConfig: tlsConfig.Clone(),
+			}
 		}
 
 		server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_ = h3Server.SetQUICHeaders(w.Header())
+			// A tcp:// TLS listener intentionally opts out of H3. Do not emit
+			// Alt-Svc unless we really own a QUIC socket.
+			if h3Server != nil {
+				_ = h3Server.SetQUICHeaders(w.Header())
+			}
 			handler.ServeHTTP(w, r)
 		})
 
@@ -470,18 +668,20 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			go func() {
 				defer wg.Done()
 				logger.Info("🔐 [Server] 启动 TCP(TLS) HTTP 服务器", zap.String("addr", listenAddr))
-				if err = server.ServeTLS(xl.ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
+				// Own error variable: the HTTP/3 goroutine below runs
+				// concurrently and a shared one would be a data race.
+				if err := server.ServeTLS(xl.ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
 					logger.Warn("TLS 退出", zap.Error(err))
 				}
 			}()
 		}
 
-		if xl.srvUDP {
+		if h3Server != nil {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				logger.Info("🔐 [Server] 尝试启动 HTTP/3 (QUIC) 服务器", zap.String("addr", listenAddr))
-				if err = h3Server.Serve(xl.uln); err != nil && !errors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
+				if err := h3Server.Serve(xl.uln); err != nil && !errors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
 					logger.Warn("HTTP/3 退出", zap.Error(err))
 				}
 			}()
@@ -501,7 +701,7 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		go func() {
 			defer wg.Done()
 			logger.Info("🚀 [Server] Starting cleartext HTTP (h2c) server", zap.String("addr", listenAddr))
-			if err = server.Serve(xl.ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
+			if err := server.Serve(xl.ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
 				logger.Warn("H2C 退出", zap.Error(err))
 			}
 		}()
@@ -517,15 +717,11 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 	}
 	logger.Debug("🔧 默认路由配置", zap.String("host", defURL.Host), zap.String("scheme", defURL.Scheme))
 
-	var host string
-	if strings.Contains(listenAddr, "://") {
-		u, _ := url.Parse(listenAddr)
-		host = u.Host
-	} else {
-		host = listenAddr
-	}
-
-	xl, err := ListenXHTTP(ctx, host, path, psk, certFile, keyFile, fallback)
+	// Keep the optional tcp://, udp:// or tcp+udp:// prefix intact. Stripping
+	// it here made every configured listener look like the default tcp+udp
+	// mode, so explicit protocol selection was silently ignored.
+	host := listenAddr
+	xl, err := ListenXHTTP(ctx, listenAddr, path, psk, certFile, keyFile, fallback)
 	if err != nil {
 		logger.Fatal("Server listen failed", zap.Error(err))
 	}
@@ -544,17 +740,26 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 				return
 			}
 
-			logger.Error("❌ Accept connection failed", zap.Error(err))
+			// Accept only ever fails when the context is done — the connCh is
+			// never closed — so retrying would spin the CPU logging at full
+			// speed. Treat it as terminal.
+			logger.Error("❌ Accept connection failed, stopping accept loop", zap.Error(err))
+			return
+		}
+		xc, ok := conn.(*xhttpFramedConn)
+		if !ok {
+			// The accept loop must never panic: today Accept only produces
+			// *xhttpFramedConn, but a future transport type must fail loud
+			// and skip, not crash the whole server.
+			logger.Error("❌ Accepted unexpected connection type, skipping", zap.String("type", fmt.Sprintf("%T", conn)))
 			continue
 		}
-		if xc, ok := conn.(*xhttpFramedConn); ok {
-			logger.Debug("📥 [Accept] Accepted underlying virtual connection",
-				zap.String("client_addr", xc.RemoteAddr().String()),
-				zap.String("local_addr", xc.LocalAddr().String()),
-				zap.String("req_target", xc.targetAddr),
-				zap.String("req_network", xc.network),
-			)
-		}
+		logger.Debug("📥 [Accept] Accepted underlying virtual connection",
+			zap.String("client_addr", xc.RemoteAddr().String()),
+			zap.String("local_addr", xc.LocalAddr().String()),
+			zap.String("req_target", xc.targetAddr),
+			zap.String("req_network", xc.network),
+		)
 
 		go func(xc *xhttpFramedConn) {
 			defer xc.Close()
@@ -579,6 +784,15 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 					logger.Error("❌ Failed to connect to target TCP service", zap.String("id", connID), zap.String("target", target), zap.Error(err))
 					xc.WriteCloseFrame()
 					return
+				}
+				// Enable TCP keepalive on the target connection so a half-open
+				// peer (crashed box, severed cable, NAT table entry dropped)
+				// is noticed in seconds instead of lingering until the idle
+				// cleaner sweeps it. Keepalive probes ride in-band and cost
+				// nothing until the peer is actually dead.
+				if tcpConn, ok := rc.(*net.TCPConn); ok {
+					_ = tcpConn.SetKeepAlive(true)
+					_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 				}
 				var closeOnce sync.Once
 				closeTarget := func() {
@@ -625,6 +839,9 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 				rc, err := net.DialTimeout("udp", target, 5*time.Second)
 				if err != nil {
 					logger.Error("❌ Failed to connect to target UDP service", zap.String("id", connID), zap.String("target", target), zap.Error(err))
+					// Mirror the TCP branch: without a close frame the client
+					// keeps polling a session whose target never existed.
+					xc.WriteCloseFrame()
 					return
 				}
 				var closeOnce sync.Once
@@ -644,7 +861,7 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 				logger.Debug("✅ Target UDP service connected successfully", zap.String("id", connID), zap.String("target", target))
 
 				go func() {
-					defer closeTarget() // 上行退出时，立刻关闭 rc，打断可能阻塞在 rc.Read 上的下行协程
+					defer closeTarget() // When the uplink exits, close rc immediately to interrupt the downlink goroutine that may be blocked on rc.Read
 					uBuf := make([]byte, maxUDPFrameSize)
 					for {
 						n, err := readUDPFrameInto(xc, uBuf)
@@ -679,6 +896,6 @@ func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, cer
 			} else {
 				logger.Warn("⚠️ Unknown network type", zap.String("id", connID), zap.String("network", network))
 			}
-		}(conn.(*xhttpFramedConn))
+		}(xc)
 	}
 }

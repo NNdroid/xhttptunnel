@@ -6,9 +6,13 @@ BIN_DIR="${PROJECT_ROOT}/bin"
 mkdir -p "${BIN_DIR}"
 
 APP_NAME="xhttptunnel"
-VERSION="1.1.0"
 
-LDFLAGS="-s -w -X 'main.Version=${VERSION}'"
+# Default version: keep in sync with `Version` in main.go (single source of truth).
+# Override without editing this script:  VERSION=1.2.0 ./scripts/build.sh
+# Injected into the documented `main.version` var, which wins via versionString().
+VERSION="${VERSION:-1.1.0}"
+
+LDFLAGS="-s -w -X main.version=${VERSION}"
 
 PLATFORMS=(
   "linux/amd64"

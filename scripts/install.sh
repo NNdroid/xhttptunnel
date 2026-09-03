@@ -33,10 +33,13 @@ get_arch() {
   esac
 }
 
-# 生成分享 URI 时的额外参数：
-#   GEN_URI_PIN   —— 指定固定的 6 位分享 PIN（默认留空=每次随机生成，需在输出中抄下）。
-#   GEN_URI_HOST  —— 覆盖分享 URI 中的服务器公网 IP/域名（server 配置通常只有 listen 端口，
-#                     不包含公网地址；不设置时占位为 your-server-ip，客户端无法连接）。
+# Extra parameters for share-URI generation:
+#   GEN_URI_PIN   — fixed 6-digit share PIN (default: empty = a random PIN is
+#                   generated each time and must be copied from the output).
+#   GEN_URI_HOST  — overrides the server public IP/domain in the share URI
+#                   (the server config usually only contains the listen port,
+#                   not the public address; if unset it falls back to the
+#                   your-server-ip placeholder and clients cannot connect).
 gen_uri_extra_args() {
   local args=""
   if [ -n "${GEN_URI_PIN:-}" ]; then
