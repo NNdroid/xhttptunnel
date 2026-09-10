@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/NNdroid/xhttptunnel/tunnel"
 )
 
 func TestXHTTPTunnel_JSONConfigParsing(t *testing.T) {
@@ -124,8 +126,11 @@ func TestXHTTPTunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go runServer(ctx, sCfg.Listen, sCfg.Path, sCfg.Target, sCfg.PSK, "", "", false, "")
-	time.Sleep(100 * time.Millisecond)
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- runServer(ctx, sCfg.Listen, sCfg.Path, sCfg.Target, sCfg.PSK, "", "", false, "") }()
+	if err := waitStarted(serverErr, 100*time.Millisecond); err != nil {
+		t.Fatalf("server failed to start: %v", err)
+	}
 
 	// 5. Find free port for Client
 	clientDummy, err := net.Listen("tcp", "127.0.0.1:0")
@@ -156,8 +161,13 @@ func TestXHTTPTunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load client_e2e.json failed: %v", err)
 	}
-	go runClient(ctx, cCfg.Listen, cCfg.ServerURL, cCfg.Target, cCfg.PSK, cCfg.SNI, cCfg.Host, cCfg.ALPN, false, "")
-	time.Sleep(150 * time.Millisecond)
+	clientErr := make(chan error, 1)
+	go func() {
+		clientErr <- runClient(ctx, cCfg.Listen, cCfg.ServerURL, cCfg.Target, cCfg.PSK, cCfg.SNI, cCfg.Host, cCfg.ALPN, false, "")
+	}()
+	if err := waitStarted(clientErr, 150*time.Millisecond); err != nil {
+		t.Fatalf("client failed to start: %v", err)
+	}
 
 	// 8. Connect to Client Listener & Test Echo
 	conn, err := net.Dial("tcp", clientListen)
@@ -165,6 +175,11 @@ func TestXHTTPTunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 		t.Fatalf("dial client failed: %v", err)
 	}
 	defer conn.Close()
+	// Bound the echo read so a stalled tunnel fails the test instead of
+	// hanging it until the package timeout.
+	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
 
 	testData := []byte("Hello XHTTPTunnel via JSON Configuration!")
 	if _, err := conn.Write(testData); err != nil {
@@ -183,82 +198,103 @@ func TestXHTTPTunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 	t.Logf("✅ Live E2E XHTTPTunnel via JSON Config PASSED!")
 }
 
-func TestApplyChunkSizeClamping(t *testing.T) {
-	cases := []struct {
-		name     string
-		in       int
-		wantSize int // bytes
-	}{
-		{"default", 0, 256 * 1000},
-		{"in-range", 512, 512 * 1000},
-		{"too-small-clamps-to-16k", 1, 16 * 1000},
-		{"negative-treats-as-default", -5, 256 * 1000},
-		{"too-big-clamps-to-900k", 10000, 900 * 1000},
-		{"exact-max", 900, 900 * 1000},
+func TestLegacyServerPolicyHelpers(t *testing.T) {
+	// The package-level helpers wire the low-level ListenXHTTP state; Server
+	// instances carry their own copy via ServerConfig fields.
+	tunnel.SetAllowedTargets([]string{"127.0.0.1:22", ":8080", "db:"})
+	tunnel.SetTrustProxyHeaders(true)
+	if targets := tunnel.AllowedTargets(); len(targets) != 3 {
+		t.Fatalf("AllowedTargets = %v, want 3 entries", targets)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			applyChunkSize(tc.in)
-			if maxsendBufSize != tc.wantSize {
-				t.Fatalf("maxsendBufSize = %d, want %d", maxsendBufSize, tc.wantSize)
-			}
-			if maxframeSize != maxsendBufSize+framePaddingBudget {
-				t.Fatalf("maxframeSize = %d, want %d", maxframeSize, maxsendBufSize+framePaddingBudget)
-			}
-		})
+	if !tunnel.TrustProxyHeaders() {
+		t.Fatal("trust proxy headers not applied")
 	}
-	// Restore defaults so parallel tests are not affected.
-	applyChunkSize(0)
-}
-
-func TestApplyServerOptions(t *testing.T) {
-	// allowed_targets + trust_proxy_headers are wired through to the globals.
-	applyServerOptions(&FileConfig{
-		AllowedTargets:    []string{"127.0.0.1:22", ":8080", "db:"},
-		TrustProxyHeaders: true,
-	})
-	if len(allowedTargets) != 3 {
-		t.Fatalf("allowedTargets = %v, want 3 entries", allowedTargets)
-	}
-	if !trustProxyHeaders {
-		t.Fatal("trustProxyHeaders not applied")
-	}
-	// targetAllowed must honour the allowlist forms.
-	if !targetAllowed("127.0.0.1:22") {
+	// TargetAllowed must honour the allowlist forms.
+	if !tunnel.TargetAllowed("127.0.0.1:22") {
 		t.Error("exact host:port should be allowed")
 	}
-	if !targetAllowed("10.0.0.5:8080") {
+	if !tunnel.TargetAllowed("10.0.0.5:8080") {
 		t.Error(":port form should allow any host on that port")
 	}
-	if !targetAllowed("db:5432") {
+	if !tunnel.TargetAllowed("db:5432") {
 		t.Error("host: form should allow any port on that host")
 	}
-	if targetAllowed("evil.com:443") {
+	if tunnel.TargetAllowed("evil.com:443") {
 		t.Error("non-listed target must be rejected")
 	}
-	// Empty allowlist = allow all. At startup the global is nil; an empty
+	// Empty allowlist = allow all. At startup the list is nil; an empty
 	// config must not restrict anything.
-	allowedTargets = nil
-	if !targetAllowed("anything:1") {
+	tunnel.SetAllowedTargets(nil)
+	if !tunnel.TargetAllowed("anything:1") {
 		t.Error("empty allowlist must allow everything")
 	}
-	// Restore defaults: the E2E suite creates servers via ListenXHTTP directly
-	// (bypassing applyServerOptions) and relies on allow-all.
-	allowedTargets = nil
-	trustProxyHeaders = false
+	// Restore defaults so parallel tests are not affected.
+	tunnel.SetAllowedTargets(nil)
+	tunnel.SetTrustProxyHeaders(false)
 }
 
-func TestApplyClientOptions(t *testing.T) {
-	// idle_timeout is applied as a duration.
-	applyClientOptions(&FileConfig{IdleTimeout: 42})
-	if clientIdleTimeout != 42*time.Second {
-		t.Fatalf("clientIdleTimeout = %v, want %v", clientIdleTimeout, 42*time.Second)
+func TestApplyClientDefaults(t *testing.T) {
+	// Structural defaults fill in when the config omits them.
+	cfg := &FileConfig{}
+	applyClientDefaults(cfg)
+	if cfg.Listen != "tcp://127.0.0.1:1080" {
+		t.Errorf("Listen = %q, want tcp://127.0.0.1:1080", cfg.Listen)
 	}
-	// Zero (unset) keeps the default.
-	applyClientOptions(&FileConfig{})
-	if clientIdleTimeout != 42*time.Second {
-		t.Fatalf("clientIdleTimeout changed when field unset: %v", clientIdleTimeout)
+	if cfg.ServerURL != "https://127.0.0.1:8443/stream" {
+		t.Errorf("ServerURL = %q, want the default endpoint", cfg.ServerURL)
 	}
-	// Restore the default to avoid leaking state into other tests.
-	applyClientOptions(&FileConfig{IdleTimeout: 900})
+	if cfg.Target != "127.0.0.1:22" {
+		t.Errorf("Target = %q, want 127.0.0.1:22", cfg.Target)
+	}
+	if cfg.ALPN != "auto" {
+		t.Errorf("ALPN = %q, want auto", cfg.ALPN)
+	}
+
+	// Explicit values win, and the Forward alias backs Target up.
+	cfg2 := &FileConfig{Listen: "tcp://127.0.0.1:9999", Forward: "10.0.0.1:80"}
+	applyClientDefaults(cfg2)
+	if cfg2.Listen != "tcp://127.0.0.1:9999" || cfg2.Target != "10.0.0.1:80" || cfg2.ALPN != "auto" {
+		t.Errorf("explicit config clobbered: %+v", cfg2)
+	}
 }
+
+func TestApplyServerDefaultsSelfSign(t *testing.T) {
+	// applyServerDefaults generates cert.pem/key.pem into the working
+	// directory — exactly the files a real selfsign deployment uses. Run the
+	// test in a throwaway directory so it can never clobber the repo's own
+	// certificates.
+	t.Chdir(t.TempDir())
+
+	scfg := &FileConfig{SelfSign: true}
+	if err := applyServerDefaults(scfg); err != nil {
+		t.Fatalf("applyServerDefaults: %v", err)
+	}
+	if scfg.Listen != ":8443" || scfg.Path != "/stream" || scfg.Target != "tcp://127.0.0.1:22" {
+		t.Errorf("server defaults mismatch: %+v", scfg)
+	}
+	if scfg.Cert != "cert.pem" || scfg.Key != "key.pem" {
+		t.Errorf("selfsign files = %q/%q, want cert.pem/key.pem", scfg.Cert, scfg.Key)
+	}
+	if _, err := os.Stat(scfg.Cert); err != nil {
+		t.Errorf("selfsign did not write %s: %v", scfg.Cert, err)
+	}
+	if _, err := os.Stat(scfg.Key); err != nil {
+		t.Errorf("selfsign did not write %s: %v", scfg.Key, err)
+	}
+}
+
+// waitStarted gives a blocking serve goroutine a grace period to fail fast
+// (bad listen address, certificate error). A nil return means the server is
+// still running; a non-nil error means startup failed.
+func waitStarted(errCh <-chan error, grace time.Duration) error {
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(grace):
+		return nil
+	}
+}
+
+// The config-file idle_timeout → client mapping is covered by
+// tunnel.TestNewClientDefaults; the structural default coverage lives in
+// TestApplyClientDefaults above.

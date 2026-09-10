@@ -1,4 +1,4 @@
-package main
+package tunnel
 
 import (
 	"crypto/rand"
@@ -17,7 +17,7 @@ var (
 	maxUDPFrameSize = 65535
 )
 
-func readUDPFrameInto(r io.Reader, buf []byte) (int, error) {
+func ReadUDPFrameInto(r io.Reader, buf []byte) (int, error) {
 	var lengthBuf [2]byte
 	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
 		return 0, err
@@ -32,7 +32,7 @@ func readUDPFrameInto(r io.Reader, buf []byte) (int, error) {
 	return length, nil
 }
 
-func writeUDPFrame(w io.Writer, payload []byte) error {
+func WriteUDPFrame(w io.Writer, payload []byte) error {
 	length := len(payload)
 	if length > 65535 {
 		return fmt.Errorf("UDP payload too large: %d > 65535", length)
@@ -92,7 +92,7 @@ func (c *DumpPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 // XHTTP dynamic padding and EOF signaling frame
 // ==========================================
 
-type xhttpFramedConn struct {
+type XHTTPConn struct {
 	r          io.Reader
 	w          io.Writer
 	closer     func() error
@@ -100,6 +100,9 @@ type xhttpFramedConn struct {
 	remote     net.Addr
 	targetAddr string
 	network    string
+	// vc is the underlying session, when this conn wraps one (nil in tests
+	// that build the conn from raw pipes). It backs Done() and Err().
+	vc         *meekVirtualConn
 	mu         sync.Mutex
 	readBuf    []byte
 	frameBuf   []byte
@@ -110,9 +113,9 @@ type xhttpFramedConn struct {
 	closedFlag int32
 }
 
-func newXhttpFramedConn(r io.Reader, w io.Writer, closer func() error, local, remote net.Addr) *xhttpFramedConn {
-	return &xhttpFramedConn{
-		r: r, w: w, closer: closer, local: local, remote: remote,
+func newXHTTPConn(r io.Reader, w io.Writer, closer func() error, local, remote net.Addr, vc *meekVirtualConn) *XHTTPConn {
+	return &XHTTPConn{
+		r: r, w: w, closer: closer, local: local, remote: remote, vc: vc,
 		// The frame and padding buffers grow on first use. An accepted session
 		// can remain idle for minutes behind a CDN, so reserving a full chunk for
 		// every connection is expensive at high concurrency.
@@ -121,7 +124,26 @@ func newXhttpFramedConn(r io.Reader, w io.Writer, closer func() error, local, re
 	}
 }
 
-func (c *xhttpFramedConn) WriteCloseFrame() error {
+// Done returns a channel closed when the underlying session begins closing —
+// normally when the tunnelled application on the peer side ends the session,
+// or on transport death. Nil when this conn does not wrap a session.
+func (c *XHTTPConn) Done() <-chan struct{} {
+	if c.vc != nil {
+		return c.vc.closedSignal()
+	}
+	return nil
+}
+
+// Err returns why the session died, if a reason was recorded (nil means a
+// clean close or that the conn is still open).
+func (c *XHTTPConn) Err() error {
+	if c.vc != nil {
+		return c.vc.getCloseErr()
+	}
+	return nil
+}
+
+func (c *XHTTPConn) WriteCloseFrame() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	frame := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00}
@@ -129,19 +151,28 @@ func (c *xhttpFramedConn) WriteCloseFrame() error {
 	return err
 }
 
-func (c *xhttpFramedConn) writeSingleFrame(chunk []byte) error {
-	chunkSize := len(chunk)
+// padLenFor implements the per-chunk padding policy: empty chunks dress up as
+// small random keepalives, tiny chunks are padded into a common size band so
+// short payloads stop being length-linkable, and bulk chunks get light cover.
+func padLenFor(chunkSize int) int {
 	var padLenInt int
-	if chunkSize == 0 {
+	switch {
+	case chunkSize == 0:
 		padLenInt = 32 + mrand.Intn(128)
-	} else if chunkSize < 512 {
+	case chunkSize < 512:
 		padLenInt = (600 + mrand.Intn(600)) - chunkSize
 		if padLenInt < 0 {
 			padLenInt = mrand.Intn(256)
 		}
-	} else {
+	default:
 		padLenInt = 16 + mrand.Intn(112)
 	}
+	return padLenInt
+}
+
+func (c *XHTTPConn) writeSingleFrame(chunk []byte) error {
+	chunkSize := len(chunk)
+	padLenInt := padLenFor(chunkSize)
 
 	frameLen := 6 + padLenInt + chunkSize
 	if frameLen > cap(c.frameBuf) {
@@ -177,7 +208,71 @@ func (c *xhttpFramedConn) writeSingleFrame(chunk []byte) error {
 	return err
 }
 
-func (c *xhttpFramedConn) Write(p []byte) (int, error) {
+// streamFrameBytes renders one chunk of the stream-mode wire format into a
+// single buffer: a 16-byte metadata block (sender's stream sequence, ack of
+// the peer's stream) followed by the standard 6-byte padded frame. One buffer
+// means one Write per chunk on the wire.
+func streamFrameBytes(seq, ack uint64, payload []byte) ([]byte, error) {
+	padLenInt := padLenFor(len(payload))
+	total := 16 + 6 + padLenInt + len(payload)
+	buf := make([]byte, total)
+	binary.BigEndian.PutUint64(buf[0:8], seq)
+	binary.BigEndian.PutUint64(buf[8:16], ack)
+	binary.BigEndian.PutUint32(buf[16:20], uint32(len(payload)))
+	binary.BigEndian.PutUint16(buf[20:22], uint16(padLenInt))
+	if padLenInt > 0 {
+		if _, err := rand.Read(buf[22 : 22+padLenInt]); err != nil {
+			return nil, err
+		}
+	}
+	copy(buf[22+padLenInt:], payload)
+	return buf, nil
+}
+
+// streamFrame is one parsed stream-mode chunk.
+type streamFrame struct {
+	seq    uint64 // sender's stream sequence for this payload
+	ack    uint64 // sender's ack of the receiver's stream
+	closed bool   // payloadLen == 0xFFFFFFFF: session close marker
+	data   []byte
+}
+
+// readStreamFrame parses one stream-mode chunk from r. Header guards mirror
+// XHTTPConn.Read's defense in depth.
+func readStreamFrame(r io.Reader) (streamFrame, error) {
+	var meta [22]byte
+	if _, err := io.ReadFull(r, meta[:]); err != nil {
+		return streamFrame{}, err
+	}
+	f := streamFrame{
+		seq:    binary.BigEndian.Uint64(meta[0:8]),
+		ack:    binary.BigEndian.Uint64(meta[8:16]),
+		closed: binary.BigEndian.Uint32(meta[16:20]) == 0xFFFFFFFF,
+	}
+	padLen := int(binary.BigEndian.Uint16(meta[20:22]))
+	if padLen > 65535 {
+		return f, fmt.Errorf("corrupted stream frame: padLen=%d", padLen)
+	}
+	payloadLen := binary.BigEndian.Uint32(meta[16:20]) & 0x7FFFFFFF
+	if payloadLen > uint32(currentMaxFrameSize()*4) {
+		return f, fmt.Errorf("corrupted stream frame: payloadLen=%d", payloadLen)
+	}
+	if padLen > 0 {
+		if _, err := io.CopyN(io.Discard, r, int64(padLen)); err != nil {
+			return f, err
+		}
+	}
+	if f.closed || payloadLen == 0 {
+		return f, nil
+	}
+	f.data = make([]byte, payloadLen)
+	if _, err := io.ReadFull(r, f.data); err != nil {
+		return f, err
+	}
+	return f, nil
+}
+
+func (c *XHTTPConn) Write(p []byte) (int, error) {
 	if atomic.LoadInt32(&c.closedFlag) == 1 {
 		return 0, io.ErrClosedPipe
 	}
@@ -188,7 +283,7 @@ func (c *xhttpFramedConn) Write(p []byte) (int, error) {
 	}
 
 	written := 0
-	maxPayload := maxframeSize
+	maxPayload := currentMaxFrameSize()
 	for len(p) > 0 {
 		chunkSize := len(p)
 		if chunkSize > maxPayload {
@@ -204,7 +299,7 @@ func (c *xhttpFramedConn) Write(p []byte) (int, error) {
 	return written, nil
 }
 
-func (c *xhttpFramedConn) Read(p []byte) (int, error) {
+func (c *XHTTPConn) Read(p []byte) (int, error) {
 	if len(c.readBuf) > 0 {
 		n := copy(p, c.readBuf)
 		c.readBuf = c.readBuf[n:]
@@ -218,7 +313,7 @@ func (c *xhttpFramedConn) Read(p []byte) (int, error) {
 		padLen := int(binary.BigEndian.Uint16(c.hdrBuf[4:6]))
 
 		// Defense in depth: cap per-frame padding and payload size to prevent malicious OOM
-		if padLen > 65535 || (rawPayloadLen != 0xFFFFFFFF && rawPayloadLen > uint32(maxframeSize*4)) {
+		if padLen > 65535 || (rawPayloadLen != 0xFFFFFFFF && rawPayloadLen > uint32(currentMaxFrameSize()*4)) {
 			return 0, fmt.Errorf("corrupted frame header: payloadLen=%d, padLen=%d", rawPayloadLen, padLen)
 		}
 
@@ -262,17 +357,21 @@ func (c *xhttpFramedConn) Read(p []byte) (int, error) {
 	}
 }
 
-func (c *xhttpFramedConn) Close() error {
+func (c *XHTTPConn) Close() error {
 	if atomic.CompareAndSwapInt32(&c.closedFlag, 0, 1) {
 		close(c.closeCh)
-		c.readBuf = nil
 		return c.closer()
 	}
 	return nil
 }
 
-func (c *xhttpFramedConn) LocalAddr() net.Addr                { return c.local }
-func (c *xhttpFramedConn) RemoteAddr() net.Addr               { return c.remote }
-func (c *xhttpFramedConn) SetDeadline(t time.Time) error      { return nil }
-func (c *xhttpFramedConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *xhttpFramedConn) SetWriteDeadline(t time.Time) error { return nil }
+// TargetAddr and Network report the forwarding target the client requested
+// for this session. They are only meaningful on the server side.
+func (c *XHTTPConn) TargetAddr() string { return c.targetAddr }
+func (c *XHTTPConn) Network() string    { return c.network }
+
+func (c *XHTTPConn) LocalAddr() net.Addr                { return c.local }
+func (c *XHTTPConn) RemoteAddr() net.Addr               { return c.remote }
+func (c *XHTTPConn) SetDeadline(t time.Time) error      { return nil }
+func (c *XHTTPConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *XHTTPConn) SetWriteDeadline(t time.Time) error { return nil }

@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v1.0.*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Binary target uploaded as the single manual artifact
+        required: true
+        default: linux/amd64
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
+          - linux/arm
+          - linux/386
+          - darwin/amd64
+          - darwin/arm64
+          - windows/amd64
+          - windows/arm64
+          - windows/386
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify before release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./... -count=1 -timeout=5m
+
+      - name: Run race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./... -count=1 -timeout=10m
+
+      - name: Run go vet
+        run: go vet ./...
+
+  build-and-publish:
+    name: Build and publish binaries
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version and output name
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=7 HEAD)"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            version="${GITHUB_REF_NAME}"
+            if [[ ! "${version}" =~ ^v1\.0\.[0-9]{8}-([0-9a-f]{7,40})$ ]]; then
+              echo "Tag must match v1.0.yyyyMMdd-<commit hash>: ${version}" >&2
+              exit 1
+            fi
+            tagged_hash="${BASH_REMATCH[1]}"
+            if [[ "${GITHUB_SHA}" != "${tagged_hash}"* ]]; then
+              echo "Tag hash ${tagged_hash} does not match commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+            target=""
+            asset=""
+          else
+            version="v1.0.$(date -u +%Y%m%d)-${short_sha}"
+            target="${{ inputs.target }}"
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            asset="xhttptunnel_${goos}_${goarch}"
+            if [[ "${goos}" == "windows" ]]; then
+              asset="${asset}.exe"
+            fi
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "target=${target}" >> "${GITHUB_OUTPUT}"
+          echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved version: ${version}"
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            ./scripts/build.sh "${{ steps.metadata.outputs.target }}"
+          else
+            ./scripts/build.sh
+          fi
+
+      - name: Verify build outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            test -f "bin/${{ steps.metadata.outputs.asset }}"
+            expected=1
+          else
+            expected=9
+          fi
+          actual="$(find bin -maxdepth 1 -type f -name 'xhttptunnel_*' | wc -l)"
+          if [[ "${actual}" -ne "${expected}" ]]; then
+            echo "Expected ${expected} binaries, found ${actual}" >&2
+            find bin -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+
+      - name: Upload the single manual binary artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          path: bin/${{ steps.metadata.outputs.asset }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create or update GitHub Release with raw binaries
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" bin/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" bin/* \
+              --verify-tag \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

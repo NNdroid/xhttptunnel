@@ -1,4 +1,4 @@
-package main
+package tunnel
 
 import (
 	"bytes"
@@ -44,13 +44,15 @@ const (
 )
 
 var (
-	maxsendBufSize = defaultChunkSize
-	maxframeSize   = defaultChunkSize + framePaddingBudget
+	// maxsendBufSize is configured once during normal startup, but tests and
+	// embedders may reconfigure it while HTTP transports are still returning
+	// pooled request bodies. Keep the hot-path read lock-free and race-free.
+	maxsendBufSize atomic.Int64
 
 	// sendBuf: sized to fit GetSlice's max request length
 	sendBuf = sync.Pool{
 		New: func() interface{} {
-			b := make([]byte, maxframeSize)
+			b := make([]byte, currentMaxFrameSize())
 			return &b
 		},
 	}
@@ -62,8 +64,20 @@ var (
 	}
 )
 
+func init() {
+	maxsendBufSize.Store(defaultChunkSize)
+}
+
+func currentMaxSendBufSize() int {
+	return int(maxsendBufSize.Load())
+}
+
+func currentMaxFrameSize() int {
+	return currentMaxSendBufSize() + framePaddingBudget
+}
+
 func safelyPutSendBuf(bufPtr *[]byte) {
-	if bufPtr != nil && cap(*bufPtr) >= maxsendBufSize {
+	if bufPtr != nil && cap(*bufPtr) >= currentMaxSendBufSize() {
 		sendBuf.Put(bufPtr)
 	}
 }
@@ -268,6 +282,35 @@ func (rb *reliableBuffer) waitLongPoll(ctx context.Context, timeout time.Duratio
 	stopCtx()
 }
 
+// waitDispatchable parks the caller until bytes exist beyond the given
+// dispatch cursor (i.e. the peer has NOT yet been sent everything buffered),
+// the context is cancelled, or the timeout elapses. Unlike waitLongPoll, data
+// that is buffered-but-already-dispatched (sitting in flight, awaiting the
+// peer's ack) does NOT wake the caller — that state drains via acks, and
+// waking on it would busy-loop a streaming writer.
+func (rb *reliableBuffer) waitDispatchable(ctx context.Context, timeout time.Duration, dispatchSeq uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if rb.pendingBeyond(dispatchSeq) {
+		return
+	}
+	stopCtx := context.AfterFunc(ctx, func() { rb.broadcast() })
+	timer := time.AfterFunc(timeout, func() { rb.broadcast() })
+	rb.cond.Wait()
+	timer.Stop()
+	stopCtx()
+}
+
+// pendingBeyond reports whether bytes exist beyond dispatchSeq. Caller must
+// hold rb.mu.
+func (rb *reliableBuffer) pendingBeyond(dispatchSeq uint64) bool {
+	if dispatchSeq < rb.baseOffset {
+		dispatchSeq = rb.baseOffset
+	}
+	offset := int(dispatchSeq - rb.baseOffset)
+	return offset < rb.count
+}
+
 func (rb *reliableBuffer) Close() {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -292,23 +335,104 @@ type meekVirtualConn struct {
 
 	writeBuf *reliableBuffer
 
+	logField        *zap.Logger
 	closedFlag      atomic.Bool // set once Close() wins; safe to read without the lock
 	closeRequested  atomic.Bool // graceful stop: ship what is queued, then exit
+	kicked          atomic.Bool // set by Kick: the downlink must NOT send a close marker, so the client re-establishes
+	closedCh        chan struct{}
+	closedOnce      sync.Once
 	lastActive      int64
 	downDispatchSeq uint64     // server->client dispatch cursor
 	downWindowMu    sync.Mutex // guards concurrent access to the dispatch cursor
+	// downWriter is the exclusive owner of the downlink dispatch cursor. A
+	// streaming downlink response holds it for the session's lifetime; poll
+	// responses acquire it briefly and release. Acquiring evicts the previous
+	// owner and rewinds the cursor to the peer's last acknowledged byte, so
+	// nothing the old owner had in flight can be lost (the peer dedups
+	// re-sent bytes by sequence number).
+	downWriter  atomic.Pointer[downWriterTicket]
+	downPeerAck atomic.Uint64 // peer's ack of our downlink stream (client-reported)
+
+	// closeErr records why the session died, for XHTTPConn.Err(). Written
+	// once before the close signal fires; read-only afterwards.
+	closeErr atomic.Pointer[closeErrValue]
 }
 
-func newMeekVirtualConn(sessionID string, local, remote net.Addr) *meekVirtualConn {
+// closeErrValue boxes an error so it can live in an atomic.Pointer.
+type closeErrValue struct{ err error }
+
+// setCloseErr records the session's death reason (first writer wins).
+func (c *meekVirtualConn) setCloseErr(err error) {
+	c.closeErr.CompareAndSwap(nil, &closeErrValue{err: err})
+}
+
+// getCloseErr returns the recorded death reason, or nil for a clean close.
+func (c *meekVirtualConn) getCloseErr() error {
+	if v := c.closeErr.Load(); v != nil {
+		return v.err
+	}
+	return nil
+}
+
+// downWriterTicket identifies one downlink writer. Pointer identity lets a
+// returning writer detect that a newer one replaced it.
+type downWriterTicket struct{}
+
+// AcquireDownWriter evicts any previous downlink writer and takes ownership.
+// The cursor is rewound to the peer's acknowledged byte so bytes the evicted
+// writer had dispatched-but-unacknowledged are re-sent by the new owner.
+func (c *meekVirtualConn) AcquireDownWriter(t *downWriterTicket) {
+	c.downWindowMu.Lock()
+	if ack := c.downPeerAck.Load(); ack < c.downDispatchSeq {
+		c.downDispatchSeq = ack
+	}
+	c.downWriter.Store(t)
+	c.downWindowMu.Unlock()
+	c.writeBuf.broadcast() // wake the evicted owner so it observes the loss
+}
+
+// ReleaseDownWriter gives ownership up if the caller still holds it.
+func (c *meekVirtualConn) ReleaseDownWriter(t *downWriterTicket) {
+	if c.downWriter.CompareAndSwap(t, nil) {
+		c.writeBuf.broadcast()
+	}
+}
+
+// holdsDownWriter reports whether t is still the current downlink owner.
+func (c *meekVirtualConn) holdsDownWriter(t *downWriterTicket) bool {
+	return c.downWriter.Load() == t
+}
+
+// downWriterActive reports whether any streaming owner holds the downlink.
+func (c *meekVirtualConn) downWriterActive() bool {
+	return c.downWriter.Load() != nil
+}
+
+func newMeekVirtualConn(sessionID string, local, remote net.Addr, lg *zap.Logger) *meekVirtualConn {
 	return &meekVirtualConn{
 		sessionID:  sessionID,
 		local:      local,
 		remote:     remote,
+		logField:   lg,
+		closedCh:   make(chan struct{}),
 		readCond:   sync.NewCond(&sync.Mutex{}),
 		writeBuf:   newReliableBuffer(4 * 1024 * 1024), // 4MB max buffer
 		lastActive: time.Now().Unix(),
 		oooBuf:     make(map[uint64][]byte),
 	}
+}
+
+// closedSignal is a channel closed when the session is fully closed. Callers
+// with long blocking operations (stream probes) select on it to abort.
+func (c *meekVirtualConn) closedSignal() <-chan struct{} { return c.closedCh }
+
+// log returns the session's logger, falling back to the package logger when
+// the owner did not thread one in (tests, low-level construction).
+func (c *meekVirtualConn) log() *zap.Logger {
+	if c.logField != nil {
+		return c.logField
+	}
+	return logger
 }
 
 func (c *meekVirtualConn) Read(p []byte) (int, error) {
@@ -335,6 +459,13 @@ func (c *meekVirtualConn) isClosed() bool { return c.closedFlag.Load() }
 // not released here; Close() still has to run once the pump has exited.
 func (c *meekVirtualConn) requestClose() {
 	if c.closeRequested.CompareAndSwap(false, true) {
+		// Fire the shutdown signal so long-blocking operations (stream
+		// negotiation probes) abort instead of idling out their windows.
+		c.closedOnce.Do(func() {
+			if c.closedCh != nil {
+				close(c.closedCh)
+			}
+		})
 		c.writeBuf.broadcast()
 	}
 }
@@ -354,7 +485,7 @@ func (c *meekVirtualConn) waitDrained(timeout time.Duration) {
 			return
 		}
 		if !time.Now().Before(deadline) {
-			logger.Warn("[Session] downlink drain timed out, closing with data still queued", zap.String("session", c.sessionID))
+			c.log().Warn("[Session] downlink drain timed out, closing with data still queued", zap.String("session", c.sessionID))
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -458,7 +589,7 @@ func (c *meekVirtualConn) waitForReassemblyRoom(n int) {
 	if c.readBuf.Len()+n <= maxReassemblyBytes {
 		return
 	}
-	logger.Debug("[Buffer] 重组缓冲已满，对上游施加背压",
+	c.log().Debug("[Buffer] 重组缓冲已满，对上游施加背压",
 		zap.String("session", c.sessionID),
 		zap.Int("buffered", c.readBuf.Len()),
 		zap.Int("incoming", n),
@@ -474,7 +605,7 @@ func (c *meekVirtualConn) waitForOutOfOrderRoom(n int) {
 	if len(c.oooBuf) < maxOutOfOrderChunks && c.oooBytes+n <= maxOutOfOrderBytes {
 		return
 	}
-	logger.Debug("[Buffer] 乱序缓存已满，对上游施加背压",
+	c.log().Debug("[Buffer] 乱序缓存已满，对上游施加背压",
 		zap.String("session", c.sessionID),
 		zap.Int("chunks", len(c.oooBuf)),
 		zap.Int("bytes", c.oooBytes),
@@ -489,6 +620,11 @@ func (c *meekVirtualConn) updateActive() {
 }
 
 func (c *meekVirtualConn) Close() error {
+	c.closedOnce.Do(func() {
+		if c.closedCh != nil {
+			close(c.closedCh)
+		}
+	})
 	if !c.closedFlag.CompareAndSwap(false, true) {
 		return nil
 	}

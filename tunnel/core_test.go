@@ -1,31 +1,11 @@
-package main
+package tunnel
 
 import (
 	"crypto/rand"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
-
-	"go.uber.org/zap"
 )
-
-// init sets up a Nop logger so benchmarks are not slowed down by log spam.
-func init() {
-	logger = zap.NewNop()
-	zap.ReplaceGlobals(logger)
-
-	// If sendBuf were initialized inside main() in main.go, it could be nil
-	// during tests and panic; initialize it here as a safety net.
-	if sendBuf.New == nil {
-		sendBuf = sync.Pool{
-			New: func() interface{} {
-				b := make([]byte, 262144) // default 256KB
-				return &b
-			},
-		}
-	}
-}
 
 // ==========================================
 // 1. Unit tests (core logic correctness)
@@ -61,7 +41,7 @@ func TestReliableBuffer_Logic(t *testing.T) {
 }
 
 func TestMeekVirtualConn_PutReadData(t *testing.T) {
-	vc := newMeekVirtualConn("test-session", nil, nil)
+	vc := newMeekVirtualConn("test-session", nil, nil, nil)
 
 	// Test normal in-order arrival
 	ack := vc.PutReadData(0, []byte("part1-"))
@@ -85,20 +65,20 @@ func TestMeekVirtualConn_PutReadData(t *testing.T) {
 func TestGetClientIP(t *testing.T) {
 	// Proxy headers are spoofable, so by default (trustProxyHeaders=false)
 	// getClientIP must ignore them and fall back to RemoteAddr.
-	trustProxyHeaders = false
-	defer func() { trustProxyHeaders = false }()
+	SetTrustProxyHeaders(false)
+	defer SetTrustProxyHeaders(false)
 
 	// Default (secure): CF-Connecting-IP present but not trusted.
 	r1, _ := http.NewRequest("GET", "http://example.com", nil)
 	r1.RemoteAddr = "1.2.3.4:5678"
 	r1.Header.Set("CF-Connecting-IP", "114.114.114.114")
-	if ip := getClientIP(r1); ip != "1.2.3.4:5678" {
+	if ip := defaultServerState.getClientIP(r1); ip != "1.2.3.4:5678" {
 		t.Errorf("untrusted: CF-Connecting-IP leaked, got %s", ip)
 	}
 
 	// Trusted mode: headers are honoured.
-	trustProxyHeaders = true
-	if ip := getClientIP(r1); ip != "114.114.114.114" {
+	SetTrustProxyHeaders(true)
+	if ip := defaultServerState.getClientIP(r1); ip != "114.114.114.114" {
 		t.Errorf("trusted: expected 114.114.114.114, got %s", ip)
 	}
 
@@ -106,7 +86,7 @@ func TestGetClientIP(t *testing.T) {
 	r2, _ := http.NewRequest("GET", "http://example.com", nil)
 	r2.RemoteAddr = "1.2.3.4:5678"
 	r2.Header.Set("X-Forwarded-For", "8.8.8.8, 10.0.0.1")
-	if ip := getClientIP(r2); ip != "8.8.8.8" {
+	if ip := defaultServerState.getClientIP(r2); ip != "8.8.8.8" {
 		t.Errorf("trusted: expected 8.8.8.8, got %s", ip)
 	}
 
@@ -114,14 +94,14 @@ func TestGetClientIP(t *testing.T) {
 	r3, _ := http.NewRequest("GET", "http://example.com", nil)
 	r3.RemoteAddr = "1.2.3.4:5678"
 	r3.Header.Set("X-Real-IP", "1.1.1.1")
-	if ip := getClientIP(r3); ip != "1.1.1.1" {
+	if ip := defaultServerState.getClientIP(r3); ip != "1.1.1.1" {
 		t.Errorf("trusted: expected 1.1.1.1, got %s", ip)
 	}
 
 	// Case: no proxy headers -> RemoteAddr even when trusted.
 	r4, _ := http.NewRequest("GET", "http://example.com", nil)
 	r4.RemoteAddr = "192.168.1.100:12345"
-	if ip := getClientIP(r4); ip != "192.168.1.100:12345" {
+	if ip := defaultServerState.getClientIP(r4); ip != "192.168.1.100:12345" {
 		t.Errorf("expected 192.168.1.100:12345, got %s", ip)
 	}
 }

@@ -1,4 +1,4 @@
-module xhttptunnel
+module github.com/NNdroid/xhttptunnel
 
 go 1.26.1
 

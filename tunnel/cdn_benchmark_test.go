@@ -1,4 +1,4 @@
-package main
+package tunnel
 
 import (
 	"bytes"
@@ -30,10 +30,11 @@ func BenchmarkXHTTPTunnel_ThroughCDN_72KB(b *testing.B) {
 	if err != nil {
 		b.Fatalf("parse CDN URL: %v", err)
 	}
-	conn, err := DialXHTTP(ctx, cdnURL, &Config{
-		Password: "benchmark-secret",
-		Path:     "/stream",
-		ALPN:     "h1",
+	conn, err := DialXHTTP(ctx, cdnURL, &DialConfig{
+		Password:   "benchmark-secret",
+		Path:       "/stream",
+		ALPN:       "h1",
+		StreamMode: "poll", // the buffered fake CDN stalls the stream probe; poll is the measured baseline
 	}, echoAddr, "tcp")
 	if err != nil {
 		b.Fatalf("dial through CDN: %v", err)

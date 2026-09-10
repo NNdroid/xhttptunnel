@@ -3,6 +3,9 @@ set -e
 
 APP_NAME="xhttptunnel"
 GITHUB_REPO="NNdroid/${APP_NAME}"
+# Set XHTTPTUNNEL_VERSION to an exact tag (for example,
+# v1.0.20260904-8f60417) to pin an installation. The default follows latest.
+RELEASE_VERSION="${XHTTPTUNNEL_VERSION:-latest}"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/${APP_NAME}"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -29,8 +32,30 @@ get_arch() {
     aarch64) echo "arm64" ;;
     armv7l)  echo "arm" ;;
     i386|i686) echo "386" ;;
-    *)       echo "amd64" ;;
+    *)
+      echo -e "${RED}Error: Unsupported CPU architecture: ${arch}${PLAIN}" >&2
+      return 1
+      ;;
   esac
+}
+
+get_release_download_url() {
+  local goarch="$1"
+  local release_path
+
+  if [ "${RELEASE_VERSION}" = "latest" ]; then
+    release_path="latest/download"
+  else
+    case "${RELEASE_VERSION}" in
+      */*)
+        echo -e "${RED}Error: Invalid release tag: ${RELEASE_VERSION}${PLAIN}" >&2
+        return 1
+        ;;
+    esac
+    release_path="download/${RELEASE_VERSION}"
+  fi
+
+  echo "https://github.com/${GITHUB_REPO}/releases/${release_path}/${APP_NAME}_linux_${goarch}"
 }
 
 # Extra parameters for share-URI generation:
@@ -66,8 +91,9 @@ install_binary() {
     echo -e "${CYAN}--> Building from source with Go...${PLAIN}"
     CGO_ENABLED=0 go build -ldflags "-s -w" -o "${INSTALL_DIR}/${APP_NAME}" .
   else
-    echo -e "${CYAN}--> Downloading latest release binary (${goarch})...${PLAIN}"
-    local download_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${APP_NAME}_linux_${goarch}"
+    echo -e "${CYAN}--> Downloading ${RELEASE_VERSION} release binary (${goarch})...${PLAIN}"
+    local download_url
+    download_url=$(get_release_download_url "${goarch}")
     local tmp_bin
     tmp_bin=$(mktemp "/tmp/${APP_NAME}.XXXXXX" 2>/dev/null || echo "/tmp/${APP_NAME}.$$")
 

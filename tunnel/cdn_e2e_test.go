@@ -1,4 +1,4 @@
-package main
+package tunnel
 
 import (
 	"bytes"
@@ -50,10 +50,11 @@ func TestXHTTPTunnel_E2E_ThroughCDN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse CDN URL: %v", err)
 	}
-	conn, err := DialXHTTP(ctx, cdnURL, &Config{
-		Password: "cdn-test-secret",
-		Path:     "/stream",
-		ALPN:     "h1",
+	conn, err := DialXHTTP(ctx, cdnURL, &DialConfig{
+		Password:   "cdn-test-secret",
+		Path:       "/stream",
+		ALPN:       "h1",
+		StreamMode: "poll", // this test targets poll resilience; stream probe would eat the injected faults
 		// A client normally presents the public CDN hostname rather than the
 		// origin address. The simulator records this value before proxying.
 		Host: "cdn.example.test",
@@ -111,10 +112,11 @@ func TestXHTTPTunnel_E2E_ThroughCDNWithLatency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse CDN URL: %v", err)
 	}
-	conn, err := DialXHTTP(ctx, cdnURL, &Config{
-		Password: "latency-test-secret",
-		Path:     "/stream",
-		ALPN:     "h1",
+	conn, err := DialXHTTP(ctx, cdnURL, &DialConfig{
+		Password:   "latency-test-secret",
+		Path:       "/stream",
+		ALPN:       "h1",
+		StreamMode: "poll", // measures long-poll latency behaviour specifically
 	}, echoAddr, "tcp")
 	if err != nil {
 		t.Fatalf("dial delayed CDN: %v", err)
@@ -173,14 +175,14 @@ func serveAcceptedTCPEcho(t testing.TB, ctx context.Context, listener *XHTTPList
 			}
 			go func(conn net.Conn) {
 				defer conn.Close()
-				xconn, ok := conn.(*xhttpFramedConn)
+				xconn, ok := conn.(*XHTTPConn)
 				if !ok {
 					t.Errorf("accepted unexpected connection type %T", conn)
 					return
 				}
-				target, err := net.Dial("tcp", xconn.targetAddr)
+				target, err := net.Dial("tcp", xconn.TargetAddr())
 				if err != nil {
-					t.Errorf("dial echo target %q: %v", xconn.targetAddr, err)
+					t.Errorf("dial echo target %q: %v", xconn.TargetAddr(), err)
 					return
 				}
 				defer target.Close()
@@ -356,7 +358,7 @@ func (c *cdnTestServer) trace() string {
 }
 
 // readFullBefore gives this concurrent end-to-end test a real deadline.
-// xhttpFramedConn intentionally implements SetDeadline as a no-op because its
+// XHTTPConn intentionally implements SetDeadline as a no-op because its
 // underlying byte stream is virtual, so net.Conn deadlines cannot protect the
 // test from an accidentally stalled polling loop.
 func readFullBefore(r io.Reader, length int, timeout time.Duration) ([]byte, error) {

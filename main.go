@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -15,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/NNdroid/xhttptunnel/tunnel"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -29,7 +28,10 @@ var (
 	// Version is the human-facing version string. Prefer versionString() so a
 	// linker-injected version wins over the source default.
 	Version = "1.1.0"
-	logger  *zap.Logger
+	// logger is the CLI's own sink for startup warnings and errors; all
+	// protocol-level logging flows through the tunnel package logger, which
+	// initLogger keeps in sync with this one.
+	logger = zap.NewNop()
 )
 
 func versionString() string {
@@ -49,16 +51,7 @@ func initLogger(levelStr string) {
 	config.Level = zap.NewAtomicLevelAt(level)
 	config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 	logger, _ = config.Build()
-	zap.ReplaceGlobals(logger)
-}
-
-type Config struct {
-	Path                   string
-	SNI                    string
-	Host                   string
-	Password               string
-	ALPN                   string
-	CertificateFingerprint string
+	tunnel.SetLogger(logger)
 }
 
 type FileConfig struct {
@@ -93,6 +86,10 @@ type FileConfig struct {
 	// AllowedTargets (server) restricts which targets clients may request.
 	// Entries may be "host:port", ":port" or "host:". Empty = allow all.
 	AllowedTargets []string `json:"allowed_targets"`
+	// StreamMode (client) selects the downlink transport: "" / "auto" runs
+	// the automatic negotiation, "poll" forces the legacy long-poll mode,
+	// "stream" forces the streaming downlink. Invalid values fail startup.
+	StreamMode string `json:"stream_mode"`
 	// TrustProxyHeaders (server) makes the client address logged via
 	// CF-Connecting-IP / X-Forwarded-For / X-Real-IP headers instead of the
 	// socket peer. Those headers are spoofable, so keep this OFF unless the
@@ -137,17 +134,6 @@ func (fc *FileConfig) UnmarshalJSON(data []byte) error {
 	}
 
 	return nil
-}
-
-type stringAddr string
-
-func (a stringAddr) Network() string { return "tcp" }
-func (a stringAddr) String() string  { return string(a) }
-
-func generateRandomHex(n int) string {
-	b := make([]byte, n)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 func applyEnvOverrides(cfg *FileConfig) {
@@ -254,44 +240,62 @@ func runGenURI(args []string) {
 		*remark = "XHTTPTunnel Node"
 	}
 
-	uri := GenerateXHTTPTunnelURI(*host, *port, *path, *target, *psk, *sni, *remark, *pin, *insecure)
+	uri := tunnel.GenerateXHTTPTunnelURI(*host, *port, *path, *target, *psk, *sni, *remark, *pin, *insecure)
 	fmt.Printf("=== 📱 xhttptunnel Sharing URI (encrypted stun://) ===\n\n%s\n", uri)
-	PrintTerminalQR(uri)
+	tunnel.PrintTerminalQR(uri)
 }
 
-// applyChunkSize clamps the user-supplied chunk size and recomputes the
-// derived wire limits. 16KB is the smallest useful block, 900KB keeps a frame
-// safely under a 1MB request-body ceiling once headers and padding are added.
-func applyChunkSize(kb int) {
-	if kb <= 0 {
-		kb = defaultChunkSize / 1000
+// applyClientDefaults fills the structural defaults shared by the `client`
+// subcommand and the -c config.json bootstrap. The built-in default PSK is
+// deliberately NOT applied here: config-file bootstrapping runs in open mode
+// with a warning instead of silently using a well-known token.
+func applyClientDefaults(cfg *FileConfig) {
+	if cfg.Listen == "" {
+		cfg.Listen = "tcp://127.0.0.1:1080"
 	}
-	if kb < 16 {
-		kb = 16
+	if cfg.ServerURL == "" {
+		cfg.ServerURL = "https://127.0.0.1:8443/stream"
 	}
-	if kb > 900 {
-		kb = 900
+	if cfg.Target == "" {
+		cfg.Target = cfg.Forward
 	}
-	maxsendBufSize = kb * 1000
-	maxframeSize = maxsendBufSize + framePaddingBudget
+	if cfg.Target == "" {
+		cfg.Target = "127.0.0.1:22"
+	}
+	if cfg.ALPN == "" {
+		cfg.ALPN = "auto"
+	}
 }
 
-// applyServerOptions wires server-side tunables from the config file. Must run
-// before ListenXHTTP, because the session registry reads these at startup.
-func applyServerOptions(cfg *FileConfig) {
-	if len(cfg.AllowedTargets) > 0 {
-		allowedTargets = cfg.AllowedTargets
+// applyServerDefaults fills the structural defaults shared by the `server`
+// subcommand and the -c config.json bootstrap, including self-signed
+// certificate generation. PSK handling is left to the caller (see
+// applyClientDefaults for the rationale).
+func applyServerDefaults(cfg *FileConfig) error {
+	if cfg.Listen == "" {
+		cfg.Listen = ":8443"
 	}
-	trustProxyHeaders = cfg.TrustProxyHeaders
-	applyChunkSize(cfg.ChunkSizeKB)
-}
-
-// applyClientOptions wires client-side tunables from the config file.
-func applyClientOptions(cfg *FileConfig) {
-	if cfg.IdleTimeout > 0 {
-		clientIdleTimeout = time.Duration(cfg.IdleTimeout) * time.Second
+	if cfg.Path == "" {
+		cfg.Path = "/stream"
 	}
-	applyChunkSize(cfg.ChunkSizeKB)
+	if cfg.Target == "" {
+		cfg.Target = cfg.DefaultTarget
+	}
+	if cfg.Target == "" {
+		cfg.Target = "tcp://127.0.0.1:22"
+	}
+	if cfg.SelfSign && (cfg.Cert == "" || cfg.Key == "") {
+		cn := cfg.SelfSignCN
+		if cn == "" {
+			cn = "www.bing.com"
+		}
+		if err := tunnel.GenerateSelfSignedCert("cert.pem", "key.pem", cn); err != nil {
+			return fmt.Errorf("generate self-signed certificate: %w", err)
+		}
+		cfg.Cert = "cert.pem"
+		cfg.Key = "key.pem"
+	}
+	return nil
 }
 
 func loadConfigFile(path string) (*FileConfig, error) {
@@ -308,6 +312,9 @@ func loadConfigFile(path string) (*FileConfig, error) {
 }
 
 func main() {
+	// Stamp the tunnel User-Agent with the CLI version.
+	tunnel.Version = versionString()
+
 	if len(os.Args) > 1 && (os.Args[1] == "-c" || os.Args[1] == "--config" || strings.HasPrefix(os.Args[1], "-c=") || strings.HasPrefix(os.Args[1], "--config=")) {
 		confPath := "config.json"
 		if strings.Contains(os.Args[1], "=") {
@@ -344,92 +351,29 @@ func main() {
 		printUsage()
 	case "server":
 		cfg := resolveConfig(os.Args[2:])
-		applyServerOptions(cfg)
-		maxGlobalSessions = cfg.MaxSessions
-		if maxGlobalSessions == 0 {
-			maxGlobalSessions = 2000
-		}
-		logLevel := cfg.LogLevel
-		if logLevel == "" {
-			logLevel = "info"
-		}
-		initLogger(logLevel)
+		initLogger(cfg.LogLevel)
 		defer logger.Sync()
-
-		listen := cfg.Listen
-		if listen == "" {
-			listen = ":8443"
+		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
+		if err := applyServerDefaults(cfg); err != nil {
+			logger.Fatal("❌ 服务端启动失败", zap.Error(err))
 		}
-		pathStr := cfg.Path
-		if pathStr == "" {
-			pathStr = "/stream"
-		}
-		target := cfg.Target
-		if target == "" {
-			target = cfg.DefaultTarget
-		}
-		if target == "" {
-			target = "tcp://127.0.0.1:22"
-		}
-		psk := cfg.PSK
-		if psk == "" {
-			psk = "my-secret-token"
+		if cfg.PSK == "" {
+			cfg.PSK = "my-secret-token"
 			logger.Warn("⚠️ 未配置 PSK，使用内置默认 token 'my-secret-token'，存在被未授权访问风险，请通过配置文件设置强 token！")
 		}
-		certFile := cfg.Cert
-		keyFile := cfg.Key
-		if cfg.SelfSign && (certFile == "" || keyFile == "") {
-			certFile = "cert.pem"
-			keyFile = "key.pem"
-			cn := cfg.SelfSignCN
-			if cn == "" {
-				cn = "www.bing.com"
-			}
-			if err := generateSelfSignedCert(certFile, keyFile, cn); err != nil {
-				logger.Fatal("Failed to generate self-signed certificate", zap.Error(err))
-			}
-		}
-		runServer(ctx, listen, pathStr, target, psk, certFile, keyFile, cfg.Dump, cfg.Fallback)
+		startServer(ctx, cfg)
 
 	case "client":
 		cfg := resolveConfig(os.Args[2:])
-		applyClientOptions(cfg)
-		maxClientSessions = cfg.MaxConns
-		if maxClientSessions == 0 {
-			maxClientSessions = 2000
-		}
-		logLevel := cfg.LogLevel
-		if logLevel == "" {
-			logLevel = "info"
-		}
-		initLogger(logLevel)
+		initLogger(cfg.LogLevel)
 		defer logger.Sync()
-
-		listen := cfg.Listen
-		if listen == "" {
-			listen = "tcp://127.0.0.1:1080"
-		}
-		serverURL := cfg.ServerURL
-		if serverURL == "" {
-			serverURL = "https://127.0.0.1:8443/stream"
-		}
-		forward := cfg.Target
-		if forward == "" {
-			forward = cfg.Forward
-		}
-		if forward == "" {
-			forward = "127.0.0.1:22"
-		}
-		psk := cfg.PSK
-		if psk == "" {
-			psk = "my-secret-token"
+		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
+		applyClientDefaults(cfg)
+		if cfg.PSK == "" {
+			cfg.PSK = "my-secret-token"
 			logger.Warn("⚠️ 未配置 PSK，使用内置默认 token 'my-secret-token'，存在被未授权访问风险，请通过配置文件设置强 token！")
 		}
-		alpn := cfg.ALPN
-		if alpn == "" {
-			alpn = "auto"
-		}
-		runClient(ctx, listen, serverURL, forward, psk, cfg.SNI, cfg.Host, alpn, cfg.Dump, cfg.Fingerprint)
+		startClient(ctx, cfg)
 
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
@@ -465,6 +409,54 @@ func resolveConfig(args []string) *FileConfig {
 	return cfg
 }
 
+// startClient builds a tunnel.Client from the resolved configuration and runs
+// the blocking local forwarder. It exits the process on startup failure.
+func startClient(ctx context.Context, cfg *FileConfig) {
+	c, err := tunnel.NewClient(tunnel.ClientConfig{
+		ServerURL:   cfg.ServerURL,
+		PSK:         cfg.PSK,
+		SNI:         cfg.SNI,
+		Host:        cfg.Host,
+		ALPN:        cfg.ALPN,
+		Fingerprint: cfg.Fingerprint,
+		Target:      cfg.Target,
+		MaxConns:    cfg.MaxConns,
+		IdleTimeout: time.Duration(cfg.IdleTimeout) * time.Second,
+		StreamMode:  cfg.StreamMode,
+		Dump:        cfg.Dump,
+	})
+	if err != nil {
+		logger.Fatal("❌ 客户端启动失败", zap.Error(err))
+	}
+	if err := c.ListenAndServe(ctx, cfg.Listen); err != nil && ctx.Err() == nil {
+		logger.Fatal("❌ 客户端退出", zap.Error(err))
+	}
+}
+
+// startServer builds a tunnel.Server from the resolved configuration and runs
+// the blocking accept/bridge loop. It exits the process on startup failure.
+func startServer(ctx context.Context, cfg *FileConfig) {
+	s, err := tunnel.NewServer(tunnel.ServerConfig{
+		Listen:            cfg.Listen,
+		Path:              cfg.Path,
+		PSK:               cfg.PSK,
+		CertFile:          cfg.Cert,
+		KeyFile:           cfg.Key,
+		Fallback:          cfg.Fallback,
+		DefaultTarget:     cfg.Target,
+		AllowedTargets:    cfg.AllowedTargets,
+		TrustProxyHeaders: cfg.TrustProxyHeaders,
+		MaxSessions:       cfg.MaxSessions,
+		Dump:              cfg.Dump,
+	})
+	if err != nil {
+		logger.Fatal("❌ 服务端启动失败", zap.Error(err))
+	}
+	if err := s.ListenAndServe(ctx); err != nil && ctx.Err() == nil {
+		logger.Fatal("❌ 服务端退出", zap.Error(err))
+	}
+}
+
 func runFromConfig(path string) {
 	cfg, err := loadConfigFile(path)
 	if err != nil {
@@ -475,79 +467,67 @@ func runFromConfig(path string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	logLevel := cfg.LogLevel
-	if logLevel == "" {
-		logLevel = "info"
-	}
-	initLogger(logLevel)
+	initLogger(cfg.LogLevel)
 	defer logger.Sync()
 
 	if strings.ToLower(cfg.Mode) == "client" {
-		applyClientOptions(cfg)
-		if cfg.MaxConns > 0 {
-			maxClientSessions = cfg.MaxConns
-		}
-		listen := cfg.Listen
-		if listen == "" {
-			listen = "tcp://127.0.0.1:1080"
-		}
-		alpn := cfg.ALPN
-		if alpn == "" {
-			alpn = "auto"
-		}
-		serverURL := cfg.ServerURL
-		if serverURL == "" {
-			serverURL = "https://127.0.0.1:8443/stream"
-		}
-		forward := cfg.Target
-		if forward == "" {
-			forward = cfg.Forward
-		}
-		if forward == "" {
-			forward = "127.0.0.1:22"
-		}
+		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
+		applyClientDefaults(cfg)
 		if cfg.PSK == "" {
 			logger.Warn("⚠️ 配置文件未设置 PSK，客户端将以无鉴权方式连接。")
 		}
-		runClient(ctx, listen, serverURL, forward, cfg.PSK, cfg.SNI, cfg.Host, alpn, cfg.Dump, cfg.Fingerprint)
+		startClient(ctx, cfg)
 	} else {
-		applyServerOptions(cfg)
-		if cfg.MaxSessions > 0 {
-			maxGlobalSessions = cfg.MaxSessions
-		}
-		listen := cfg.Listen
-		if listen == "" {
-			listen = ":8443"
-		}
-		pathStr := cfg.Path
-		if pathStr == "" {
-			pathStr = "/stream"
-		}
-		target := cfg.Target
-		if target == "" {
-			target = cfg.DefaultTarget
-		}
-		if target == "" {
-			target = "tcp://127.0.0.1:22"
-		}
-		certFile := cfg.Cert
-		keyFile := cfg.Key
-		if cfg.SelfSign && (certFile == "" || keyFile == "") {
-			certFile = "cert.pem"
-			keyFile = "key.pem"
-			cn := cfg.SelfSignCN
-			if cn == "" {
-				cn = "www.bing.com"
-			}
-			if err := generateSelfSignedCert(certFile, keyFile, cn); err != nil {
-				logger.Fatal("Failed to generate self-signed certificate", zap.Error(err))
-			}
+		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
+		if err := applyServerDefaults(cfg); err != nil {
+			logger.Fatal("❌ 服务端启动失败", zap.Error(err))
 		}
 		if cfg.PSK == "" {
 			logger.Warn("⚠️ 配置文件未设置 PSK，服务器将以开放模式运行（无鉴权），请勿在公网暴露。")
 		}
-		runServer(ctx, listen, pathStr, target, cfg.PSK, certFile, keyFile, cfg.Dump, cfg.Fallback)
+		startServer(ctx, cfg)
 	}
+}
+
+// runClient mirrors the historical CLI entry point: a blocking local
+// forwarder with per-call parameters. The subcommands construct the tunnel
+// package types directly; this shim remains for tests and quick embedding.
+// It returns the startup or serve error instead of exiting, so callers can
+// decide how loudly to fail.
+func runClient(ctx context.Context, listenStr, serverURLStr, forwardTarget, psk, customSNI, customHost, alpn string, dump bool, fingerprint string) error {
+	c, err := tunnel.NewClient(tunnel.ClientConfig{
+		ServerURL:   serverURLStr,
+		PSK:         psk,
+		SNI:         customSNI,
+		Host:        customHost,
+		ALPN:        alpn,
+		Fingerprint: fingerprint,
+		Target:      forwardTarget,
+		Dump:        dump,
+	})
+	if err != nil {
+		return err
+	}
+	return c.ListenAndServe(ctx, listenStr)
+}
+
+// runServer mirrors the historical CLI entry point: a blocking server with
+// per-call parameters. See startServer for the config-file driven path.
+func runServer(ctx context.Context, listenAddr, path, defaultTargetStr, psk, certFile, keyFile string, dump bool, fallback string) error {
+	s, err := tunnel.NewServer(tunnel.ServerConfig{
+		Listen:        listenAddr,
+		Path:          path,
+		PSK:           psk,
+		CertFile:      certFile,
+		KeyFile:       keyFile,
+		DefaultTarget: defaultTargetStr,
+		Dump:          dump,
+		Fallback:      fallback,
+	})
+	if err != nil {
+		return err
+	}
+	return s.ListenAndServe(ctx)
 }
 
 func printUsage() {

@@ -1,4 +1,4 @@
-package main
+package tunnel
 
 import (
 	"bytes"
@@ -46,7 +46,7 @@ func TestXHTTPTunnel_E2E_TLSHTTP3(t *testing.T) {
 	certDir := t.TempDir()
 	certFile := filepath.Join(certDir, "cert.pem")
 	keyFile := filepath.Join(certDir, "key.pem")
-	if err := generateSelfSignedCert(certFile, keyFile, "localhost"); err != nil {
+	if err := GenerateSelfSignedCert(certFile, keyFile, "localhost"); err != nil {
 		t.Fatalf("generate test certificate: %v", err)
 	}
 
@@ -73,7 +73,7 @@ func TestXHTTPTunnel_E2E_TLSHTTP3(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse H3 URL: %v", err)
 	}
-	conn, err := DialXHTTP(ctx, serverURL, &Config{
+	conn, err := DialXHTTP(ctx, serverURL, &DialConfig{
 		Password: "h3-test-secret",
 		Path:     "/stream",
 		SNI:      "localhost",
@@ -113,7 +113,7 @@ func TestSelectTransportReusesHTTP3(t *testing.T) {
 		transportMu.Unlock()
 	}()
 
-	cfg := &Config{SNI: "cdn.example.test", ALPN: "h3"}
+	cfg := &DialConfig{SNI: "cdn.example.test", ALPN: "h3"}
 	protos := buildNextProtos(cfg.ALPN)
 	first, ownedFirst := selectTransport("h3", cfg, protos, true, "127.0.0.1:443")
 	second, ownedSecond := selectTransport("h3", cfg, protos, true, "127.0.0.1:443")

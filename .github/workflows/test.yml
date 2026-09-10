@@ -1,0 +1,157 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run unit, integration, CDN, delay, TLS, and HTTP/3 tests
+        run: go test ./... -count=1 -timeout=5m
+
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          mapfile -t go_files < <(git ls-files '*.go')
+          unformatted="$(gofmt -l "${go_files[@]}")"
+          if [[ -n "${unformatted}" ]]; then
+            echo "The following files need gofmt:" >&2
+            echo "${unformatted}" >&2
+            exit 1
+          fi
+
+  race-and-network-stress:
+    name: Race and repeated delay tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./... -count=1 -timeout=10m
+
+      - name: Repeat the delayed CDN test
+        run: go test ./... -run '^TestXHTTPTunnel_E2E_ThroughCDNWithLatency$' -count=3 -timeout=3m
+
+  benchmark-regression:
+    name: Benchmark regression gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BENCH_REGEX: 'Benchmark(XHTTPTunnel_(ThroughCDN_72KB|TCP_h[123]|UDP_h[123])|ReliableBuffer_.*)$'
+      # Fail when a benchmark's mean ns/op grows beyond this ratio vs the
+      # baseline. Generous by default so shared-runner noise does not redden
+      # CI; lower it once the signal proves stable.
+      BENCH_THRESHOLD: '1.25'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve baseline ref
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            ref="${{ github.event.pull_request.base.sha }}"
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            ref="${{ github.event.before }}"
+          else
+            ref="HEAD~1"
+          fi
+          zero="0000000000000000000000000000000000000000"
+          if [ -z "$ref" ] || [ "$ref" = "$zero" ] || ! git cat-file -e "${ref}^{commit}" 2>/dev/null; then
+            ref="HEAD~1"
+          fi
+          if git cat-file -e "${ref}^{commit}" 2>/dev/null; then
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          else
+            echo "No reachable baseline (first commit / shallow clone); skipping gate." >> "$GITHUB_STEP_SUMMARY"
+            echo "ref=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Benchmark current HEAD
+        if: steps.base.outputs.ref != ''
+        run: go test ./... -run '^$' -bench "$BENCH_REGEX" -benchmem -benchtime=100ms -count=8 | tee new.txt
+
+      - name: Benchmark baseline
+        if: steps.base.outputs.ref != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach ../bench-base "${{ steps.base.outputs.ref }}"
+          ( cd ../bench-base && go test ./... -run '^$' -bench "$BENCH_REGEX" -benchmem -benchtime=100ms -count=8 ) > base.txt
+
+      - name: Compare with benchstat
+        if: steps.base.outputs.ref != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run golang.org/x/perf/cmd/benchstat@latest base.txt new.txt | tee benchstat.txt
+          { echo '### Benchmark comparison (baseline → HEAD)'; echo '```'; cat benchstat.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on regression
+        if: steps.base.outputs.ref != ''
+        run: python3 scripts/bench_gate.py base.txt new.txt --threshold "$BENCH_THRESHOLD"

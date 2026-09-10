@@ -1,4 +1,4 @@
-package main
+package tunnel
 
 import (
 	"bytes"
@@ -39,9 +39,9 @@ func verifyFingerprint(expectedHex string) func([][]byte, [][]*x509.Certificate)
 	}
 }
 
-// generateSelfSignedCert generates a realistic-looking self-signed certificate
+// GenerateSelfSignedCert generates a realistic-looking self-signed certificate
 // valid for 10 years and saves it to disk.
-func generateSelfSignedCert(certPath, keyPath, commonName string) error {
+func GenerateSelfSignedCert(certPath, keyPath, commonName string) error {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return err

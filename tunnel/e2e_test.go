@@ -1,4 +1,4 @@
-package main
+package tunnel
 
 import (
 	"bytes"
@@ -52,16 +52,16 @@ func TestXHTTPTunnel_E2E_TCP(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func(xc *xhttpFramedConn) {
+			go func(xc *XHTTPConn) {
 				defer xc.Close()
-				rc, err := net.Dial("tcp", xc.targetAddr)
+				rc, err := net.Dial("tcp", xc.TargetAddr())
 				if err != nil {
 					return
 				}
 				defer rc.Close()
 				go io.Copy(rc, xc)
 				io.Copy(xc, rc)
-			}(conn.(*xhttpFramedConn))
+			}(conn.(*XHTTPConn))
 		}
 	}()
 
@@ -69,7 +69,7 @@ func TestXHTTPTunnel_E2E_TCP(t *testing.T) {
 
 	// 3. Client dials the tunnel
 	serverURL, _ := url.Parse("http://" + xl.Addr().String() + path)
-	cfg := &Config{
+	cfg := &DialConfig{
 		Password: token,
 		Path:     path,
 		ALPN:     "h1",
@@ -166,23 +166,23 @@ func bulkIntegrityOver(t *testing.T, alpn, serverLnAddr string) {
 			if err != nil {
 				return
 			}
-			go func(xc *xhttpFramedConn) {
+			go func(xc *XHTTPConn) {
 				defer xc.Close()
-				rc, err := net.Dial("tcp", xc.targetAddr)
+				rc, err := net.Dial("tcp", xc.TargetAddr())
 				if err != nil {
 					return
 				}
 				defer rc.Close()
 				go io.Copy(rc, xc)
 				io.Copy(xc, rc)
-			}(conn.(*xhttpFramedConn))
+			}(conn.(*XHTTPConn))
 		}
 	}()
 
 	time.Sleep(100 * time.Millisecond)
 
 	serverURL, _ := url.Parse("http://" + xl.Addr().String() + "/stream")
-	clientConn, err := DialXHTTP(ctx, serverURL, &Config{
+	clientConn, err := DialXHTTP(ctx, serverURL, &DialConfig{
 		Password: "test-secret",
 		Path:     "/stream",
 		ALPN:     alpn,
@@ -263,9 +263,9 @@ func TestXHTTPTunnel_E2E_UDP(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func(xc *xhttpFramedConn) {
+			go func(xc *XHTTPConn) {
 				defer xc.Close()
-				rc, err := net.Dial("udp", xc.targetAddr)
+				rc, err := net.Dial("udp", xc.TargetAddr())
 				if err != nil {
 					return
 				}
@@ -274,7 +274,7 @@ func TestXHTTPTunnel_E2E_UDP(t *testing.T) {
 				go func() {
 					uBuf := make([]byte, maxUDPFrameSize)
 					for {
-						n, err := readUDPFrameInto(xc, uBuf)
+						n, err := ReadUDPFrameInto(xc, uBuf)
 						if err != nil {
 							return
 						}
@@ -288,9 +288,9 @@ func TestXHTTPTunnel_E2E_UDP(t *testing.T) {
 					if err != nil {
 						return
 					}
-					writeUDPFrame(xc, dBuf[:n])
+					WriteUDPFrame(xc, dBuf[:n])
 				}
-			}(conn.(*xhttpFramedConn))
+			}(conn.(*XHTTPConn))
 		}
 	}()
 
@@ -298,7 +298,7 @@ func TestXHTTPTunnel_E2E_UDP(t *testing.T) {
 
 	// 3. Client dials the tunnel
 	serverURL, _ := url.Parse("http://" + xl.Addr().String() + path)
-	cfg := &Config{
+	cfg := &DialConfig{
 		Password: token,
 		Path:     path,
 		ALPN:     "h1",
@@ -312,14 +312,14 @@ func TestXHTTPTunnel_E2E_UDP(t *testing.T) {
 
 	// 4. Send a UDP frame and verify the echo
 	testData := []byte("Hello UDP Frame via XHTTP Tunnel!")
-	if err := writeUDPFrame(clientConn, testData); err != nil {
-		t.Fatalf("Client writeUDPFrame failed: %v", err)
+	if err := WriteUDPFrame(clientConn, testData); err != nil {
+		t.Fatalf("Client WriteUDPFrame failed: %v", err)
 	}
 
 	recvBuf := make([]byte, maxUDPFrameSize)
-	n, err := readUDPFrameInto(clientConn, recvBuf)
+	n, err := ReadUDPFrameInto(clientConn, recvBuf)
 	if err != nil {
-		t.Fatalf("Client readUDPFrameInto failed: %v", err)
+		t.Fatalf("Client ReadUDPFrameInto failed: %v", err)
 	}
 
 	if !bytes.Equal(recvBuf[:n], testData) {

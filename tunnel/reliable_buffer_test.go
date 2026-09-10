@@ -1,4 +1,4 @@
-package main
+package tunnel
 
 import (
 	"sync"
@@ -187,7 +187,7 @@ func TestReliableBuffer_Close(t *testing.T) {
 
 // Test 6: concurrent Close vs PutReadData race (guards against a nil map panic)
 func TestMeekVirtualConn_ConcurrentClosePutReadData(t *testing.T) {
-	conn := newMeekVirtualConn("test-race", stringAddr("127.0.0.1:1"), stringAddr("127.0.0.1:2"))
+	conn := newMeekVirtualConn("test-race", stringAddr("127.0.0.1:1"), stringAddr("127.0.0.1:2"), nil)
 	var wg sync.WaitGroup
 
 	for i := 0; i < 20; i++ {
@@ -210,7 +210,7 @@ func TestMeekVirtualConn_ConcurrentClosePutReadData(t *testing.T) {
 // hits maxReassemblyBytes, a further contiguous chunk must block in
 // waitForReassemblyRoom until a reader drains room — not drop or overwrite.
 func TestMeekVirtualConn_ReassemblyBackpressure(t *testing.T) {
-	conn := newMeekVirtualConn("bp-reasm", stringAddr("127.0.0.1:1"), stringAddr("127.0.0.1:2"))
+	conn := newMeekVirtualConn("bp-reasm", stringAddr("127.0.0.1:1"), stringAddr("127.0.0.1:2"), nil)
 
 	// Fill the reassembly buffer to exactly the cap. The first chunk fits
 	// without blocking.
@@ -263,7 +263,7 @@ func TestMeekVirtualConn_ReassemblyBackpressure(t *testing.T) {
 // must wake once a leading chunk frees a slot and drainContiguous flushes the
 // run.
 func TestMeekVirtualConn_OutOfOrderBackpressure(t *testing.T) {
-	conn := newMeekVirtualConn("bp-ooo", stringAddr("127.0.0.1:1"), stringAddr("127.0.0.1:2"))
+	conn := newMeekVirtualConn("bp-ooo", stringAddr("127.0.0.1:1"), stringAddr("127.0.0.1:2"), nil)
 
 	chunk := make([]byte, 1024)
 	// 1024 strictly-ahead chunks fill the cache to its chunk cap.
