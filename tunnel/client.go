@@ -634,7 +634,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					} else if cfg.SNI != "" {
 						req.Host = cfg.SNI
 					}
-					req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.5410.0 Safari/537.36 Client/"+Version)
+					req.Header.Set("User-Agent", clientUserAgent)
 					if cfg.Password != "" {
 						req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Password)
 						// Proxy-Authorization is hop-by-hop and is commonly stripped
@@ -1326,20 +1326,37 @@ func (c *Client) dialTracked(ctx context.Context, network, addr string) (net.Con
 		c.dialCount.Add(-1)
 		return nil, err
 	}
-	return &trackedConn{Conn: conn, client: c}, nil
+	tracked := &trackedConn{Conn: conn, client: c}
+	// Release the MaxConns slot the moment the tunnel dies on its own
+	// (peer closed / transport failure), not only when the caller closes it.
+	// Without this, a caller that forgets to Close a dead session leaks its
+	// slot for the process lifetime and can eventually lock itself out of
+	// MaxConns. The release is idempotent via tracked.release.
+	if doneable, ok := conn.(interface{ Done() <-chan struct{} }); ok {
+		go func() {
+			<-doneable.Done()
+			tracked.releaseSlot()
+		}()
+	}
+	return tracked, nil
 }
 
-// trackedConn releases its MaxConns slot exactly once, when the caller
-// closes the session.
+// trackedConn releases its MaxConns slot exactly once — either when the
+// caller closes the session or when the underlying tunnel dies, whichever
+// happens first.
 type trackedConn struct {
 	net.Conn
 	client  *Client
 	release sync.Once
 }
 
+func (t *trackedConn) releaseSlot() {
+	t.release.Do(func() { t.client.dialCount.Add(-1) })
+}
+
 func (t *trackedConn) Close() error {
 	err := t.Conn.Close()
-	t.release.Do(func() { t.client.dialCount.Add(-1) })
+	t.releaseSlot()
 	return err
 }
 

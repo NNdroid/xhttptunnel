@@ -75,7 +75,17 @@ type FileConfig struct {
 	LogLevel      string `json:"log_level"`      // debug, info, warn, error
 	Dump          bool   `json:"dump"`           // Dump hex traffic
 	MaxSessions   int    `json:"max_sessions"`   // Server max concurrent sessions
-	MaxConns      int    `json:"max_conns"`      // Client max concurrent connections
+	// MaxSessionsPerIP bounds concurrent sessions from a single client address,
+	// limiting one PSK holder's blast radius. 0 (default) disables.
+	MaxSessionsPerIP int `json:"max_sessions_per_ip"`
+	// HealthPath, when set (e.g. "/healthz"), exposes an unauthenticated JSON
+	// stats endpoint on the tunnel listener. Empty disables it.
+	HealthPath string `json:"health_path"`
+	// MinProtoVersion rejects (HTTP 426) clients advertising an older
+	// X-XHTTP-Proto than this, to force a fleet off a retired wire format. 0
+	// (default) accepts all clients including header-less legacy ones.
+	MinProtoVersion int `json:"min_proto_version"`
+	MaxConns        int `json:"max_conns"` // Client max concurrent connections
 	// ChunkSizeKB caps the upstream payload carried by one poll request. The
 	// default (256) leaves headroom under the 1MB body limit that nginx and
 	// many CDN/WAF tiers enforce. Must be raised on BOTH ends together.
@@ -447,6 +457,9 @@ func startServer(ctx context.Context, cfg *FileConfig) {
 		AllowedTargets:    cfg.AllowedTargets,
 		TrustProxyHeaders: cfg.TrustProxyHeaders,
 		MaxSessions:       cfg.MaxSessions,
+		MaxSessionsPerIP:  cfg.MaxSessionsPerIP,
+		HealthPath:        cfg.HealthPath,
+		MinProtoVersion:   cfg.MinProtoVersion,
 		Dump:              cfg.Dump,
 	})
 	if err != nil {

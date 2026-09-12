@@ -51,11 +51,32 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 	if len(st.sessions) >= st.maxSessions {
 		st.sessionsMu.Unlock()
 		lg.Warn("❌ [Server] 拒绝连接: 达到最大并发会话数限制", zap.Int("limit", st.maxSessions), zap.String("remote", remoteAddr))
+		st.stats.sessionsReject.Add(1)
 		st.events.emit(SessionLimitRejected{SessionID: sessionID, Remote: remoteAddr})
 		return nil, false, http.StatusServiceUnavailable
 	}
+	// Per-IP cap: a single PSK holder (or one compromised host) behind an
+	// otherwise-healthy client must not be able to occupy the whole registry
+	// and starve the rest. 0 disables. perIP is kept in sync with the registry
+	// (incremented on create, decremented by removeSessionLocked on every
+	// removal path: session close, kick, reaper, connCh-full rejection).
+	if st.maxPerIP > 0 {
+		if ip := ipOnly(remoteAddr); ip != "" && st.perIP[ip] >= st.maxPerIP {
+			st.sessionsMu.Unlock()
+			lg.Warn("❌ [Server] 拒绝连接: 达到单 IP 会话上限", zap.String("ip", ip), zap.Int("limit", st.maxPerIP))
+			st.stats.sessionsReject.Add(1)
+			st.events.emit(SessionLimitRejected{SessionID: sessionID, Remote: remoteAddr})
+			return nil, false, http.StatusServiceUnavailable
+		}
+	}
 	vConn = newMeekVirtualConn(sessionID, stringAddr(host), stringAddr(remoteAddr), st.lg())
 	st.sessions[sessionID] = vConn
+	if st.perIP != nil {
+		if ip := ipOnly(remoteAddr); ip != "" {
+			st.perIP[ip]++
+		}
+	}
+	st.stats.sessionsTotal.Add(1)
 	st.sessionsMu.Unlock()
 
 	xConn := newXHTTPConn(vConn, vConn, func() error {

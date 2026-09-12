@@ -89,11 +89,14 @@ journalctl -u xhttptunnel -f   # View live logs
 | `log_level` | `string` | `"info"` | Logging output level: `debug`, `info`, `warn`, `error`. |
 | `dump` | `bool` | `false` | Hex-dump tunnelled traffic to stdout (debugging only). |
 | `max_sessions` | `int` | `2000` | Server max concurrent sessions. |
+| `max_sessions_per_ip` | `int` | `0` | Server: cap concurrent sessions from one client address (0 = unlimited). Bounds one PSK holder's blast radius against the shared registry. Counts the TCP peer address unless `trust_proxy_headers` is on. |
 | `max_conns` | `int` | `2000` | Client max concurrent local connections / sessions. |
 | `chunk_size_kb` | `int` | `256` | Upstream payload per poll request (clamped 16–900). Must match on both ends. |
 | `idle_timeout` | `int` | `900` | Client: drop a local connection after this many seconds of silence. |
 | `allowed_targets` | `[]string` | `[]` | Server: restrict client-requested targets (`"host:port"`, `":port"`, or `"host:"`). Empty = allow all. |
 | `trust_proxy_headers` | `bool` | `false` | Server: honour `CF-Connecting-IP`/`X-Forwarded-For`/`X-Real-IP` for client-address logging. Enable only behind a trusted proxy that strips them. |
+| `health_path` | `string` | `""` | Server: when set (e.g. `/healthz`), expose an unauthenticated JSON stats snapshot (`Server.Stats`) on the tunnel listener. Empty = disabled. Intended for localhost / operator listeners. |
+| `min_proto_version` | `int` | `0` | Server: reject (HTTP 426) clients advertising an `X-XHTTP-Proto` below this, to retire an old wire generation fleet-wide. `0` accepts all clients, including header-less legacy ones. |
 
 For a direct TLS deployment, `:8443` (or `tcp+udp://:8443`) starts HTTPS and HTTP/3 on the same port. Use `tcp://127.0.0.1:8443` for a cleartext CDN origin; without a certificate/key the server intentionally does not bind UDP or advertise HTTP/3.
 
@@ -262,13 +265,57 @@ TTL 5 min):
 2. **Path probe** — the server flushes a hello frame immediately; if the first
    frame arrives within `max(2s, 3× measured TTFB)` the path does not buffer
    responses and stream mode is committed.
-3. **Watchdog** — an established stream must see a frame (data or 25 s
-   keepalive) within 75 s; two consecutive breaks downgrade the endpoint to
-   poll mode.
+3. **Watchdog** — an established stream must see a frame (data or keepalive,
+   emitted every 5 s) within 75 s; two consecutive breaks downgrade the
+   endpoint to poll mode.
 
 Set `StreamMode: "poll"` to force the legacy mode, `"stream"` to skip
 negotiation. Kicked sessions end their stream **without** the close marker so
 the client transparently re-establishes (poll parity).
+
+### Protocol versioning & operational hardening
+
+- **Wire-protocol generation.** Every tunnel response carries
+  `X-XHTTP-Proto: 1`. A client refuses to speak to a server advertising a
+  *newer* generation (a hard error, not a poll fallback — a changed frame
+  layout must not be polled by an older reader). An operator can force the
+  fleet off a retired generation with `min_proto_version`: requests whose
+  advertised version is lower (including header-less legacy clients) get
+  HTTP 426. Bumping the generation is a single constant in the SDK.
+- **Per-IP session cap.** `max_sessions_per_ip` bounds how many live sessions
+  one client address may hold, so a single leaked PSK or a compromised host
+  cannot exhaust the global `max_sessions` and starve everyone else. Off by
+  default; the global cap always still applies.
+- **Stats & health endpoint.** `Server.Stats()` returns monotonic counters
+  (sessions created / rejected / kicked / reaped, request total, live gauge,
+  protocol version). Setting `health_path` (e.g. `/healthz`) serves them as
+  JSON on the tunnel listener — unauthenticated, so point it at a
+  localhost/operator address, not the public one.
+- **Connection-slot reclamation.** A client `MaxConns` slot is released when
+  the tunnel dies **terminally** (peer close marker, auth rejection) even if
+  the embedder never calls `Close` — a forgotten dead session cannot leak the
+  pool dry. A transient server *vanish* intentionally does **not** release it:
+  the client keeps reconnecting to resume, so the slot stays reserved while
+  recovery is in flight.
+
+HTTP/3 (QUIC) keeps Go's native TLS stack: `quic-go` hard-codes
+`tls.QUICClient` in its internal handshake and cannot take a `crypto/tls`
+replacement without a forked `quic-go`, so the HTTP/3 client does not carry
+the uTLS browser-mimicry the h1/h2 clients do.
+
+HTTP/2 is slower than HTTP/1.1 on request/response traffic. That gap was
+probed for a tunable flow-control cause: `x/net/http2` does expose per-stream
+and per-connection windows on the server and a client read-frame buffer, but
+a controlled same-machine A/B found **no reliable gain** — raising the client
+`MaxReadFrameSize` (16 KiB default → 256 KiB) landed within run-to-run noise,
+and the h2 benchmark swings several-fold with transient machine load, so single
+measurements mislead. No HTTP/2 tuning is applied; the gap is treated as
+inherent per-stream overhead and `h1` remains the default fast path. To keep
+this investigation reproducible instead of eyeballing noisy `ns/op`, CI runs a
+`profiling` job (see `.github/workflows/test.yml`) that captures CPU, block
+and memory profiles for `h1/h2/h3` and `ThroughCDN`, publishes them as
+downloadable artifacts and an SVG set, and prints pprof top tables (including
+block-wait breakdowns) into the run summary.
 
 ### Low-level building blocks
 

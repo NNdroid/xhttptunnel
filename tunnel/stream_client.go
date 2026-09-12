@@ -292,6 +292,13 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return false, errStreamUnavailable
 	}
+	// A server announcing a newer protocol generation than this client speaks
+	// is fatal, not a fallback: the frame layout may already differ, so
+	// polling could corrupt the stream rather than degrade it.
+	if err := checkServerProto(resp.Header); err != nil {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return false, err
+	}
 
 	// First frame inside the probe window proves the path streams.
 	type firstResult struct {
@@ -542,7 +549,7 @@ func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, n
 	} else if cfg.SNI != "" {
 		req.Host = cfg.SNI
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.5410.0 Safari/537.36 Client/"+Version)
+	req.Header.Set("User-Agent", clientUserAgent)
 	if cfg.Password != "" {
 		req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Password)
 		// Proxy-Authorization is hop-by-hop and is commonly stripped by CDNs;
@@ -552,4 +559,5 @@ func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, n
 	req.Header.Set("X-Target", targetAddr)
 	req.Header.Set("X-Network", network)
 	req.Header.Set("X-Session-ID", sessionID)
+	req.Header.Set(ProtoHeader, strconv.Itoa(tunnelProtoVersion))
 }

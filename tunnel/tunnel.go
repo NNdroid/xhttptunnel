@@ -27,6 +27,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -42,6 +44,13 @@ import (
 // SetLogger, it is an unsynchronized package global: set it during process
 // startup, before any Client or Server is constructed.
 var Version = "dev"
+
+// clientUserAgent is the User-Agent every client request (poll, stream GET
+// and stream POST) presents. It must stay consistent with the TLS
+// fingerprint the dialer advertises (utls.HelloChrome_Auto): the current
+// value identifies an Android WebView (Chrome 151), matching the mobile
+// camouflage this deployment targets.
+const clientUserAgent = "Mozilla/5.0 (Linux; Android 15; SM-A057G Build/AP3A.240905.015.A2; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/151.0.7922.202 Mobile Safari/537.36 w2n/Android"
 
 // Sentinel errors the library returns for programmatically actionable
 // conditions. Check with errors.Is; the concrete error may carry more detail.
@@ -210,6 +219,63 @@ func chunkSizeBytes(kb int) int {
 
 const defaultMaxSessions = 2000
 
+// ProtoHeader advertises the wire-protocol generation a request speaks and is
+// echoed by the server in every response. Bumping tunnelProtoVersion is the
+// single place to change when a frame-format revision lands; clients refuse
+// servers that report a newer generation rather than corrupting silently.
+const (
+	ProtoHeader        = "X-XHTTP-Proto"
+	tunnelProtoVersion = 1
+)
+
+// errProtoTooNew reports a server speaking a protocol generation this client
+// predates. Distinct from the "unavailable → fall back" signal because a
+// newer wire format must not be polled by an older client.
+var errProtoTooNew = errors.New("tunnel: server reports a newer protocol version than this client supports")
+
+// checkServerProto rejects responses that advertise a protocol generation
+// newer than tunnelProtoVersion. An absent header is treated as the oldest
+// generation (legacy server), so it is always acceptable.
+func checkServerProto(h http.Header) error {
+	v := h.Get(ProtoHeader)
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= tunnelProtoVersion {
+		return nil
+	}
+	return fmt.Errorf("%w (server %d, client %d)", errProtoTooNew, n, tunnelProtoVersion)
+}
+
+// TunnelStats is the monotonic snapshot reported by Server.Stats and the
+// optional health endpoint. Counters never reset; ActiveSessions is the live
+// registry size.
+type TunnelStats struct {
+	ActiveSessions   int    `json:"active_sessions"`
+	SessionsTotal    uint64 `json:"sessions_total"`
+	SessionsRejected uint64 `json:"sessions_rejected"`
+	SessionsKicked   uint64 `json:"sessions_kicked"`
+	SessionsReaped   uint64 `json:"sessions_reaped"`
+	RequestsTotal    uint64 `json:"requests_total"`
+	ProtoVersion     int    `json:"proto_version"`
+}
+
+func (st *serverState) snapshot() TunnelStats {
+	st.sessionsMu.RLock()
+	active := len(st.sessions)
+	st.sessionsMu.RUnlock()
+	return TunnelStats{
+		ActiveSessions:   active,
+		SessionsTotal:    st.stats.sessionsTotal.Load(),
+		SessionsRejected: st.stats.sessionsReject.Load(),
+		SessionsKicked:   st.stats.sessionsKicked.Load(),
+		SessionsReaped:   st.stats.sessionsReaped.Load(),
+		RequestsTotal:    st.stats.requests.Load(),
+		ProtoVersion:     tunnelProtoVersion,
+	}
+}
+
 // serverState holds the mutable policy and the session registry of one
 // server. It exists so several servers can run side by side in one process:
 // the low-level ListenXHTTP keeps using defaultServerState (its historical
@@ -218,6 +284,28 @@ type serverState struct {
 	sessionsMu  sync.RWMutex
 	sessions    map[string]*meekVirtualConn
 	maxSessions int
+	// maxPerIP bounds sessions from one client address (0 = unlimited). The
+	// global cap alone lets a single PSK holder — or one compromised machine —
+	// starve everyone else out of the registry.
+	maxPerIP int
+	// perIP counts live sessions by client IP (host part of remoteAddr).
+	perIP map[string]int
+	// minProto rejects requests whose advertised X-XHTTP-Proto is below this
+	// (0 = accept everything, including legacy clients that send no header).
+	minProto int
+	// stats are monotonic counters surfaced by Server.Stats and the optional
+	// health endpoint. Atomic so the read side never takes sessionsMu.
+	stats struct {
+		sessionsTotal  atomic.Uint64
+		sessionsReject atomic.Uint64
+		sessionsKicked atomic.Uint64
+		sessionsReaped atomic.Uint64
+		requests       atomic.Uint64
+	}
+	// healthPath ("" = disabled) serves a JSON snapshot of stats on GET,
+	// outside the tunnel path and without authentication — intended for
+	// localhost/operator use.
+	healthPath string
 	// events delivers typed session events to the embedder's handler. Nil
 	// until Server.SetEventHandler (or a configured EventHandler) starts it.
 	events *sessionEventHub
@@ -263,6 +351,7 @@ func newServerState(maxSessions int) *serverState {
 	}
 	return &serverState{
 		sessions:    make(map[string]*meekVirtualConn),
+		perIP:       make(map[string]int),
 		maxSessions: maxSessions,
 		stopCleaner: make(chan struct{}),
 	}
@@ -384,9 +473,39 @@ func (st *serverState) addSession(id string, v *meekVirtualConn) bool {
 	return true
 }
 
+// ipOnly strips the port from a client address ("1.2.3.4:5678" → "1.2.3.4",
+// "[::1]:443" → "::1"); a bare IP passes through. Unparseable values become
+// "" so they collapse into one shared bucket rather than fragmenting the
+// per-IP accounting.
+func ipOnly(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	if addr != "" && !strings.Contains(addr, ":") {
+		return addr
+	}
+	return ""
+}
+
+// removeSessionLocked unregisters a session and decrements its per-IP tally.
+// Callers must hold sessionsMu and must have looked the session up first.
+func (st *serverState) removeSessionLocked(id string) {
+	v := st.sessions[id]
+	delete(st.sessions, id)
+	if v != nil && v.remote != nil && st.perIP != nil {
+		if ip := ipOnly(v.remote.String()); ip != "" {
+			if st.perIP[ip] <= 1 {
+				delete(st.perIP, ip)
+			} else {
+				st.perIP[ip]--
+			}
+		}
+	}
+}
+
 func (st *serverState) removeSession(id string) {
 	st.sessionsMu.Lock()
-	delete(st.sessions, id)
+	st.removeSessionLocked(id)
 	st.sessionsMu.Unlock()
 }
 
@@ -408,10 +527,11 @@ func (st *serverState) Kick(id string) bool {
 	st.sessionsMu.Lock()
 	v, ok := st.sessions[id]
 	if ok {
-		delete(st.sessions, id)
+		st.removeSessionLocked(id)
 	}
 	st.sessionsMu.Unlock()
 	if ok {
+		st.stats.sessionsKicked.Add(1)
 		// Mark the kick so a streaming downlink ends its response WITHOUT the
 		// close marker: marker means "session over, stop reconnecting", while
 		// a kicked client must transparently re-establish (poll parity).
@@ -429,7 +549,7 @@ func (st *serverState) KickAll() int {
 	victims := make([]*meekVirtualConn, 0, len(st.sessions))
 	for id, v := range st.sessions {
 		victims = append(victims, v)
-		delete(st.sessions, id)
+		st.removeSessionLocked(id)
 	}
 	st.sessionsMu.Unlock()
 	for _, v := range victims {
@@ -437,6 +557,7 @@ func (st *serverState) KickAll() int {
 		v.Close()
 	}
 	if len(victims) > 0 {
+		st.stats.sessionsKicked.Add(uint64(len(victims)))
 		st.lg().Debug("👢 [Server] 全部会话被管理员踢除", zap.Int("count", len(victims)))
 	}
 	return len(victims)
@@ -472,8 +593,9 @@ func (st *serverState) sweepIdleSessions() {
 		if now-atomic.LoadInt64(&v.lastActive) > int64(sessionIdleTimeout.Seconds()) {
 			logger.Debug("🧹 [Cleaner] 发现过期会话，清理释放资源", zap.String("session", id))
 			st.events.emit(SessionClosed{SessionID: id, Reason: "reaped"})
+			st.stats.sessionsReaped.Add(1)
 			v.Close()
-			delete(st.sessions, id)
+			st.removeSessionLocked(id)
 		}
 	}
 }
@@ -498,6 +620,6 @@ func (st *serverState) sweepAllSessions() {
 	defer st.sessionsMu.Unlock()
 	for id, v := range st.sessions {
 		v.Close()
-		delete(st.sessions, id)
+		st.removeSessionLocked(id)
 	}
 }

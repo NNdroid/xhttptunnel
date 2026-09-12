@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -237,6 +238,16 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 	}
 
 	mux := http.NewServeMux()
+	if healthPath := st.healthPath; healthPath != "" {
+		mux.HandleFunc(healthPath, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				nginxError(w, http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(st.snapshot())
+		})
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		clientIP := st.getClientIP(r)
 		logger.Debug("👀 [HTTP] 收到原始 HTTP 请求",
@@ -255,6 +266,19 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			return
 		}
 		atomic.AddUint64(&xl.RequestCount, 1)
+		st.stats.requests.Add(1)
+		// Advertise this server's protocol generation and, when configured,
+		// refuse clients that announced an older one than the operator allows.
+		w.Header().Set(ProtoHeader, strconv.Itoa(tunnelProtoVersion))
+		if st.minProto > 0 {
+			if v, err := strconv.Atoi(r.Header.Get(ProtoHeader)); err != nil || v < st.minProto {
+				logger.Warn("❌ [HTTP] 拒绝请求: 协议版本过旧",
+					zap.String("remote", clientIP),
+					zap.String("client_proto", r.Header.Get(ProtoHeader)))
+				http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+				return
+			}
+		}
 
 		target := r.Header.Get("X-Target")
 		network := r.Header.Get("X-Network")
@@ -703,6 +727,22 @@ type ServerConfig struct {
 	// MaxSessions caps concurrent tunnel sessions. 0 selects the default
 	// (2000).
 	MaxSessions int
+	// MaxSessionsPerIP caps concurrent sessions from a single client address,
+	// bounding one PSK holder's blast radius against the shared registry. 0
+	// (default) disables the per-IP limit; the global MaxSessions still applies.
+	// Behind an untrusted front (no TrustProxyHeaders) this keys off the TCP
+	// peer address; enable TrustProxyHeaders only behind a CDN that strips the
+	// forwarding headers, or the limit is trivially bypassed by spoofing them.
+	MaxSessionsPerIP int
+	// MinProtoVersion rejects requests advertising an X-XHTTP-Proto below this
+	// value with HTTP 426, letting an operator force a fleet off an old wire
+	// generation. 0 (default) accepts every client, including legacy ones that
+	// send no header.
+	MinProtoVersion int
+	// HealthPath, when non-empty (e.g. "/healthz"), serves an unauthenticated
+	// JSON TunnelStats snapshot on GET at that path, independent of the tunnel
+	// path. Intended for localhost or an operator-only listener.
+	HealthPath string
 	// Dump hex-dumps tunnelled traffic to stdout (debugging only).
 	Dump bool
 	// Logger is the per-instance logger: every log line this server emits goes
@@ -784,6 +824,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	state.events = newSessionEventHub(cfg.EventHandler)
 	state.setAllowedTargets(cfg.AllowedTargets)
 	state.trustProxy.Store(cfg.TrustProxyHeaders)
+	state.maxPerIP = cfg.MaxSessionsPerIP
+	state.minProto = cfg.MinProtoVersion
+	state.healthPath = cfg.HealthPath
 
 	s := &Server{cfg: cfg, state: state, certDir: certDir}
 	if cfg.DefaultTarget != "" {
@@ -916,6 +959,11 @@ func (s *Server) Addr() net.Addr {
 	}
 	return nil
 }
+
+// Stats returns a monotonic snapshot of the server's activity: live session
+// count, cumulative creates/rejects/kicks/reaps and request total. Safe to
+// call concurrently; it takes only a read lock for the gauge.
+func (s *Server) Stats() TunnelStats { return s.state.snapshot() }
 
 // ActiveSessions reports the number of tunnel sessions currently registered
 // on this server (created, not yet closed). Useful for health endpoints and

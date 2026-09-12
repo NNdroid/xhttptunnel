@@ -155,3 +155,89 @@ jobs:
       - name: Fail on regression
         if: steps.base.outputs.ref != ''
         run: python3 scripts/bench_gate.py base.txt new.txt --threshold "$BENCH_THRESHOLD"
+
+  profiling:
+    name: pprof / flamegraph profiles (h1/h2/h3 throughput)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Informational only: profile artifacts never gate the build, so a
+    # graphviz hiccup cannot redden CI.
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install graphviz (for pprof SVG rendering)
+        run: sudo apt-get update && sudo apt-get install -y graphviz
+
+      - name: Capture CPU, block and memory profiles per transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p profiles
+          # -benchtime generous enough to accumulate meaningful samples; block
+          # profiling rate is enabled automatically by -blockprofile. ThroughCDN
+          # is included because the CDN downlink (ack cadence / buffering) was
+          # the original throughput pain point, not just raw transport speed.
+          declare -A BENCHS=(
+            [h1]='BenchmarkXHTTPTunnel_TCP_h1$'
+            [h2]='BenchmarkXHTTPTunnel_TCP_h2$'
+            [h3]='BenchmarkXHTTPTunnel_TCP_h3$'
+            [cdn]='BenchmarkXHTTPTunnel_ThroughCDN_72KB$'
+          )
+          for label in h1 h2 h3 cdn; do
+            go test ./tunnel/ -run '^$' \
+              -bench "${BENCHS[$label]}" -benchmem \
+              -benchtime=3s -count=1 \
+              -cpuprofile "profiles/cpu-${label}.out" \
+              -blockprofile "profiles/block-${label}.out" \
+              -memprofile  "profiles/mem-${label}.out"
+          done
+
+      - name: Render SVG call graphs and summary tables
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo '### Transport profiles — CPU top (flat)'
+            echo ''
+            for label in h1 h2 h3 cdn; do
+              echo "<details><summary>${label} (cpu)</summary>"
+              echo ''
+              echo '```'
+              go tool pprof -top -nodecount=12 "profiles/cpu-${label}.out" 2>/dev/null || true
+              echo '```'
+              echo ''
+              echo 'Block waits (where goroutines stall — flow control, reads, locks):'
+              echo ''
+              echo '```'
+              go tool pprof -top -nodecount=12 "profiles/block-${label}.out" 2>/dev/null || true
+              echo '```'
+              echo '</details>'
+              echo ''
+            done
+            echo 'Open any raw profile locally for an interactive flamegraph:'
+            echo '`go tool pprof -http=. profiles/cpu-h2.out`'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # SVG rendering is best-effort (needs graphviz); the raw .out files
+          # are always uploaded and are the canonical flamegraph source.
+          for label in h1 h2 h3 cdn; do
+            go tool pprof -svg "profiles/cpu-${label}.out"   > "profiles/cpu-${label}.svg"   2>/dev/null || true
+            go tool pprof -svg "profiles/block-${label}.out" > "profiles/block-${label}.svg" 2>/dev/null || true
+            go tool pprof -svg "profiles/mem-${label}.out"   > "profiles/mem-${label}.svg"   2>/dev/null || true
+          done
+
+      - name: Upload profile artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiles-${{ github.sha }}
+          path: profiles/
+          if-no-files-found: warn
+          retention-days: 14
