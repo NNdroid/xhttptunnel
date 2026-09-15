@@ -9,7 +9,7 @@
     "sni": "Optional TLS SNI disguise/domain (default: inherited from server URL domain. Required if server URL uses CDN IP)",
     "host": "Optional HTTP Host disguise/domain (default: inherited from server URL domain. Required if server URL uses CDN IP)",
     "alpn": "HTTP protocol ALPN negotiation: 'auto', 'h2', 'http/1.1', 'h3'",
-    "fingerprint": "Expected SHA256 hex fingerprint of server certificate (optional certificate pinning; leave empty when behind CDN)",
+    "fingerprint": "SHA256 certificate pin (required for self-signed TLS; empty uses system CA and SNI verification for ordinary CDN HTTPS)",
     "max_conns": "Maximum concurrent client connections allowed",
     "dump": "Dump raw packet hex data in logs for low-level debugging",
     "log_level": "Logging verbosity: debug, info, warn, error"
@@ -18,7 +18,7 @@
   "listen": "tcp://127.0.0.1:1080",
   "server": "https://example.com:8443/stream",
   "target": "127.0.0.1:22",
-  "psk": "my-secret-token",
+  "psk": "replace-with-a-random-secret",
   "sni": "",
   "host": "",
   "alpn": "auto",

@@ -54,7 +54,7 @@ type DumpConn struct {
 func (c *DumpConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	if n > 0 {
-		fmt.Printf("\n--- [%s] ⬇️ 读取 %d 字节 ---\n%s\n", c.Prefix, n, hex.Dump(b[:n]))
+		fmt.Printf("\n--- [%s] ⬇️ read %d bytes ---\n%s\n", c.Prefix, n, hex.Dump(b[:n]))
 	}
 	return n, err
 }
@@ -62,7 +62,7 @@ func (c *DumpConn) Read(b []byte) (int, error) {
 func (c *DumpConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
 	if n > 0 {
-		fmt.Printf("\n--- [%s] ⬆️ 发送 %d 字节 ---\n%s\n", c.Prefix, n, hex.Dump(b[:n]))
+		fmt.Printf("\n--- [%s] ⬆️ sent %d bytes ---\n%s\n", c.Prefix, n, hex.Dump(b[:n]))
 	}
 	return n, err
 }
@@ -75,7 +75,7 @@ type DumpPacketConn struct {
 func (c *DumpPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, addr, err := c.PacketConn.ReadFrom(b)
 	if n > 0 {
-		fmt.Printf("\n--- [%s] ⬇️ 从 %s 读取 %d 字节 ---\n%s\n", c.Prefix, addr.String(), n, hex.Dump(b[:n]))
+		fmt.Printf("\n--- [%s] ⬇️ read from %s: %d bytes ---\n%s\n", c.Prefix, addr.String(), n, hex.Dump(b[:n]))
 	}
 	return n, addr, err
 }
@@ -83,7 +83,7 @@ func (c *DumpPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 func (c *DumpPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	n, err := c.PacketConn.WriteTo(b, addr)
 	if n > 0 {
-		fmt.Printf("\n--- [%s] ⬆️ 发送到 %s %d 字节 ---\n%s\n", c.Prefix, addr.String(), n, hex.Dump(b[:n]))
+		fmt.Printf("\n--- [%s] ⬆️ sent to %s: %d bytes ---\n%s\n", c.Prefix, addr.String(), n, hex.Dump(b[:n]))
 	}
 	return n, err
 }
@@ -229,6 +229,14 @@ func streamFrameBytes(seq, ack uint64, payload []byte) ([]byte, error) {
 	return buf, nil
 }
 
+func streamCloseFrameBytes(seq, ack uint64) ([]byte, error) {
+	frame, err := streamFrameBytes(seq, ack, nil)
+	if err == nil {
+		binary.BigEndian.PutUint32(frame[16:20], ^uint32(0))
+	}
+	return frame, err
+}
+
 // streamFrame is one parsed stream-mode chunk.
 type streamFrame struct {
 	seq    uint64 // sender's stream sequence for this payload
@@ -253,8 +261,8 @@ func readStreamFrame(r io.Reader) (streamFrame, error) {
 	if padLen > 65535 {
 		return f, fmt.Errorf("corrupted stream frame: padLen=%d", padLen)
 	}
-	payloadLen := binary.BigEndian.Uint32(meta[16:20]) & 0x7FFFFFFF
-	if payloadLen > uint32(currentMaxFrameSize()*4) {
+	payloadLen := binary.BigEndian.Uint32(meta[16:20])
+	if !f.closed && payloadLen > uint32(currentMaxFrameSize()*4) {
 		return f, fmt.Errorf("corrupted stream frame: payloadLen=%d", payloadLen)
 	}
 	if padLen > 0 {

@@ -44,18 +44,39 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 	// rejected target would still leave a phantom session behind.
 	if !st.targetAllowed(target) {
 		st.sessionsMu.Unlock()
-		lg.Warn("❌ [Server] 拒绝连接: 目标不在允许列表", zap.String("target", target), zap.String("remote", remoteAddr))
+		lg.Warn("❌ [Server] refused connection: target not in allow list", zap.String("target", target), zap.String("remote", remoteAddr))
 		st.events.emit(TargetDenied{Target: target, Network: network, Remote: remoteAddr})
 		return nil, false, http.StatusForbidden
 	}
 	if len(st.sessions) >= st.maxSessions {
 		st.sessionsMu.Unlock()
-		lg.Warn("❌ [Server] 拒绝连接: 达到最大并发会话数限制", zap.Int("limit", st.maxSessions), zap.String("remote", remoteAddr))
+		lg.Warn("❌ [Server] refused connection: reached max concurrent sessions", zap.Int("limit", st.maxSessions), zap.String("remote", remoteAddr))
+		st.stats.sessionsReject.Add(1)
 		st.events.emit(SessionLimitRejected{SessionID: sessionID, Remote: remoteAddr})
 		return nil, false, http.StatusServiceUnavailable
 	}
+	// Per-IP cap: a single PSK holder (or one compromised host) behind an
+	// otherwise-healthy client must not be able to occupy the whole registry
+	// and starve the rest. 0 disables. perIP is kept in sync with the registry
+	// (incremented on create, decremented by removeSessionLocked on every
+	// removal path: session close, kick, reaper, connCh-full rejection).
+	if st.maxPerIP > 0 {
+		if ip := ipOnly(remoteAddr); ip != "" && st.perIP[ip] >= st.maxPerIP {
+			st.sessionsMu.Unlock()
+			lg.Warn("❌ [Server] refused connection: reached per-IP session limit", zap.String("ip", ip), zap.Int("limit", st.maxPerIP))
+			st.stats.sessionsReject.Add(1)
+			st.events.emit(SessionLimitRejected{SessionID: sessionID, Remote: remoteAddr})
+			return nil, false, http.StatusServiceUnavailable
+		}
+	}
 	vConn = newMeekVirtualConn(sessionID, stringAddr(host), stringAddr(remoteAddr), st.lg())
 	st.sessions[sessionID] = vConn
+	if st.perIP != nil {
+		if ip := ipOnly(remoteAddr); ip != "" {
+			st.perIP[ip]++
+		}
+	}
+	st.stats.sessionsTotal.Add(1)
 	st.sessionsMu.Unlock()
 
 	xConn := newXHTTPConn(vConn, vConn, func() error {
@@ -70,7 +91,7 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 			reason = "kicked"
 		}
 		st.events.emit(SessionClosed{SessionID: sessionID, Reason: reason})
-		lg.Debug("💀 [Server] 会话彻底注销销毁", zap.String("session", sessionID))
+		lg.Debug("💀 [Server] session fully removed and destroyed", zap.String("session", sessionID))
 		return vConn.Close()
 	}, vConn.local, vConn.remote, vConn)
 	xConn.targetAddr = target
@@ -83,10 +104,10 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 	default:
 		st.removeSession(sessionID)
 		vConn.Close()
-		lg.Warn("❌ [Server] 会话队列已满，拒绝新会话", zap.String("session", sessionID), zap.String("remote", remoteAddr))
+		lg.Warn("❌ [Server] session queue full, refusing new session", zap.String("session", sessionID), zap.String("remote", remoteAddr))
 		return nil, false, http.StatusServiceUnavailable
 	}
-	lg.Debug("🆕 [Server] 收到并创建全新隧道会话", zap.String("session", sessionID), zap.String("target", target))
+	lg.Debug("🆕 [Server] received and created a new tunnel session", zap.String("session", sessionID), zap.String("target", target))
 	st.events.emit(SessionEstablished{SessionID: sessionID, Target: target, Network: network, Remote: remoteAddr})
 	return vConn, true, 0
 }
@@ -97,11 +118,14 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 // deployment requirements are identical to the long-poll mode's
 // (X-Accel-Buffering: no + response streaming enabled).
 func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState, vConn *meekVirtualConn, sessionID string, created bool) {
+	if r.Context().Err() != nil {
+		return
+	}
 	logger := st.lg()
 	if created {
-		logger.Debug("📡 [Stream] 新会话建立流式下行", zap.String("session", sessionID))
+		logger.Debug("📡 [Stream] new session established streaming downlink", zap.String("session", sessionID))
 	} else {
-		logger.Debug("📡 [Stream] 客户端重连既有会话的流式下行（续传）", zap.String("session", sessionID))
+		logger.Debug("📡 [Stream] client resumed the existing session's streaming downlink (resume)", zap.String("session", sessionID))
 	}
 
 	// A reconnecting GET carries X-Ack = the downlink bytes the client
@@ -134,6 +158,10 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	h.Set("Access-Control-Allow-Origin", "*")
 	h.Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Downstream-Accepted")
 	h.Set("X-Downstream-Accepted", "1")
+	h.Set("X-Stream-Uplink-Sync", "1")
+	if created {
+		h.Set("X-Session-Created", "1")
+	}
 	h.Set("Content-Type", "application/octet-stream")
 	h.Set("Server", "nginx")
 	w.WriteHeader(http.StatusOK)
@@ -142,20 +170,58 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	if err := rc.Flush(); err != nil {
 		// A path that cannot flush cannot stream; the client will not see the
 		// hello bytes inside its probe window and falls back to polling.
-		logger.Warn("⚠️ [Stream] 响应不支持 Flush，流式下行不可用", zap.String("session", sessionID), zap.Error(err))
+		logger.Warn("⚠️ [Stream] response does not support Flush, streaming downlink unavailable", zap.String("session", sessionID), zap.Error(err))
 		return
 	}
 
 	// Hello frame: zero payload, carries the current dispatch cursor so the
 	// client learns immediately where the stream resumes. This is also what
 	// the client's TTFB probe observes.
-	if hello, err := streamFrameBytes(vConn.downDispatchSeq, vConn.consumedUpSeq(), nil); err == nil {
-		if _, err := w.Write(hello); err == nil {
-			_ = rc.Flush()
+	vConn.downWindowMu.Lock()
+	helloSeq := vConn.downDispatchSeq
+	vConn.downWindowMu.Unlock()
+	hello, err := streamFrameBytes(helloSeq, vConn.consumedUpSeq(), nil)
+	if err != nil {
+		return
+	}
+	if _, err = w.Write(hello); err != nil {
+		return
+	}
+	if err = rc.Flush(); err != nil {
+		return
+	}
+
+	// The client starts its companion POST only after seeing the flushed GET
+	// headers. Do not send the hello frame until that POST has passed auth and
+	// per-session admission; this makes Dial success mean both directions are
+	// actually usable, without requiring full-duplex responses on the POST
+	// (which many CDNs buffer until its request body ends).
+	if created {
+		select {
+		case <-vConn.streamReady:
+		case <-r.Context().Done():
+			return
+		case <-time.After(streamProbeMinWindow):
+			return
 		}
+	}
+	if vConn.isClosed() {
+		if !vConn.kicked.Load() {
+			vConn.downWindowMu.Lock()
+			byeSeq := vConn.downDispatchSeq
+			vConn.downWindowMu.Unlock()
+			if bye, err := streamCloseFrameBytes(byeSeq, vConn.consumedUpSeq()); err == nil {
+				_, _ = w.Write(bye)
+				_ = rc.Flush()
+			}
+		}
+		return
 	}
 
 	for {
+		if r.Context().Err() != nil {
+			return
+		}
 		if vConn.isClosed() {
 			if vConn.kicked.Load() {
 				// Admin kick: end the response without the close marker so
@@ -165,7 +231,10 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 			// Session over (client closed uplink, or the target ended it):
 			// ship the poll-compatible close marker so the client's tunnel
 			// conn sees EOF, then end the response.
-			if bye, err := streamFrameBytes(vConn.downDispatchSeq, vConn.consumedUpSeq(), closeMarkerPayload); err == nil {
+			vConn.downWindowMu.Lock()
+			byeSeq := vConn.downDispatchSeq
+			vConn.downWindowMu.Unlock()
+			if bye, err := streamCloseFrameBytes(byeSeq, vConn.consumedUpSeq()); err == nil {
 				_, _ = w.Write(bye)
 				_ = rc.Flush()
 			}
@@ -178,6 +247,10 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 		}
 
 		vConn.downWindowMu.Lock()
+		if !vConn.holdsDownWriter(ticket) {
+			vConn.downWindowMu.Unlock()
+			return
+		}
 		downData, myDownSeq, downBufPtr := vConn.writeBuf.GetSlice(vConn.downPeerAck.Load(), vConn.downDispatchSeq, currentMaxSendBufSize())
 		if len(downData) > 0 {
 			vConn.downDispatchSeq = myDownSeq + uint64(len(downData))
@@ -190,13 +263,21 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 			// Idle: keepalive frame resets intermediary read timeouts and the
 			// session's idle stamp, then park until data, client departure,
 			// or the next keepalive tick.
-			vConn.updateActive()
-			if ka, err := streamFrameBytes(vConn.downDispatchSeq, vConn.consumedUpSeq(), nil); err == nil {
-				if _, err := w.Write(ka); err == nil {
-					_ = rc.Flush()
-				}
+			ka, err := streamFrameBytes(myDownSeq, vConn.consumedUpSeq(), nil)
+			if err != nil {
+				return
 			}
-			vConn.writeBuf.waitDispatchable(r.Context(), streamKeepaliveInterval, vConn.downDispatchSeq)
+			if _, err = w.Write(ka); err != nil {
+				return
+			}
+			if err = rc.Flush(); err != nil {
+				return
+			}
+			if r.Context().Err() != nil {
+				return
+			}
+			vConn.updateActive()
+			vConn.writeBuf.waitDispatchable(r.Context(), streamKeepaliveInterval, myDownSeq)
 			continue
 		}
 
@@ -228,16 +309,22 @@ func serveStreamUplink(w http.ResponseWriter, r *http.Request, st *serverState, 
 	for {
 		f, err := readStreamFrame(r.Body)
 		if err != nil {
+			if r.Context().Err() != nil || (r.Header.Get("X-Stream-Resume") == "1" && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF))) {
+				// A transport round ended, not the application session. Preserve
+				// acknowledged bytes for the replacement POST; explicit markers
+				// below still close normally. Legacy clients retain EOF semantics.
+				return
+			}
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				// Client ended the uplink: normal tunnel close or connection
 				// loss. Either way the session cannot make progress — closing
 				// (not just requestClose) makes the downlink loop ship its
 				// close marker so the client's reader finishes promptly.
-				logger.Debug("📡 [Stream] 上行流结束", zap.String("session", sessionID))
+				logger.Debug("📡 [Stream] uplink stream ended", zap.String("session", sessionID))
 				vConn.Close()
 				return
 			}
-			logger.Warn("⚠️ [Stream] 上行帧解析失败", zap.String("session", sessionID), zap.Error(err))
+			logger.Warn("⚠️ [Stream] failed to parse uplink frame", zap.String("session", sessionID), zap.Error(err))
 			vConn.Close()
 			return
 		}
@@ -246,7 +333,7 @@ func serveStreamUplink(w http.ResponseWriter, r *http.Request, st *serverState, 
 		// downlink writer's GetSlice frees acknowledged bytes based on it.
 		vConn.noteDownPeerAck(f.ack)
 		if f.closed {
-			logger.Debug("📡 [Stream] 上行流携带关闭标记", zap.String("session", sessionID))
+			logger.Debug("📡 [Stream] uplink stream carried a close marker", zap.String("session", sessionID))
 			vConn.Close()
 			return
 		}
@@ -254,13 +341,16 @@ func serveStreamUplink(w http.ResponseWriter, r *http.Request, st *serverState, 
 			// A frame whose sequence is entirely below the read cursor is a
 			// duplicate retransmission: normal transport behaviour, but worth
 			// surfacing at a high rate (possible replay probing).
-			if f.seq+uint64(len(f.data)) <= vConn.consumedUpSeq() {
+			consumed := vConn.consumedUpSeq()
+			if f.seq <= consumed && uint64(len(f.data)) <= consumed-f.seq {
 				st.events.emit(ReplayDropped{SessionID: sessionID, Seq: f.seq})
 			}
 			// The client dedups by sequence; PutReadData may block here to
 			// apply backpressure when the target drains slowly — that is the
 			// transport's flow control working as designed.
-			vConn.PutReadData(f.seq, f.data)
+			if _, err := vConn.PutReadDataContext(r.Context(), f.seq, f.data); err != nil {
+				return
+			}
 		}
 	}
 }

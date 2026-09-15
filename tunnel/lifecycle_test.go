@@ -3,6 +3,7 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/url"
@@ -347,7 +348,7 @@ func TestStreamClientFallsBackOnLegacyServer(t *testing.T) {
 // (server-side conn teardown of the response) and verifies the client
 // reconnects with its X-Ack and the byte stream continues without loss or
 // duplication.
-func TestStreamResumeAfterDownlinkBreak(t *testing.T) {
+func TestStreamSessionRecreationFailsOldConnection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -452,17 +453,52 @@ func TestStreamResumeAfterDownlinkBreak(t *testing.T) {
 	readSeq()
 	readSeq()
 
-	// Break the downlink: closing the session forces the streaming handler
-	// to end; the client must reconnect and resume without byte loss. The
-	// sequence generator keeps counting across the break.
+	// Recreating the server session changes both reliable sequence spaces.
+	// The old application connection must terminate explicitly; pretending it
+	// resumed would silently stall or duplicate data because acknowledged
+	// uplink bytes are no longer available to rebase at sequence zero.
 	srv.KickAll()
+	errCh := make(chan error, 1)
+	go func() {
+		var b [1]byte
+		_, err := conn.Read(b[:])
+		errCh <- err
+	}()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("old connection returned data after server session recreation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("old connection did not terminate after server session recreation")
+	}
+	xc, ok := conn.(*XHTTPConn)
+	if !ok {
+		t.Fatalf("old connection type = %T, want *XHTTPConn", conn)
+	}
+	if !errors.Is(xc.Err(), errServerSessionGone) {
+		t.Fatalf("old connection error = %v, want %v", xc.Err(), errServerSessionGone)
+	}
 
-	// After the kick the client transparently re-establishes and the stream
-	// must keep flowing (the generator kept counting). Byte continuity across
-	// a forced reconnect is best-effort (the bridge re-dials the target), so
-	// this asserts liveness only: 8 bytes arrive within the bounded windows.
-	// Frame alignment after kick is tracked as a separate investigation.
-	for i := 0; i < 8; i++ {
-		_ = readSeq()
+	// A new application connection starts a fresh sequence epoch and remains
+	// usable, proving that only the unsafe stale connection is rejected.
+	fresh, err := DialXHTTP(ctx, serverURL, &DialConfig{Password: secret, Path: "/stream", ALPN: "h1"}, "seq:1", "tcp")
+	if err != nil {
+		t.Fatalf("fresh dial: %v", err)
+	}
+	defer fresh.Close()
+	readFresh := make(chan error, 1)
+	go func() {
+		var b [1]byte
+		_, err := io.ReadFull(fresh, b[:])
+		readFresh <- err
+	}()
+	select {
+	case err := <-readFresh:
+		if err != nil {
+			t.Fatalf("fresh connection read: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fresh connection did not carry data")
 	}
 }

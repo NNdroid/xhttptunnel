@@ -3,6 +3,7 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -168,11 +169,8 @@ func (rb *reliableBuffer) GetSlice(remoteAck uint64, dispatchSeq uint64, maxLen 
 
 	// Discard data the peer has already acknowledged (advance the tail cursor)
 	freed := false
-	if remoteAck > rb.baseOffset {
+	if remoteAck > rb.baseOffset && remoteAck-rb.baseOffset <= uint64(rb.count) {
 		skip := int(remoteAck - rb.baseOffset)
-		if skip > rb.count {
-			skip = rb.count
-		}
 		if skip > 0 {
 			rb.tail = (rb.tail + skip) % rb.maxSize
 			rb.count -= skip
@@ -189,10 +187,11 @@ func (rb *reliableBuffer) GetSlice(remoteAck uint64, dispatchSeq uint64, maxLen 
 		dispatchSeq = rb.baseOffset
 	}
 
-	offsetInBuf := int(dispatchSeq - rb.baseOffset)
-	if offsetInBuf >= rb.count {
+	delta := dispatchSeq - rb.baseOffset
+	if delta >= uint64(rb.count) || maxLen <= 0 {
 		return nil, dispatchSeq, nil
 	}
+	offsetInBuf := int(delta)
 
 	availLen := rb.count - offsetInBuf
 	length := availLen
@@ -226,6 +225,14 @@ func (rb *reliableBuffer) Len() int {
 	return rb.count
 }
 
+func (rb *reliableBuffer) validAck(ack uint64) bool {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	// Subtract only after the lower bound check so an attacker-controlled
+	// acknowledgement cannot wrap around and appear to be in range.
+	return ack <= rb.baseOffset || ack-rb.baseOffset <= uint64(rb.count)
+}
+
 // undispatched reports how many buffered bytes have not been handed out by
 // GetSlice yet. GetSlice moves the dispatch cursor independently of the Ack
 // cursor, so Len() alone cannot tell whether the peer has been given
@@ -236,11 +243,11 @@ func (rb *reliableBuffer) undispatched(dispatchSeq uint64) int {
 	if dispatchSeq < rb.baseOffset {
 		dispatchSeq = rb.baseOffset
 	}
-	offset := int(dispatchSeq - rb.baseOffset)
-	if offset >= rb.count {
+	delta := dispatchSeq - rb.baseOffset
+	if delta >= uint64(rb.count) {
 		return 0
 	}
-	return rb.count - offset
+	return rb.count - int(delta)
 }
 
 // broadcast wakes every goroutine parked on the condition variable. Callers
@@ -272,7 +279,7 @@ func (rb *reliableBuffer) wait() {
 func (rb *reliableBuffer) waitLongPoll(ctx context.Context, timeout time.Duration) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	if rb.count != 0 {
+	if rb.count != 0 || rb.closed || ctx.Err() != nil {
 		return
 	}
 	stopCtx := context.AfterFunc(ctx, func() { rb.broadcast() })
@@ -291,7 +298,7 @@ func (rb *reliableBuffer) waitLongPoll(ctx context.Context, timeout time.Duratio
 func (rb *reliableBuffer) waitDispatchable(ctx context.Context, timeout time.Duration, dispatchSeq uint64) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	if rb.pendingBeyond(dispatchSeq) {
+	if rb.pendingBeyond(dispatchSeq) || rb.closed || ctx.Err() != nil {
 		return
 	}
 	stopCtx := context.AfterFunc(ctx, func() { rb.broadcast() })
@@ -307,8 +314,7 @@ func (rb *reliableBuffer) pendingBeyond(dispatchSeq uint64) bool {
 	if dispatchSeq < rb.baseOffset {
 		dispatchSeq = rb.baseOffset
 	}
-	offset := int(dispatchSeq - rb.baseOffset)
-	return offset < rb.count
+	return dispatchSeq-rb.baseOffset < uint64(rb.count)
 }
 
 func (rb *reliableBuffer) Close() {
@@ -352,6 +358,10 @@ type meekVirtualConn struct {
 	// re-sent bytes by sequence number).
 	downWriter  atomic.Pointer[downWriterTicket]
 	downPeerAck atomic.Uint64 // peer's ack of our downlink stream (client-reported)
+	uploads     atomic.Int32  // admitted bounded poll producers
+	streamUp    atomic.Int32  // at most one retained stream frame per session
+	streamReady chan struct{} // initial stream POST passed authentication/admission
+	streamOnce  sync.Once
 
 	// closeErr records why the session died, for XHTTPConn.Err(). Written
 	// once before the close signal fires; read-only afterwards.
@@ -376,7 +386,7 @@ func (c *meekVirtualConn) getCloseErr() error {
 
 // downWriterTicket identifies one downlink writer. Pointer identity lets a
 // returning writer detect that a newer one replaced it.
-type downWriterTicket struct{}
+type downWriterTicket struct{ identity byte }
 
 // AcquireDownWriter evicts any previous downlink writer and takes ownership.
 // The cursor is rewound to the peer's acknowledged byte so bytes the evicted
@@ -410,16 +420,21 @@ func (c *meekVirtualConn) downWriterActive() bool {
 
 func newMeekVirtualConn(sessionID string, local, remote net.Addr, lg *zap.Logger) *meekVirtualConn {
 	return &meekVirtualConn{
-		sessionID:  sessionID,
-		local:      local,
-		remote:     remote,
-		logField:   lg,
-		closedCh:   make(chan struct{}),
-		readCond:   sync.NewCond(&sync.Mutex{}),
-		writeBuf:   newReliableBuffer(4 * 1024 * 1024), // 4MB max buffer
-		lastActive: time.Now().Unix(),
-		oooBuf:     make(map[uint64][]byte),
+		sessionID:   sessionID,
+		local:       local,
+		remote:      remote,
+		logField:    lg,
+		closedCh:    make(chan struct{}),
+		streamReady: make(chan struct{}),
+		readCond:    sync.NewCond(&sync.Mutex{}),
+		writeBuf:    newReliableBuffer(4 * 1024 * 1024), // 4MB max buffer
+		lastActive:  time.Now().Unix(),
+		oooBuf:      make(map[uint64][]byte),
 	}
+}
+
+func (c *meekVirtualConn) signalStreamReady() {
+	c.streamOnce.Do(func() { close(c.streamReady) })
 }
 
 // closedSignal is a channel closed when the session is fully closed. Callers
@@ -447,6 +462,7 @@ func (c *meekVirtualConn) Read(p []byte) (int, error) {
 	n, err := c.readBuf.Read(p)
 	// Wake any producer parked on backpressure in PutReadData.
 	if n > 0 {
+		c.drainContiguous()
 		c.readCond.Broadcast()
 	}
 	return n, err
@@ -509,58 +525,85 @@ func (c *meekVirtualConn) Write(p []byte) (int, error) {
 // the producer instead pushes the backpressure all the way out to the local
 // socket, which is what a real transport does.
 func (c *meekVirtualConn) PutReadData(seq uint64, data []byte) uint64 {
+	ack, _ := c.PutReadDataContext(context.Background(), seq, data)
+	return ack
+}
+
+// PutReadDataContext bounds the lifetime of a request waiting for receive
+// capacity. Cancellation releases its payload without closing the session;
+// the peer can retransmit from the returned cumulative acknowledgement.
+func (c *meekVirtualConn) PutReadDataContext(ctx context.Context, seq uint64, data []byte) (uint64, error) {
 	c.readCond.L.Lock()
 	defer c.readCond.L.Unlock()
-
-	if c.isClosed() || len(data) == 0 {
-		return c.nextReadSeq
+	if uint64(len(data)) > ^uint64(0)-seq || len(data) > maxReassemblyBytes {
+		return c.nextReadSeq, fmt.Errorf("invalid receive sequence or payload size")
 	}
-
-	// The dispatch below is a loop, not a one-shot branch. A chunk that arrives
-	// ahead of the read cursor can become contiguous — or already delivered —
-	// while it sits parked waiting for room in the out-of-order cache. Filing
-	// it blind strands it there forever: drainContiguous only ever looks at
-	// oooBuf[nextReadSeq], so a chunk filed at a seq the cursor has already
-	// passed is never drained, and its bytes are silently lost.
-	waited := false
+	// Register a wakeup only on the slow path; normal ingestion needs no
+	// timer, goroutine or cancellation allocation.
+	var stop func() bool
+	defer func() {
+		if stop != nil {
+			stop()
+		}
+	}()
 	for {
-		switch {
-		case seq < c.nextReadSeq:
-			// Stale retransmission: these bytes are already in readBuf.
-			return c.nextReadSeq
-
-		case seq == c.nextReadSeq:
-			c.waitForReassemblyRoom(len(data))
-			if c.isClosed() {
-				return c.nextReadSeq
+		if err := ctx.Err(); err != nil {
+			return c.nextReadSeq, err
+		}
+		if c.isClosed() {
+			return c.nextReadSeq, io.ErrClosedPipe
+		}
+		if seq < c.nextReadSeq {
+			skip := c.nextReadSeq - seq
+			if skip >= uint64(len(data)) {
+				return c.nextReadSeq, nil
 			}
+			data = data[int(skip):]
+			seq = c.nextReadSeq
+		}
+		if len(data) == 0 {
+			return c.nextReadSeq, nil
+		}
+		switch {
+		case seq == c.nextReadSeq && c.readBuf.Len()+len(data) <= maxReassemblyBytes:
 			c.readBuf.Write(data)
 			c.nextReadSeq += uint64(len(data))
 			c.drainContiguous()
 			c.readCond.Broadcast()
-			return c.nextReadSeq
-
-		default: // seq > nextReadSeq: genuinely ahead of the read cursor.
-			if _, dup := c.oooBuf[seq]; dup {
-				return c.nextReadSeq
+			return c.nextReadSeq, nil
+		case seq > c.nextReadSeq:
+			if existing, dup := c.oooBuf[seq]; dup {
+				if len(data) <= len(existing) {
+					return c.nextReadSeq, nil
+				}
+				growth := len(data) - len(existing)
+				if c.oooBytes+growth <= maxOutOfOrderBytes {
+					extended := make([]byte, len(data))
+					copy(extended, existing)
+					copy(extended[len(existing):], data[len(existing):])
+					c.oooBuf[seq] = extended
+					c.oooBytes += growth
+					return c.nextReadSeq, nil
+				}
+				// Keep the already bounded prefix. Once the missing gap arrives,
+				// its cumulative ACK asks the sender for any remaining suffix.
+				return c.nextReadSeq, nil
 			}
-			// waitForOutOfOrderRoom returns immediately once there is room, so
-			// without this guard the loop would spin forever. One wait is
-			// enough: if the gap was filled meanwhile, the next iteration
-			// re-dispatches this chunk down the contiguous path above.
-			if waited {
-				dataCopy := make([]byte, len(data))
-				copy(dataCopy, data)
+			if len(c.oooBuf) < maxOutOfOrderChunks && c.oooBytes+len(data) <= maxOutOfOrderBytes {
+				dataCopy := bytes.Clone(data)
 				c.oooBuf[seq] = dataCopy
 				c.oooBytes += len(dataCopy)
-				return c.nextReadSeq
+				return c.nextReadSeq, nil
 			}
-			c.waitForOutOfOrderRoom(len(data))
-			if c.isClosed() {
-				return c.nextReadSeq
-			}
-			waited = true
 		}
+		if stop == nil && ctx.Done() != nil {
+			stop = context.AfterFunc(ctx, func() {
+				c.readCond.L.Lock()
+				c.readCond.Broadcast()
+				c.readCond.L.Unlock()
+			})
+		}
+		c.readCond.Wait()
 	}
 }
 
@@ -568,50 +611,43 @@ func (c *meekVirtualConn) PutReadData(seq uint64, data []byte) uint64 {
 // the read cursor. Caller must hold readCond.L.
 func (c *meekVirtualConn) drainContiguous() {
 	for {
+		// An in-order chunk may cover all or part of previously cached data.
+		// Remove fully covered entries and re-key a surviving suffix at the
+		// current cursor; otherwise stale entries can consume the OOO budget
+		// forever because their original key is now behind nextReadSeq.
+		for seq, data := range c.oooBuf {
+			if seq >= c.nextReadSeq {
+				continue
+			}
+			delete(c.oooBuf, seq)
+			c.oooBytes -= len(data)
+			end := seq + uint64(len(data)) // insertion rejects overflow
+			if end <= c.nextReadSeq {
+				continue
+			}
+			suffix := data[int(c.nextReadSeq-seq):]
+			if existing, ok := c.oooBuf[c.nextReadSeq]; ok {
+				if len(existing) >= len(suffix) {
+					continue
+				}
+				c.oooBytes -= len(existing)
+			}
+			c.oooBuf[c.nextReadSeq] = suffix
+			c.oooBytes += len(suffix)
+		}
 		nextData, ok := c.oooBuf[c.nextReadSeq]
 		if !ok {
 			return
 		}
-		c.waitForReassemblyRoom(len(nextData))
-		if c.isClosed() {
+		// Never wait while draining: readers must be able to consume the
+		// prefix just appended. Read resumes draining when capacity returns.
+		if c.isClosed() || c.readBuf.Len()+len(nextData) > maxReassemblyBytes {
 			return
 		}
 		delete(c.oooBuf, c.nextReadSeq)
 		c.oooBytes -= len(nextData)
 		c.readBuf.Write(nextData)
 		c.nextReadSeq += uint64(len(nextData))
-	}
-}
-
-// waitForReassemblyRoom parks until the reassembly buffer can take n more
-// bytes. Caller must hold readCond.L; it is released while waiting.
-func (c *meekVirtualConn) waitForReassemblyRoom(n int) {
-	if c.readBuf.Len()+n <= maxReassemblyBytes {
-		return
-	}
-	c.log().Debug("[Buffer] 重组缓冲已满，对上游施加背压",
-		zap.String("session", c.sessionID),
-		zap.Int("buffered", c.readBuf.Len()),
-		zap.Int("incoming", n),
-	)
-	for c.readBuf.Len()+n > maxReassemblyBytes && !c.isClosed() {
-		c.readCond.Wait()
-	}
-}
-
-// waitForOutOfOrderRoom parks until the out-of-order cache can take another n
-// bytes. Caller must hold readCond.L; it is released while waiting.
-func (c *meekVirtualConn) waitForOutOfOrderRoom(n int) {
-	if len(c.oooBuf) < maxOutOfOrderChunks && c.oooBytes+n <= maxOutOfOrderBytes {
-		return
-	}
-	c.log().Debug("[Buffer] 乱序缓存已满，对上游施加背压",
-		zap.String("session", c.sessionID),
-		zap.Int("chunks", len(c.oooBuf)),
-		zap.Int("bytes", c.oooBytes),
-	)
-	for (len(c.oooBuf) >= maxOutOfOrderChunks || c.oooBytes+n > maxOutOfOrderBytes) && !c.isClosed() {
-		c.readCond.Wait()
 	}
 }
 

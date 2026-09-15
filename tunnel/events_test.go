@@ -91,24 +91,30 @@ func TestClientEvents_EstablishedAndPeerClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// End the session from the server side: kick ends the stream without a
-	// marker, so the client transparently re-establishes. Events are
-	// asynchronous; poll for them instead of assuming a fixed drain window.
-	srv.KickAll() // client transparently re-establishes → Reconnecting
+	// End the server session after data has crossed it. The surviving client
+	// cannot safely rebase its reliable-buffer sequence space to the fresh
+	// server session, so it must close explicitly and let the application open
+	// a new tunnel instead of silently stalling or duplicating bytes.
+	srv.KickAll()
 
 	deadline := time.Now().Add(10 * time.Second)
-	var sawEstablished, sawReconnecting bool
+	var sawEstablished, sawSessionGone bool
 	for time.Now().Before(deadline) {
 		events := drain(200 * time.Millisecond)
 		for _, ev := range events {
-			switch ev.(type) {
+			switch v := ev.(type) {
 			case TunnelEstablished:
 				sawEstablished = true
-			case Reconnecting:
-				sawReconnecting = true
+			case TunnelDied:
+				if v.Reason == "server session recreated" {
+					sawSessionGone = true
+				}
 			}
 		}
-		if sawEstablished && sawReconnecting {
+		if sawEstablished && sawSessionGone {
+			if _, err := conn.Write([]byte("must-fail")); err == nil {
+				t.Fatal("stale application connection remained writable after session recreation")
+			}
 			conn.Close()
 			return
 		}
@@ -116,8 +122,8 @@ func TestClientEvents_EstablishedAndPeerClosed(t *testing.T) {
 	if !sawEstablished {
 		t.Fatal("no TunnelEstablished within 10s of kick")
 	}
-	if !sawReconnecting {
-		t.Fatal("no Reconnecting within 10s of kick")
+	if !sawSessionGone {
+		t.Fatal("no server-session-recreated TunnelDied within 10s of kick")
 	}
 	conn.Close()
 }

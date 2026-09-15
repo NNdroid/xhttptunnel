@@ -1,5 +1,7 @@
 #!/bin/bash
-set -e
+set -euo pipefail
+
+umask 077
 
 APP_NAME="xhttptunnel"
 GITHUB_REPO="NNdroid/${APP_NAME}"
@@ -135,7 +137,8 @@ install_config() {
   local mode="$1"
   local config_file
   config_file=$(get_config_file "${mode}")
-  mkdir -p "${CONFIG_DIR}"
+  install -d -m 0750 -o root -g root "${CONFIG_DIR}"
+  local created=0
 
   if [ ! -f "${config_file}" ] || [ ! -s "${config_file}" ]; then
     local fetched=0
@@ -157,7 +160,7 @@ install_config() {
   "listen": "tcp://127.0.0.1:1080",
   "server": "https://example.com:8443/stream",
   "target": "127.0.0.1:22",
-  "psk": "my-secret-token",
+  "psk": "replace-with-a-random-secret",
   "sni": "www.bing.com",
   "host": "www.bing.com",
   "alpn": "auto",
@@ -168,6 +171,7 @@ install_config() {
 }
 EOF
       fi
+      created=1
     else
       if [ -f "./config.server.json" ]; then
         cp -f "./config.server.json" "${config_file}"
@@ -186,7 +190,7 @@ EOF
   "listen": ":8443",
   "path": "/stream",
   "target": "tcp://127.0.0.1:22",
-  "psk": "my-secret-token",
+  "psk": "replace-with-a-random-secret",
   "selfsign": true,
   "selfsign_cn": "www.bing.com",
   "cert": "",
@@ -198,10 +202,29 @@ EOF
 }
 EOF
       fi
+      created=1
     fi
     echo -e "${GREEN}--> Created ${mode} configuration at ${config_file}${PLAIN}"
   else
     echo -e "${YELLOW}--> Existing configuration preserved at ${config_file}${PLAIN}"
+  fi
+
+  chown root:root "${config_file}"
+  chmod 0600 "${config_file}"
+
+  if [ "${mode}" = "server" ] && grep -Eq '"psk"[[:space:]]*:[[:space:]]*"(my-secret-token|change-me-before-use|replace-with-a-random-secret)"' "${config_file}"; then
+    if [ "${created}" -ne 1 ]; then
+      echo -e "${RED}Error: existing server configuration uses a published example PSK; rotate it before installation.${PLAIN}" >&2
+      return 1
+    fi
+    local generated_psk
+    generated_psk=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    if ! [[ "${generated_psk}" =~ ^[0-9a-f]{64}$ ]]; then
+      echo -e "${RED}Error: failed to generate a 256-bit server PSK.${PLAIN}" >&2
+      return 1
+    fi
+    sed -i -E "s/\"psk\"[[:space:]]*:[[:space:]]*\"(my-secret-token|change-me-before-use|replace-with-a-random-secret)\"/\"psk\": \"${generated_psk}\"/" "${config_file}"
+    echo -e "${GREEN}--> Generated a unique server PSK.${PLAIN}"
   fi
 }
 
@@ -234,6 +257,7 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 0644 "${SERVICE_FILE}"
 
   systemctl daemon-reload
   systemctl enable "${APP_NAME}" >/dev/null 2>&1 || true

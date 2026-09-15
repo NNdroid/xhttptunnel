@@ -73,11 +73,21 @@ func TestXHTTPTunnel_E2E_TLSHTTP3(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse H3 URL: %v", err)
 	}
-	conn, err := DialXHTTP(ctx, serverURL, &DialConfig{
+	if insecureConn, err := DialXHTTP(ctx, serverURL, &DialConfig{
 		Password: "h3-test-secret",
 		Path:     "/stream",
 		SNI:      "localhost",
 		ALPN:     "h3",
+	}, echoAddr, "tcp"); err == nil {
+		insecureConn.Close()
+		t.Fatal("self-signed HTTPS without a fingerprint must fail certificate verification")
+	}
+	conn, err := DialXHTTP(ctx, serverURL, &DialConfig{
+		Password:               "h3-test-secret",
+		Path:                   "/stream",
+		SNI:                    "localhost",
+		ALPN:                   "h3",
+		CertificateFingerprint: testCertificateFingerprint(t, certFile),
 	}, echoAddr, "tcp")
 	if err != nil {
 		t.Fatalf("dial HTTP/3 tunnel: %v", err)
@@ -94,6 +104,50 @@ func TestXHTTPTunnel_E2E_TLSHTTP3(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("HTTP/3 echo = %q, want %q", got, payload)
+	}
+}
+
+func TestSelfSignedTLSRequiresFingerprintH1H2(t *testing.T) {
+	for _, alpn := range []string{"h1", "h2"} {
+		t.Run(alpn, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			certDir := t.TempDir()
+			certFile := filepath.Join(certDir, "cert.pem")
+			keyFile := filepath.Join(certDir, "key.pem")
+			if err := GenerateSelfSignedCert(certFile, keyFile, "localhost"); err != nil {
+				t.Fatal(err)
+			}
+			echoAddr, closeEcho := startTCPEchoServer(t)
+			defer closeEcho()
+			origin, err := ListenXHTTP(ctx, "tcp://127.0.0.1:0", "/stream", "tls-test-secret", certFile, keyFile, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer origin.Close()
+			serveAcceptedTCPEcho(t, ctx, origin)
+			serverURL, err := url.Parse("https://" + origin.Addr().String() + "/stream")
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := DialConfig{
+				Password: "tls-test-secret", Path: "/stream", SNI: "localhost", ALPN: alpn,
+				TransportKey: "tls-pin-" + alpn,
+			}
+			conn, err := DialXHTTP(ctx, serverURL, &base, echoAddr, "tcp")
+			if conn != nil {
+				conn.Close()
+			}
+			if err == nil {
+				t.Fatal("self-signed HTTPS without a fingerprint passed certificate verification")
+			}
+			base.CertificateFingerprint = testCertificateFingerprint(t, certFile)
+			conn, err = DialXHTTP(ctx, serverURL, &base, echoAddr, "tcp")
+			if err != nil {
+				t.Fatalf("pinned self-signed TLS dial: %v", err)
+			}
+			conn.Close()
+		})
 	}
 }
 

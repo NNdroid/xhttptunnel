@@ -41,6 +41,15 @@ func versionString() string {
 	return Version
 }
 
+func isPlaceholderPSK(psk string) bool {
+	switch strings.TrimSpace(psk) {
+	case "my-secret-token", "change-me-before-use", "replace-with-a-random-secret":
+		return true
+	default:
+		return false
+	}
+}
+
 func initLogger(levelStr string) {
 	config := zap.NewProductionConfig()
 	config.Encoding = "console"
@@ -75,7 +84,17 @@ type FileConfig struct {
 	LogLevel      string `json:"log_level"`      // debug, info, warn, error
 	Dump          bool   `json:"dump"`           // Dump hex traffic
 	MaxSessions   int    `json:"max_sessions"`   // Server max concurrent sessions
-	MaxConns      int    `json:"max_conns"`      // Client max concurrent connections
+	// MaxSessionsPerIP bounds concurrent sessions from a single client address,
+	// limiting one PSK holder's blast radius. 0 (default) disables.
+	MaxSessionsPerIP int `json:"max_sessions_per_ip"`
+	// HealthPath, when set (e.g. "/healthz"), exposes an unauthenticated JSON
+	// stats endpoint on the tunnel listener. Empty disables it.
+	HealthPath string `json:"health_path"`
+	// MinProtoVersion rejects (HTTP 426) clients advertising an older
+	// X-XHTTP-Proto than this, to force a fleet off a retired wire format. 0
+	// (default) accepts all clients including header-less legacy ones.
+	MinProtoVersion int `json:"min_proto_version"`
+	MaxConns        int `json:"max_conns"` // Client max concurrent connections
 	// ChunkSizeKB caps the upstream payload carried by one poll request. The
 	// default (256) leaves headroom under the 1MB body limit that nginx and
 	// many CDN/WAF tiers enforce. Must be raised on BOTH ends together.
@@ -355,11 +374,13 @@ func main() {
 		defer logger.Sync()
 		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
 		if err := applyServerDefaults(cfg); err != nil {
-			logger.Fatal("❌ 服务端启动失败", zap.Error(err))
+			logger.Fatal("❌ server failed to start", zap.Error(err))
 		}
 		if cfg.PSK == "" {
-			cfg.PSK = "my-secret-token"
-			logger.Warn("⚠️ 未配置 PSK，使用内置默认 token 'my-secret-token'，存在被未授权访问风险，请通过配置文件设置强 token！")
+			logger.Fatal("❌ PSK not configured; the server subcommand will not use a public default password. Set a strong random PSK explicitly, or opt into open mode via the config file")
+		}
+		if isPlaceholderPSK(cfg.PSK) {
+			logger.Fatal("❌ refusing an example PSK; configure a deployment-specific strong random password")
 		}
 		startServer(ctx, cfg)
 
@@ -370,8 +391,10 @@ func main() {
 		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
 		applyClientDefaults(cfg)
 		if cfg.PSK == "" {
-			cfg.PSK = "my-secret-token"
-			logger.Warn("⚠️ 未配置 PSK，使用内置默认 token 'my-secret-token'，存在被未授权访问风险，请通过配置文件设置强 token！")
+			logger.Fatal("❌ PSK not configured; the client subcommand will not use a public default password. Set the server's PSK explicitly, or opt into unauthenticated mode via the config file")
+		}
+		if isPlaceholderPSK(cfg.PSK) {
+			logger.Fatal("❌ refusing an example PSK; set the password the server actually uses")
 		}
 		startClient(ctx, cfg)
 
@@ -426,10 +449,10 @@ func startClient(ctx context.Context, cfg *FileConfig) {
 		Dump:        cfg.Dump,
 	})
 	if err != nil {
-		logger.Fatal("❌ 客户端启动失败", zap.Error(err))
+		logger.Fatal("❌ client failed to start", zap.Error(err))
 	}
 	if err := c.ListenAndServe(ctx, cfg.Listen); err != nil && ctx.Err() == nil {
-		logger.Fatal("❌ 客户端退出", zap.Error(err))
+		logger.Fatal("❌ client exited", zap.Error(err))
 	}
 }
 
@@ -447,13 +470,16 @@ func startServer(ctx context.Context, cfg *FileConfig) {
 		AllowedTargets:    cfg.AllowedTargets,
 		TrustProxyHeaders: cfg.TrustProxyHeaders,
 		MaxSessions:       cfg.MaxSessions,
+		MaxSessionsPerIP:  cfg.MaxSessionsPerIP,
+		HealthPath:        cfg.HealthPath,
+		MinProtoVersion:   cfg.MinProtoVersion,
 		Dump:              cfg.Dump,
 	})
 	if err != nil {
-		logger.Fatal("❌ 服务端启动失败", zap.Error(err))
+		logger.Fatal("❌ server failed to start", zap.Error(err))
 	}
 	if err := s.ListenAndServe(ctx); err != nil && ctx.Err() == nil {
-		logger.Fatal("❌ 服务端退出", zap.Error(err))
+		logger.Fatal("❌ server exited", zap.Error(err))
 	}
 }
 
@@ -473,17 +499,23 @@ func runFromConfig(path string) {
 	if strings.ToLower(cfg.Mode) == "client" {
 		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
 		applyClientDefaults(cfg)
+		if isPlaceholderPSK(cfg.PSK) {
+			logger.Fatal("❌ config file contains a public example PSK; set the password the server actually uses")
+		}
 		if cfg.PSK == "" {
-			logger.Warn("⚠️ 配置文件未设置 PSK，客户端将以无鉴权方式连接。")
+			logger.Warn("⚠️ no PSK set in the config file; the client will connect unauthenticated.")
 		}
 		startClient(ctx, cfg)
 	} else {
 		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
 		if err := applyServerDefaults(cfg); err != nil {
-			logger.Fatal("❌ 服务端启动失败", zap.Error(err))
+			logger.Fatal("❌ server failed to start", zap.Error(err))
+		}
+		if isPlaceholderPSK(cfg.PSK) {
+			logger.Fatal("❌ config file contains a public example PSK; replace it with a deployment-specific strong random password first")
 		}
 		if cfg.PSK == "" {
-			logger.Warn("⚠️ 配置文件未设置 PSK，服务器将以开放模式运行（无鉴权），请勿在公网暴露。")
+			logger.Warn("⚠️ no PSK set in the config file; the server runs in open mode (unauthenticated). Do not expose it publicly.")
 		}
 		startServer(ctx, cfg)
 	}

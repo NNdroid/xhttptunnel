@@ -154,6 +154,7 @@ func TestStreamResumesAfterServerRestart(t *testing.T) {
 
 	srv := newServer(listenAddr)
 	_ = srv
+	waitListening(t, listenAddr)
 
 	// Dial while the server is UP, then kill it: the pump must keep retrying
 	// in the background.
@@ -205,4 +206,24 @@ func parseURL(t testing.TB, raw string) *url.URL {
 		t.Fatalf("parse %q: %v", raw, err)
 	}
 	return u
+}
+
+// waitListening blocks until a TCP connect to addr succeeds, so a test does
+// not race the asynchronous ListenAndServe goroutine actually binding the
+// port. ListenAndServe is launched in its own goroutine, so without this the
+// very first dial can hit ECONNREFUSED on slower schedulers (seen on macOS).
+func waitListening(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		c, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server never started listening on %s: %v", addr, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

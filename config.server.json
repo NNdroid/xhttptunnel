@@ -19,7 +19,7 @@
   "listen": ":8443",
   "path": "/stream",
   "target": "tcp://127.0.0.1:22",
-  "psk": "my-secret-token",
+  "psk": "replace-with-a-random-secret",
   "selfsign": true,
   "selfsign_cn": "www.bing.com",
   "cert": "",

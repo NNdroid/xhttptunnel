@@ -24,20 +24,20 @@ func TestReliableBuffer_BasicWriteAndRead(t *testing.T) {
 	data := []byte("hello world")
 	n, err := rb.Write(data)
 	if err != nil || n != len(data) {
-		t.Fatalf("寫入失敗: expected %d, got %d, err: %v", len(data), n, err)
+		t.Fatalf("write failed: expected %d, got %d, err: %v", len(data), n, err)
 	}
 
 	if rb.Len() != len(data) {
-		t.Fatalf("長度錯誤: expected %d, got %d", len(data), rb.Len())
+		t.Fatalf("length error: expected %d, got %d", len(data), rb.Len())
 	}
 
 	// 2. Test reading (with Seq = 0, dispatch = 0)
 	slice, nextSeq, bufPtr := rb.GetSlice(0, 0, 100)
 	if string(slice) != "hello world" {
-		t.Fatalf("讀取內容錯誤: expected 'hello world', got '%s'", string(slice))
+		t.Fatalf("read content error: expected 'hello world', got '%s'", string(slice))
 	}
 	if nextSeq != 0 {
-		t.Fatalf("返回的派發起點錯誤: expected 0, got %d", nextSeq)
+		t.Fatalf("returned dispatch offset error: expected 0, got %d", nextSeq)
 	}
 
 	// Return the buffer to the pool
@@ -58,7 +58,7 @@ func TestReliableBuffer_Wraparound(t *testing.T) {
 	// and frees the space at the front
 	rb.GetSlice(3, 3, 5) // remoteAck = 3, advances baseOffset to 3
 	if rb.Len() != 0 {
-		t.Fatalf("Ack 清理失敗: expected 0, got %d", rb.Len())
+		t.Fatalf("Ack reclaim failed: expected 0, got %d", rb.Len())
 	}
 
 	// 3. Write 4 more bytes "4567".
@@ -66,17 +66,17 @@ func TestReliableBuffer_Wraparound(t *testing.T) {
 	// "45" goes at the end (index 3, 4) and "67" wraps around to the front (index 0, 1)
 	n, err := rb.Write([]byte("4567"))
 	if err != nil || n != 4 {
-		t.Fatalf("環形寫入失敗: expected 4, got %d", n)
+		t.Fatalf("ring write failed: expected 4, got %d", n)
 	}
 
 	if rb.Len() != 4 {
-		t.Fatalf("環形寫入後長度錯誤: expected 4, got %d", rb.Len())
+		t.Fatalf("ring write length error: expected 4, got %d", rb.Len())
 	}
 
 	// 4. Perform a wraparound read (dispatchSeq should now be 3)
 	slice, _, bufPtr := rb.GetSlice(3, 3, 5)
 	if string(slice) != "4567" {
-		t.Fatalf("環形讀取錯誤: expected '4567', got '%s'", string(slice))
+		t.Fatalf("ring read error: expected '4567', got '%s'", string(slice))
 	}
 
 	if bufPtr != nil {
@@ -96,7 +96,7 @@ func TestReliableBuffer_DispatchOffset(t *testing.T) {
 
 	// dispatchSeq is 5, so the data should start from 'f'
 	if string(slice) != "fghij" {
-		t.Fatalf("偏移量讀取錯誤: expected 'fghij', got '%s'", string(slice))
+		t.Fatalf("offset read error: expected 'fghij', got '%s'", string(slice))
 	}
 
 	if bufPtr != nil {
@@ -128,7 +128,7 @@ func TestReliableBuffer_BlockingAndWakeup(t *testing.T) {
 
 	select {
 	case <-writeDone:
-		t.Fatal("寫入提早完成了，沒有正確阻塞！")
+		t.Fatal("write completed early, did not block correctly!")
 	default:
 		// Normal, still blocked
 	}
@@ -142,7 +142,7 @@ func TestReliableBuffer_BlockingAndWakeup(t *testing.T) {
 	case <-writeDone:
 		// Successfully woken up, write completed
 	case <-time.After(1 * time.Second):
-		t.Fatal("Goroutine 沒有被正確喚醒！")
+		t.Fatal("goroutine was not woken correctly!")
 	}
 
 	// Verify the final remaining data:
@@ -150,12 +150,12 @@ func TestReliableBuffer_BlockingAndWakeup(t *testing.T) {
 	// after wakeup, "abcde" (5 bytes) was written;
 	// the total length should be 8
 	if rb.Len() != 8 {
-		t.Fatalf("喚醒後資料長度錯誤: expected 8, got %d", rb.Len())
+		t.Fatalf("data length after wake error: expected 8, got %d", rb.Len())
 	}
 
 	slice, _, bufPtr := rb.GetSlice(5, 5, 10)
 	if string(slice) != "678abcde" {
-		t.Fatalf("喚醒後資料內容錯誤: expected '678abcde', got '%s'", string(slice))
+		t.Fatalf("data content after wake error: expected '678abcde', got '%s'", string(slice))
 	}
 	if bufPtr != nil {
 		sendBuf.Put(bufPtr)
@@ -174,7 +174,7 @@ func TestReliableBuffer_Close(t *testing.T) {
 		// Deliberately write oversized data so it blocks
 		_, err := rb.Write([]byte("45678"))
 		if err == nil {
-			t.Error("Close 後應該返回錯誤，但返回了 nil")
+			t.Error("expected an error after Close, got nil")
 		}
 	}()
 
@@ -203,7 +203,7 @@ func TestMeekVirtualConn_ConcurrentClosePutReadData(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	_ = conn.Close()
 	wg.Wait()
-	t.Log("✅ 併發關閉下 PutReadData 零 Panic 成功通過！")
+	t.Log("✅ PutReadData passed with zero panics under concurrent Close!")
 }
 
 // Test 7: reassembly-buffer backpressure. Once the in-order reassembly buffer

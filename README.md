@@ -4,11 +4,11 @@ High-Performance Bidirectional Split-HTTP / Meek Streaming Tunnel Server & Clien
 
 ## Features
 
-- **Split-HTTP Bidirectional Streaming**: High-throughput uplink POST chunking and downlink streaming with automatic sequence reconstruction.
-- **Reliable Packet Ring Buffer**: Zero-lock concurrent ring buffer preventing chunk drop and memory leak.
-- **Auto Self-Signed TLS & Domain Camouflage**: Auto-generates simulated ECDSA TLS certificates matching Amazon / Bing CDN profiles.
+- **Split-HTTP Bidirectional Streaming**: Long-lived uplink POST and downlink GET streams with automatic sequence reconstruction.
+- **Reliable Packet Ring Buffer**: Bounded, synchronized retransmission and reassembly buffers with backpressure.
+- **Auto Self-Signed TLS**: Can generate a pinned RSA certificate for direct TLS deployments.
 - **Stun Node Sharing (`gen-uri`)**: One-click encrypted `stun://` share link (plus a plaintext `xhttp://` URI) and terminal ASCII QR code generation for Android & TV.
-- **Active Fallback Camouflage**: Transparent reverse proxy forwarding to decoy web services for unauthorized probes.
+- **Active Fallback Camouflage**: Proxies requests on paths other than the configured tunnel endpoint to a decoy origin.
 - **Embeddable Go SDK**: Client and server live in the [`tunnel`](tunnel/) package — route your own dials through the tunnel, or inject custom socket dialers for interface binding and Android `VpnService.protect()`.
 
 ---
@@ -19,6 +19,10 @@ High-Performance Bidirectional Split-HTTP / Meek Streaming Tunnel Server & Clien
 ```bash
 curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/main/scripts/install.sh | sudo bash -s install server
 ```
+
+The first server installation replaces the published placeholder with a unique
+random PSK and stores the configuration as owner-only (`0600`). Existing
+placeholder configurations are rejected instead of being started publicly.
 
 ### 2. Client Installation (Linux)
 ```bash
@@ -76,24 +80,27 @@ journalctl -u xhttptunnel -f   # View live logs
 | `target` | `string` | `"tcp://127.0.0.1:22"` | Target service address (`tcp://127.0.0.1:22` or `udp://127.0.0.1:51820`). |
 | `default_target` / `forward` | `string` | — | Aliases for `target` (server / client respectively); cross-filled when `target` is set. |
 | `path` | `string` | `"/stream"` | Custom Split-HTTP proxy path. |
-| `psk` | `string` | `"my-secret-token"` | Pre-shared key / token for authentication (aliases `token`/`auth_token`). |
+| `psk` | `string` | none | Pre-shared key / token (aliases `token`/`auth_token`). CLI subcommands require an explicit non-placeholder value; an empty config-file value explicitly enables open mode. |
 | `cert` / `key` | `string` | `""` | TLS certificate / private key files. Both empty = cleartext origin (behind a TLS-terminating CDN). |
-| `selfsign` | `bool` | `true` | Auto-generate self-signed TLS certificate if `cert`/`key` omitted. |
+| `selfsign` | `bool` | `false` | Auto-generate a self-signed TLS certificate if `cert`/`key` are omitted. The sample server config enables it. |
 | `selfsign_cn` | `string` | `"www.bing.com"` | Common Name (SNI) for generated certificate. |
-| `fallback` | `string` | `""` | Fallback URL or host for unauthorized requests. |
+| `fallback` | `string` | `""` | Fallback URL for requests whose path does not match the tunnel endpoint. Authentication failures on the tunnel path return `407`. |
 | `sni` | `string` | server host | TLS SNI disguise (client). |
 | `host` | `string` | server host | HTTP `Host` header disguise (client). |
 | `alpn` | `string` | `"auto"` | Transport selection: `h3`, `h2`, `h1`, or `auto` (probe HTTP/3, fall back). |
 | `stream_mode` | `string` | `"auto"` | Client downlink transport: `auto` (negotiate), `poll` (legacy long-poll), or `stream` (force streaming downlink). |
-| `fingerprint` | `string` | `""` | Expected server certificate SHA-256 fingerprint (pinning). Strongly recommended for `https://` servers. |
+| `fingerprint` | `string` | `""` | SHA-256 certificate pin, required for self-signed TLS. Empty uses the system CA roots plus SNI hostname verification, which is appropriate for ordinary CDN HTTPS. |
 | `log_level` | `string` | `"info"` | Logging output level: `debug`, `info`, `warn`, `error`. |
 | `dump` | `bool` | `false` | Hex-dump tunnelled traffic to stdout (debugging only). |
 | `max_sessions` | `int` | `2000` | Server max concurrent sessions. |
+| `max_sessions_per_ip` | `int` | `0` | Server: cap concurrent sessions from one client address (0 = unlimited). Bounds one PSK holder's blast radius against the shared registry. Counts the TCP peer address unless `trust_proxy_headers` is on. |
 | `max_conns` | `int` | `2000` | Client max concurrent local connections / sessions. |
 | `chunk_size_kb` | `int` | `256` | Upstream payload per poll request (clamped 16–900). Must match on both ends. |
 | `idle_timeout` | `int` | `900` | Client: drop a local connection after this many seconds of silence. |
 | `allowed_targets` | `[]string` | `[]` | Server: restrict client-requested targets (`"host:port"`, `":port"`, or `"host:"`). Empty = allow all. |
 | `trust_proxy_headers` | `bool` | `false` | Server: honour `CF-Connecting-IP`/`X-Forwarded-For`/`X-Real-IP` for client-address logging. Enable only behind a trusted proxy that strips them. |
+| `health_path` | `string` | `""` | Server: when set (e.g. `/healthz`), expose an unauthenticated JSON stats snapshot (`Server.Stats`) on the tunnel listener. Empty = disabled. Intended for localhost / operator listeners. |
+| `min_proto_version` | `int` | `0` | Server: reject (HTTP 426) clients advertising an `X-XHTTP-Proto` below this, to retire an old wire generation fleet-wide. `0` accepts all clients, including header-less legacy ones. |
 
 For a direct TLS deployment, `:8443` (or `tcp+udp://:8443`) starts HTTPS and HTTP/3 on the same port. Use `tcp://127.0.0.1:8443` for a cleartext CDN origin; without a certificate/key the server intentionally does not bind UDP or advertise HTTP/3.
 
@@ -128,8 +135,8 @@ import "github.com/NNdroid/xhttptunnel/tunnel"
 
 c, err := tunnel.NewClient(tunnel.ClientConfig{
 	ServerURL:   "https://cdn.example.com:8443/stream",
-	PSK:         "my-secret-token",
-	Fingerprint: "AA:BB:...", // certificate pinning (recommended)
+	PSK:         "deployment-specific-random-secret",
+	Fingerprint: "AA:BB:...", // required for a self-signed origin; omit for a CA-backed CDN edge
 })
 if err != nil {
 	log.Fatal(err)
@@ -153,7 +160,7 @@ inject your own dialers:
 ```go
 c, _ := tunnel.NewClient(tunnel.ClientConfig{
 	ServerURL: "https://cdn.example.com:8443/stream",
-	PSK:       "my-secret-token",
+	PSK:       "deployment-specific-random-secret",
 	// TCP sockets for the h1/h2 transports.
 	DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
@@ -192,7 +199,7 @@ injected client.
 ```go
 srv, err := tunnel.NewServer(tunnel.ServerConfig{
 	Listen:        "tcp+udp://:8443",
-	PSK:           "my-secret-token",
+	PSK:           "deployment-specific-random-secret",
 	SelfSign:      true, // or set CertFile/KeyFile
 	DefaultTarget: "tcp://127.0.0.1:22",
 	AllowedTargets: []string{":22", ":51820"},
@@ -236,7 +243,7 @@ if err := srv.Shutdown(shutdownCtx); err != nil { /* deadline expired */ }
 
 // Inspect and evict sessions (e.g. an admin endpoint):
 for _, id := range srv.SessionIDs() { /* ... */ }
-srv.Kick(id)     // close one session; the client re-establishes if alive
+srv.Kick(id)     // close one session; the application opens a fresh tunnel
 srv.KickAll()    // close every session
 ```
 
@@ -248,27 +255,76 @@ different sinks. Nil inherits the package logger set via `tunnel.SetLogger`.
 
 `DialConfig.StreamMode` / `ClientConfig` default (`"auto"`) upgrades the
 downlink from long-poll to a **streaming GET** (SSE-style: the server pushes
-frames into one response body as they arrive) on h2/h3, keeping the bounded
-POST uplink unchanged — so deployment requirements are identical to the
-legacy mode (no new proxy features needed; nginx `proxy_request_buffering`
-stays safe). Uplink throughput no longer shares a round trip with each
-downlink chunk.
+frames into one response body as they arrive) on h1/h2/h3, paired with a
+long-lived POST uplink — so each direction remains a separate HTTP stream and
+does not require one request to read and write concurrently. CDN/proxy request
+and response streaming must remain enabled. Uplink throughput no longer shares
+a round trip with each downlink chunk.
 
 Negotiation (three layers, cached per `protocol|host|SNI|fingerprint|TransportKey`,
 TTL 5 min):
 
 1. **Capability header** — the client sends `X-Downstream: 1`; a legacy server
    answers without `X-Downstream-Accepted` and the client keeps polling.
-2. **Path probe** — the server flushes a hello frame immediately; if the first
-   frame arrives within `max(2s, 3× measured TTFB)` the path does not buffer
-   responses and stream mode is committed.
-3. **Watchdog** — an established stream must see a frame (data or 25 s
-   keepalive) within 75 s; two consecutive breaks downgrade the endpoint to
-   poll mode.
+2. **Bidirectional readiness + path probe** — after the companion POST passes
+   authentication and the per-session admission limit, the server flushes a
+   hello frame. If it arrives within `max(2s, 3× measured TTFB)`, both
+   directions are usable and the path does not buffer responses.
+3. **Watchdog** — an established stream must see a frame (data or keepalive,
+   emitted every 5 s) within 75 s; two consecutive breaks downgrade the
+   endpoint to poll mode.
 
-Set `StreamMode: "poll"` to force the legacy mode, `"stream"` to skip
-negotiation. Kicked sessions end their stream **without** the close marker so
-the client transparently re-establishes (poll parity).
+Set `StreamMode: "poll"` to force the legacy mode. `"stream"` requires the
+stream handshake to succeed and fails instead of silently falling back. A
+transport-only interruption resumes the same server session; if the origin
+restarts, reaps, or kicks that session, the client closes the old application
+connection explicitly because its acknowledged sequence space cannot be
+safely rebased. The application can then open a fresh tunnel.
+
+### Protocol versioning & operational hardening
+
+- **Wire-protocol generation.** Every tunnel response carries
+  `X-XHTTP-Proto: 1`. A client refuses to speak to a server advertising a
+  *newer* generation (a hard error, not a poll fallback — a changed frame
+  layout must not be polled by an older reader). An operator can force the
+  fleet off a retired generation with `min_proto_version`: requests whose
+  advertised version is lower (including header-less legacy clients) get
+  HTTP 426. Bumping the generation is a single constant in the SDK.
+- **Per-IP session cap.** `max_sessions_per_ip` bounds how many live sessions
+  one client address may hold, so a single leaked PSK or a compromised host
+  cannot exhaust the global `max_sessions` and starve everyone else. Off by
+  default; the global cap always still applies.
+- **Stats & health endpoint.** `Server.Stats()` returns monotonic counters
+  (sessions created / rejected / kicked / reaped, request total, live gauge,
+  protocol version). Setting `health_path` (e.g. `/healthz`) serves them as
+  JSON on the tunnel listener — unauthenticated, so point it at a
+  localhost/operator address, not the public one.
+- **Connection-slot reclamation.** A client `MaxConns` slot is released when
+  the tunnel dies **terminally** (peer close marker, auth rejection, server
+  session recreation) even if
+  the embedder never calls `Close` — a forgotten dead session cannot leak the
+  pool dry. A transient server *vanish* intentionally does **not** release it:
+  the client keeps reconnecting to resume, so the slot stays reserved while
+  recovery is in flight.
+
+HTTP/3 (QUIC) keeps Go's native TLS stack: `quic-go` hard-codes
+`tls.QUICClient` in its internal handshake and cannot take a `crypto/tls`
+replacement without a forked `quic-go`, so the HTTP/3 client does not carry
+the uTLS browser-mimicry the h1/h2 clients do.
+
+HTTP/2 is slower than HTTP/1.1 on request/response traffic. That gap was
+probed for a tunable flow-control cause: `x/net/http2` does expose per-stream
+and per-connection windows on the server and a client read-frame buffer, but
+a controlled same-machine A/B found **no reliable gain** — raising the client
+`MaxReadFrameSize` (16 KiB default → 256 KiB) landed within run-to-run noise,
+and the h2 benchmark swings several-fold with transient machine load, so single
+measurements mislead. No HTTP/2 tuning is applied; the gap is treated as
+inherent per-stream overhead and `h1` remains the default fast path. To keep
+this investigation reproducible instead of eyeballing noisy `ns/op`, CI runs a
+`profiling` job (see `.github/workflows/test.yml`) that captures CPU, block
+and memory profiles for `h1/h2/h3` and `ThroughCDN`, publishes them as
+downloadable artifacts and an SVG set, and prints pprof top tables (including
+block-wait breakdowns) into the run summary.
 
 ### Low-level building blocks
 
@@ -276,4 +332,3 @@ the client transparently re-establishes (poll parity).
 top of the protocol (the e2e tests in `tunnel/` double as usage examples).
 Logging is silent by default — call `tunnel.SetLogger(...)` or set the
 `Logger` field on either config to receive the debug/audit trail.
-

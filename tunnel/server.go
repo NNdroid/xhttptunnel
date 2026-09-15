@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -230,16 +231,26 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 				originalDirector(req)
 				req.Host = u.Host
 			}
-			logger.Info("🛡️ 伪装站点 (Fallback) 已启用", zap.String("target", fallbackURL))
+			logger.Info("🛡️ fallback camouflage site enabled", zap.String("target", fallbackURL))
 		} else {
-			logger.Warn("❌ 伪装站点 URL 解析失败", zap.Error(err))
+			logger.Warn("❌ failed to parse fallback URL", zap.Error(err))
 		}
 	}
 
 	mux := http.NewServeMux()
+	if healthPath := st.healthPath; healthPath != "" {
+		mux.HandleFunc(healthPath, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				nginxError(w, http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(st.snapshot())
+		})
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		clientIP := st.getClientIP(r)
-		logger.Debug("👀 [HTTP] 收到原始 HTTP 请求",
+		logger.Debug("👀 [HTTP] received raw HTTP request",
 			zap.String("method", r.Method),
 			zap.String("path", r.URL.Path),
 			zap.String("remote", clientIP),
@@ -255,13 +266,26 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			return
 		}
 		atomic.AddUint64(&xl.RequestCount, 1)
+		st.stats.requests.Add(1)
+		// Advertise this server's protocol generation and, when configured,
+		// refuse clients that announced an older one than the operator allows.
+		w.Header().Set(ProtoHeader, strconv.Itoa(tunnelProtoVersion))
+		if st.minProto > 0 {
+			if v, err := strconv.Atoi(r.Header.Get(ProtoHeader)); err != nil || v < st.minProto {
+				logger.Warn("❌ [HTTP] rejected request: protocol version too old",
+					zap.String("remote", clientIP),
+					zap.String("client_proto", r.Header.Get(ProtoHeader)))
+				http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+				return
+			}
+		}
 
 		target := r.Header.Get("X-Target")
 		network := r.Header.Get("X-Network")
 		sessionID := r.Header.Get("X-Session-ID")
 
 		if sessionID == "" {
-			logger.Warn("❌ [HTTP] 拒绝请求: 缺少 Session ID", zap.String("remote", clientIP))
+			logger.Warn("❌ [HTTP] rejected request: missing Session ID", zap.String("remote", clientIP))
 			nginxError(w, http.StatusBadRequest)
 			return
 		}
@@ -289,7 +313,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 				}
 			}
 			if !authed {
-				logger.Warn("❌ [HTTP] 拒绝请求: 密码错误或未授权",
+				logger.Warn("❌ [HTTP] rejected request: bad password or unauthorized",
 					zap.String("remote", r.RemoteAddr),
 				)
 				st.events.emit(AuthRejected{Remote: r.RemoteAddr, Path: r.URL.Path})
@@ -318,17 +342,38 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			serveStreamDownlink(w, r, st, vConn, sessionID, created)
 			return
 		}
-
 		// Stream-mode uplink: one long POST whose body is a continuous frame
 		// stream fed into the session. It returns only when the client ends
 		// the tunnel, so it must run before the bounded-body poll path.
 		if r.Header.Get("Content-Type") == streamContentType {
+			// A stream frame can retain the full 4 MiB receive window while
+			// blocked. Admit only one such producer per session so authenticated
+			// request fan-out cannot multiply that retained heap by 16.
+			if !vConn.streamUp.CompareAndSwap(0, 1) {
+				nginxError(w, http.StatusTooManyRequests)
+				return
+			}
+			defer vConn.streamUp.Store(0)
+			vConn.signalStreamReady()
 			serveStreamUplink(w, r, st, vConn, sessionID)
 			return
 		}
 
+		// Bound poll request payloads/goroutines as well as the shared receive
+		// window. The client uses at most eight concurrent poll workers.
+		if vConn.uploads.Add(1) > 8 {
+			vConn.uploads.Add(-1)
+			nginxError(w, http.StatusTooManyRequests)
+			return
+		}
+		defer vConn.uploads.Add(-1)
+
 		cSeq, _ := strconv.ParseUint(r.Header.Get("X-Seq"), 10, 64)
 		cAck, _ := strconv.ParseUint(r.Header.Get("X-Ack"), 10, 64)
+		if !vConn.writeBuf.validAck(cAck) {
+			nginxError(w, http.StatusBadRequest)
+			return
+		}
 		vConn.noteDownPeerAck(cAck)
 
 		bufPtr := sendBuf.Get().(*[]byte)
@@ -341,7 +386,10 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		for {
 			n, err := r.Body.Read(readChunk)
 			if n > 0 {
-				myUpAck = vConn.PutReadData(currentSeq, readChunk[:n])
+				myUpAck, errBody = vConn.PutReadDataContext(r.Context(), currentSeq, readChunk[:n])
+				if errBody != nil {
+					break
+				}
 				currentSeq += uint64(n)
 				totalUpBytes += n
 			}
@@ -356,7 +404,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		safelyPutSendBuf(bufPtr)
 
 		if errBody != nil {
-			logger.Warn("⚠️ [HTTP] 读取上行 Body 失败或异常中断", zap.Error(errBody))
+			logger.Warn("⚠️ [HTTP] failed to read uplink body or it ended unexpectedly", zap.Error(errBody))
 			nginxError(w, http.StatusBadRequest)
 			return
 		}
@@ -365,7 +413,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			myUpAck = vConn.PutReadData(cSeq, nil)
 		}
 
-		logger.Debug("📥 [HTTP] 解析上行请求",
+		logger.Debug("📥 [HTTP] parsing uplink request",
 			zap.String("session", sessionID),
 			zap.Uint64("Client_Seq", cSeq),
 			zap.Uint64("Client_Ack", cAck),
@@ -400,7 +448,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// lives; poll responses must not piggyback downlink alongside it or
 		// the two writers would split the stream.
 		if vConn.downWriterActive() {
-			logger.Debug("📡 [HTTP] 流式下行接管，本响应不捎带下行", zap.String("session", sessionID))
+			logger.Debug("📡 [HTTP] streaming downlink owns the session; this response will not piggyback downlink data", zap.String("session", sessionID))
 		} else {
 			if r.Method == http.MethodGet {
 				// A poll GET briefly owns the cursor and evicts a streaming
@@ -434,7 +482,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			downData, downBufPtr = owned, nil
 		}
 
-		logger.Debug("📤 [HTTP] 准备发送下行响应",
+		logger.Debug("📤 [HTTP] preparing downlink response",
 			zap.String("session", sessionID),
 			zap.Uint64("Server_Seq", myDownSeq),
 			zap.Uint64("Server_Ack", myUpAck),
@@ -557,20 +605,20 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 	go func() {
 		defer wg.Done()
 		<-ctx.Done()
-		logger.Info("🛑 收到退出信号，正在优雅关闭 HTTP 服务器...")
+		logger.Info("🛑 shutdown signal received, gracefully closing HTTP server...")
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("⚠️ 优雅关闭超时或出错，强制关闭残留的 TCP 连接...", zap.Error(err))
+			logger.Warn("⚠️ graceful shutdown timed out or errored, force-closing remaining TCP connections...", zap.Error(err))
 			connsMu.Lock()
 			for c := range conns {
 				c.Close()
 			}
 			connsMu.Unlock()
 		} else {
-			logger.Info("✅ HTTP 服务器已优雅退出")
+			logger.Info("✅ HTTP server exited gracefully")
 		}
 	}()
 
@@ -608,11 +656,11 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				logger.Info("🔐 [Server] 启动 TCP(TLS) HTTP 服务器", zap.String("addr", listenAddr))
+				logger.Info("🔐 [Server] starting TCP(TLS) HTTP server", zap.String("addr", listenAddr))
 				// Own error variable: the HTTP/3 goroutine below runs
 				// concurrently and a shared one would be a data race.
 				if err := server.ServeTLS(xl.ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
-					logger.Warn("TLS 退出", zap.Error(err))
+					logger.Warn("⚠️ TLS server exited", zap.Error(err))
 				}
 			}()
 		}
@@ -621,9 +669,9 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				logger.Info("🔐 [Server] 尝试启动 HTTP/3 (QUIC) 服务器", zap.String("addr", listenAddr))
+				logger.Info("🔐 [Server] attempting to start HTTP/3 (QUIC) server", zap.String("addr", listenAddr))
 				if err := h3Server.Serve(xl.uln); err != nil && !errors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
-					logger.Warn("HTTP/3 退出", zap.Error(err))
+					logger.Warn("⚠️ HTTP/3 server exited", zap.Error(err))
 				}
 			}()
 
@@ -643,7 +691,7 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			defer wg.Done()
 			logger.Info("🚀 [Server] Starting cleartext HTTP (h2c) server", zap.String("addr", listenAddr))
 			if err := server.Serve(xl.ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
-				logger.Warn("H2C 退出", zap.Error(err))
+				logger.Warn("⚠️ H2C server exited", zap.Error(err))
 			}
 		}()
 	}
@@ -703,6 +751,22 @@ type ServerConfig struct {
 	// MaxSessions caps concurrent tunnel sessions. 0 selects the default
 	// (2000).
 	MaxSessions int
+	// MaxSessionsPerIP caps concurrent sessions from a single client address,
+	// bounding one PSK holder's blast radius against the shared registry. 0
+	// (default) disables the per-IP limit; the global MaxSessions still applies.
+	// Behind an untrusted front (no TrustProxyHeaders) this keys off the TCP
+	// peer address; enable TrustProxyHeaders only behind a CDN that strips the
+	// forwarding headers, or the limit is trivially bypassed by spoofing them.
+	MaxSessionsPerIP int
+	// MinProtoVersion rejects requests advertising an X-XHTTP-Proto below this
+	// value with HTTP 426, letting an operator force a fleet off an old wire
+	// generation. 0 (default) accepts every client, including legacy ones that
+	// send no header.
+	MinProtoVersion int
+	// HealthPath, when non-empty (e.g. "/healthz"), serves an unauthenticated
+	// JSON TunnelStats snapshot on GET at that path, independent of the tunnel
+	// path. Intended for localhost or an operator-only listener.
+	HealthPath string
 	// Dump hex-dumps tunnelled traffic to stdout (debugging only).
 	Dump bool
 	// Logger is the per-instance logger: every log line this server emits goes
@@ -784,6 +848,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	state.events = newSessionEventHub(cfg.EventHandler)
 	state.setAllowedTargets(cfg.AllowedTargets)
 	state.trustProxy.Store(cfg.TrustProxyHeaders)
+	state.maxPerIP = cfg.MaxSessionsPerIP
+	state.minProto = cfg.MinProtoVersion
+	state.healthPath = cfg.HealthPath
 
 	s := &Server{cfg: cfg, state: state, certDir: certDir}
 	if cfg.DefaultTarget != "" {
@@ -916,6 +983,11 @@ func (s *Server) Addr() net.Addr {
 	}
 	return nil
 }
+
+// Stats returns a monotonic snapshot of the server's activity: live session
+// count, cumulative creates/rejects/kicks/reaps and request total. Safe to
+// call concurrently; it takes only a read lock for the gauge.
+func (s *Server) Stats() TunnelStats { return s.state.snapshot() }
 
 // ActiveSessions reports the number of tunnel sessions currently registered
 // on this server (created, not yet closed). Useful for health endpoints and
@@ -1126,7 +1198,7 @@ func (s *Server) bridge(xc *XHTTPConn) {
 			n, err := rc.Read(dBuf)
 			if err != nil {
 				if strings.Contains(err.Error(), "use of closed network connection") {
-					logger.Debug("🛑 UDP downlink finished (连接已关闭)", zap.String("id", connID))
+					logger.Debug("🛑 UDP downlink finished (connection closed)", zap.String("id", connID))
 				} else {
 					logger.Debug("⚠️ UDP downlink read target failed", zap.String("id", connID), zap.Error(err))
 				}

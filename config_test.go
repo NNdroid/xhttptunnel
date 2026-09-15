@@ -70,6 +70,19 @@ func TestXHTTPTunnel_JSONConfigParsing(t *testing.T) {
 	}
 }
 
+func TestPlaceholderPSKDetection(t *testing.T) {
+	for _, psk := range []string{"my-secret-token", " change-me-before-use ", "replace-with-a-random-secret"} {
+		if !isPlaceholderPSK(psk) {
+			t.Errorf("published placeholder %q was accepted", psk)
+		}
+	}
+	for _, psk := range []string{"", "deployment-specific-secret"} {
+		if isPlaceholderPSK(psk) {
+			t.Errorf("legitimate PSK %q was rejected", psk)
+		}
+	}
+}
+
 func TestXHTTPTunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 	tempDir := t.TempDir()
 

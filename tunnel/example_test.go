@@ -109,7 +109,7 @@ func TestMountedHandler_BridgesSessions(t *testing.T) {
 func ExampleClient_dialContext() {
 	c, err := tunnel.NewClient(tunnel.ClientConfig{
 		ServerURL:   "https://cdn.example.com:8443/stream",
-		PSK:         "my-secret-token",
+		PSK:         os.Getenv("XHTTP_PSK"),
 		Fingerprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
 	})
 	if err != nil {
@@ -130,7 +130,7 @@ func ExampleClient_dialContext() {
 func ExampleServer_mounted() {
 	srv, err := tunnel.NewServer(tunnel.ServerConfig{
 		Path:          "/stream",
-		PSK:           "my-secret-token",
+		PSK:           os.Getenv("XHTTP_PSK"),
 		DefaultTarget: "tcp://127.0.0.1:22",
 	})
 	if err != nil {

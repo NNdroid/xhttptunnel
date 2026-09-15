@@ -36,3 +36,5 @@ bin/
 .workbuddy/
 .zcode/
 .codebuddy/
+__pycache__/
+*.pyc

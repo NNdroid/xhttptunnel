@@ -3,12 +3,16 @@ package tunnel
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -16,6 +20,20 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 )
+
+func testCertificateFingerprint(t testing.TB, certFile string) string {
+	t.Helper()
+	pemBytes, err := os.ReadFile(certFile)
+	if err != nil {
+		t.Fatalf("read certificate: %v", err)
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil || block.Type != "CERTIFICATE" {
+		t.Fatal("test certificate is not valid PEM")
+	}
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:])
+}
 
 // helperSeq hands every startTunnelServer call a distinct TransportKey.
 var helperSeq atomic.Uint64
@@ -45,6 +63,7 @@ func startTunnelServer(t testing.TB, ctx context.Context, alpn string) (*url.URL
 		cfg.CertFile, cfg.KeyFile = certFile, keyFile
 		scheme = "https"
 		dial.SNI = "localhost"
+		dial.CertificateFingerprint = testCertificateFingerprint(t, certFile)
 	}
 
 	srv, err := NewServer(cfg)

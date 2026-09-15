@@ -141,7 +141,7 @@ func probeHTTP3(ctx context.Context, hostPort, sni string, timeout time.Duration
 	defer cancel()
 
 	tlsConf := &tls.Config{
-		InsecureSkipVerify:    true,
+		InsecureSkipVerify:    fingerprint != "", // explicit pin replaces CA verification
 		ServerName:            sni,
 		NextProtos:            []string{"h3"},
 		VerifyPeerCertificate: verifyFingerprint(fingerprint),
@@ -149,7 +149,7 @@ func probeHTTP3(ctx context.Context, hostPort, sni string, timeout time.Duration
 
 	qconf := &quic.Config{}
 
-	logger.Debug("🔎 probeHTTP3 开始 QUIC 握手探测", zap.String("hostport", hostPort), zap.String("sni", sni), zap.Duration("timeout", timeout))
+	logger.Debug("🔎 probeHTTP3 starting QUIC handshake probe", zap.String("hostport", hostPort), zap.String("sni", sni), zap.Duration("timeout", timeout))
 
 	type result struct {
 		sess *quic.Conn
@@ -174,17 +174,17 @@ func probeHTTP3(ctx context.Context, hostPort, sni string, timeout time.Duration
 
 	select {
 	case <-cctx.Done():
-		logger.Debug("🔎 probeHTTP3 超时/取消", zap.String("hostport", hostPort), zap.Error(cctx.Err()))
+		logger.Debug("🔎 probeHTTP3 timed out / cancelled", zap.String("hostport", hostPort), zap.Error(cctx.Err()))
 		return false, cctx.Err()
 	case res := <-ch:
 		if res.err != nil {
-			logger.Debug("🔎 probeHTTP3 握手失败", zap.String("hostport", hostPort), zap.Error(res.err))
+			logger.Debug("🔎 probeHTTP3 handshake failed", zap.String("hostport", hostPort), zap.Error(res.err))
 			return false, res.err
 		}
 		if cerr := res.sess.CloseWithError(0, "probe done"); cerr != nil {
-			logger.Debug("🔎 probeHTTP3: CloseWithError 返回", zap.Error(cerr))
+			logger.Debug("🔎 probeHTTP3: CloseWithError returned", zap.Error(cerr))
 		}
-		logger.Debug("🔎 probeHTTP3 握手成功，发现 QUIC/HTTP3 支持", zap.String("hostport", hostPort))
+		logger.Debug("🔎 probeHTTP3 handshake succeeded, QUIC/HTTP3 supported", zap.String("hostport", hostPort))
 		return true, nil
 	}
 }
@@ -208,7 +208,7 @@ func detectProtocol(ctx context.Context, cfg *DialConfig, nextProtos []string, i
 	protoMu.Lock()
 	if e, ok := protoCache[key]; ok && now.Before(e.expiry) {
 		protoMu.Unlock()
-		logger.Debug("[Sniffer] ♻️ 复用缓存的协议探测结果", zap.String("hostport", hostPort), zap.String("protocol", e.protocol))
+		logger.Debug("[Sniffer] ♻️ reusing cached protocol probe result", zap.String("hostport", hostPort), zap.String("protocol", e.protocol))
 		return e.protocol, nil
 	}
 	protoMu.Unlock()
@@ -232,13 +232,13 @@ func sniffProtocol(ctx context.Context, cfg *DialConfig, nextProtos []string, ho
 	logger := cfg.lg()
 	alpnPref := strings.ToLower(strings.TrimSpace(cfg.ALPN))
 	if alpnPref == "h3" || alpnPref == "auto" {
-		logger.Debug("尝试使用 QUIC/HTTP3 探测", zap.String("hostport", hostPort), zap.String("sni", cfg.SNI))
+		logger.Debug("🔎 attempting QUIC/HTTP3 probe", zap.String("hostport", hostPort), zap.String("sni", cfg.SNI))
 		ok, perr := probeHTTP3(ctx, hostPort, cfg.SNI, h3ProbeTimeout, cfg.CertificateFingerprint, cfg.QUICDial, logger)
 		if ok && perr == nil {
-			logger.Debug("QUIC/HTTP3 探测成功，使用 HTTP/3", zap.String("host", hostPort))
+			logger.Debug("✅ QUIC/HTTP3 probe succeeded, using HTTP/3", zap.String("host", hostPort))
 			return "h3", nil
 		}
-		logger.Debug("QUIC/HTTP3 探测失败，回落至 TCP/TLS 探测", zap.String("host", hostPort), zap.Error(perr))
+		logger.Debug("⚠️ QUIC/HTTP3 probe failed, falling back to TCP/TLS probe", zap.String("host", hostPort), zap.Error(perr))
 	}
 
 	var conn net.Conn
@@ -253,7 +253,7 @@ func sniffProtocol(ctx context.Context, cfg *DialConfig, nextProtos []string, ho
 	}
 	defer conn.Close()
 
-	utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: true, NextProtos: nextProtos, VerifyPeerCertificate: verifyFingerprint(cfg.CertificateFingerprint)}
+	utlsConfig := &utls.Config{ServerName: cfg.SNI, InsecureSkipVerify: cfg.CertificateFingerprint != "", NextProtos: nextProtos, VerifyPeerCertificate: verifyFingerprint(cfg.CertificateFingerprint)}
 	tlsConn := utls.UClient(conn, utlsConfig, utls.HelloChrome_Auto)
 	if err := tlsConn.BuildHandshakeState(); err != nil {
 		return "", fmt.Errorf("utls build handshake state failed: %w", err)
@@ -264,7 +264,9 @@ func sniffProtocol(ctx context.Context, cfg *DialConfig, nextProtos []string, ho
 			break
 		}
 	}
-	if err := tlsConn.Handshake(); err != nil {
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, dialTimeout)
+	defer cancelHandshake()
+	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 		return "", err
 	}
 
@@ -276,7 +278,7 @@ func sniffProtocol(ctx context.Context, cfg *DialConfig, nextProtos []string, ho
 			protocol = "http/1.1"
 		}
 	}
-	logger.Debug("[Sniffer] ✅ TLS 探测完成", zap.String("ALPN", protocol), zap.String("SNI", cfg.SNI))
+	logger.Debug("[Sniffer] ✅ TLS probe completed", zap.String("ALPN", protocol), zap.String("SNI", cfg.SNI))
 	return protocol, nil
 }
 
@@ -303,14 +305,14 @@ func (p *dialParams) dial(ctx context.Context, network, addr string) (net.Conn, 
 		c, err = (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, "tcp", p.hostPort)
 	}
 	if err != nil {
-		logger.Error("❌ [Dialer] 建立底层连接失败", zap.Error(err))
+		logger.Error("❌ [Dialer] failed to establish underlying connection", zap.Error(err))
 		return nil, err
 	}
 	if !p.isTLS {
 		return c, nil
 	}
 
-	utlsConfig := &utls.Config{ServerName: p.sni, InsecureSkipVerify: true, NextProtos: p.nextProtos, VerifyPeerCertificate: verifyFingerprint(p.fingerprint)}
+	utlsConfig := &utls.Config{ServerName: p.sni, InsecureSkipVerify: p.fingerprint != "", NextProtos: p.nextProtos, VerifyPeerCertificate: verifyFingerprint(p.fingerprint)}
 	tlsC := utls.UClient(c, utlsConfig, utls.HelloChrome_Auto)
 	if err := tlsC.BuildHandshakeState(); err != nil {
 		c.Close()
@@ -322,8 +324,10 @@ func (p *dialParams) dial(ctx context.Context, network, addr string) (net.Conn, 
 			break
 		}
 	}
-	if err := tlsC.Handshake(); err != nil {
-		logger.Error("❌ [Dialer] TLS 握手失败", zap.Error(err))
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, dialTimeout)
+	defer cancelHandshake()
+	if err := tlsC.HandshakeContext(handshakeCtx); err != nil {
+		logger.Error("❌ [Dialer] TLS handshake failed", zap.Error(err))
 		c.Close()
 		return nil, err
 	}
@@ -345,10 +349,10 @@ func selectTransport(protocol string, cfg *DialConfig, nextProtos []string, isTL
 		if rt, ok := transportCache[key]; ok {
 			return rt, false
 		}
-		logger.Debug("🚀 [Dialer] 准备使用 HTTP/3 (QUIC) 作为传输")
+		logger.Debug("🚀 [Dialer] preparing HTTP/3 (QUIC) transport")
 		rt := &http3.Transport{
 			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify:    true,
+				InsecureSkipVerify:    cfg.CertificateFingerprint != "",
 				ServerName:            cfg.SNI,
 				NextProtos:            []string{"h3"},
 				VerifyPeerCertificate: verifyFingerprint(cfg.CertificateFingerprint),
@@ -373,7 +377,7 @@ func selectTransport(protocol string, cfg *DialConfig, nextProtos []string, isTL
 	transportMu.Lock()
 	defer transportMu.Unlock()
 	if rt, ok := transportCache[key]; ok {
-		logger.Debug("♻️ [Dialer] 复用共享 Transport", zap.String("protocol", protocol), zap.String("hostport", hostPort))
+		logger.Debug("♻️ [Dialer] reusing shared Transport", zap.String("protocol", protocol), zap.String("hostport", hostPort))
 		return rt, false
 	}
 
@@ -381,7 +385,7 @@ func selectTransport(protocol string, cfg *DialConfig, nextProtos []string, isTL
 
 	var rt http.RoundTripper
 	if protocol == "h2" {
-		logger.Debug("🚀 [Dialer] 准备使用 HTTP/2 作为传输")
+		logger.Debug("🚀 [Dialer] preparing HTTP/2 transport")
 		rt = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
@@ -389,7 +393,7 @@ func selectTransport(protocol string, cfg *DialConfig, nextProtos []string, isTL
 			},
 		}
 	} else {
-		logger.Debug("🚀 [Dialer] 准备使用 HTTP/1.1 作为传输")
+		logger.Debug("🚀 [Dialer] preparing HTTP/1.1 transport")
 		t1 := &http.Transport{
 			ForceAttemptHTTP2:   false,
 			MaxIdleConns:        sharedMaxIdleConns,
@@ -466,7 +470,10 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		if !errors.Is(serr, errStreamUnavailable) {
 			return nil, serr
 		}
-		logger.Warn("⚠️ [Stream] 流式下行在当前路径不可用，本会话回退长轮询",
+		if strings.EqualFold(strings.TrimSpace(cfg.StreamMode), "stream") {
+			return nil, serr
+		}
+		logger.Warn("⚠️ [Stream] streaming downlink unavailable on this path, this session falls back to long polling",
 			zap.String("session", sessionID), zap.Error(serr))
 	}
 
@@ -485,12 +492,13 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 	// returning worker can tell whether its slot is still the live one.
 	var pollMu sync.Mutex
 	var pollSlot *pollHandle
-	logger.Debug("🚀 启动客户端 HTTP 数据泵", zap.String("session", sessionID), zap.String("target", targetAddr), zap.String("transport", fmt.Sprintf("%T", rt)))
+	logger.Debug("🚀 starting client HTTP data pump", zap.String("session", sessionID), zap.String("target", targetAddr), zap.String("transport", fmt.Sprintf("%T", rt)))
 
 	go func() {
 		defer close(pumpDone)
+		defer pumpCancel()
 		defer virtualConn.Close()
-		defer logger.Debug("💀 客户端 HTTP 数据泵已停止", zap.String("session", sessionID))
+		defer logger.Debug("💀 client HTTP data pump stopped", zap.String("session", sessionID))
 
 		var ackedByServer uint64
 		var dispatchSeq uint64
@@ -503,7 +511,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		for !virtualConn.isClosed() && !virtualConn.closePending() {
 			if restartCount > 0 {
 				if restartCount > 6 {
-					logger.Error("❌ [Pump] 数据泵重启次数达到上限 (超过 90 秒)，放弃恢复，关闭隧道", zap.String("session", sessionID))
+					logger.Error("❌ [Pump] data pump restart limit reached (over 90s), giving up recovery, closing tunnel", zap.String("session", sessionID))
 					break
 				}
 
@@ -511,7 +519,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 				if backoff > 30*time.Second {
 					backoff = 30 * time.Second
 				}
-				logger.Warn("⚠️ [Pump] 发生严重网络错误，数据泵已退出，准备指数退避后自动重启",
+				logger.Warn("⚠️ [Pump] severe network error, data pump exited, will auto-restart after exponential backoff",
 					zap.String("session", sessionID),
 					zap.Int("restarts", restartCount),
 					zap.Duration("backoff", backoff),
@@ -634,7 +642,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					} else if cfg.SNI != "" {
 						req.Host = cfg.SNI
 					}
-					req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.5410.0 Safari/537.36 Client/"+Version)
+					req.Header.Set("User-Agent", clientUserAgent)
 					if cfg.Password != "" {
 						req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Password)
 						// Proxy-Authorization is hop-by-hop and is commonly stripped
@@ -660,7 +668,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						req.Header.Set("X-Retry", "1")
 					}
 
-					logger.Debug("📤 [Pump] 发起 HTTP 轮询请求",
+					logger.Debug("📤 [Pump] issuing HTTP poll request",
 						zap.String("session", sessionID),
 						zap.Uint64("Client_Seq", currentSeq),
 						zap.Uint64("Client_Ack", myAck),
@@ -694,23 +702,23 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 
 					if err != nil {
 						if pumpCtx.Err() != nil {
-							logger.Debug("🛑 [Pump] 收到 Context 取消信號，Worker 退出", zap.Int("worker", id))
+							logger.Debug("🛑 [Pump] context cancelled, worker exiting", zap.Int("worker", id))
 							break
 						}
 						// An empty poll aborted by the closer is not a network
 						// failure: the pump is shutting down, so stop instead of
 						// retrying and parking another 5s long poll.
 						if handle != nil && (virtualConn.closePending() || virtualConn.isClosed()) {
-							logger.Debug("🛑 [Pump] 关闭时中止空轮询，Worker 退出", zap.Int("worker", id))
+							logger.Debug("🛑 [Pump] aborting empty poll on close, worker exiting", zap.Int("worker", id))
 							break
 						}
-						logger.Debug("⚠️ [Pump] HTTP 轮询失败，准备重试", zap.String("session", sessionID), zap.Error(err))
+						logger.Debug("⚠️ [Pump] HTTP poll failed, will retry", zap.String("session", sessionID), zap.Error(err))
 						windowMu.Lock()
 						dispatchSeq = atomic.LoadUint64(&ackedByServer)
 						windowMu.Unlock()
 						atomic.StoreInt32(&triggerRetry, 1)
 						if atomic.AddInt32(&consecutiveErrors, 1) > 20 {
-							logger.Warn("❌ [Pump] 连续错误过多，Worker 退出准备触发数据泵重启", zap.Int("worker", id))
+							logger.Warn("❌ [Pump] too many consecutive errors, worker exiting to trigger a data pump restart", zap.Int("worker", id))
 							break
 						}
 						time.Sleep(300 * time.Millisecond)
@@ -719,8 +727,15 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					atomic.StoreInt32(&consecutiveErrors, 0)
 
 					var sAck uint64
-					if sAckStr := resp.Header.Get("X-Ack"); sAckStr != "" {
+					if sAckStr := resp.Header.Get("X-Ack"); sAckStr != "" && resp.StatusCode == http.StatusOK {
 						sAck, _ = strconv.ParseUint(sAckStr, 10, 64)
+						if !virtualConn.writeBuf.validAck(sAck) {
+							resp.Body.Close()
+							virtualConn.setCloseErr(errors.New("tunnel: invalid peer acknowledgement"))
+							virtualConn.Close()
+							pumpCancel()
+							return
+						}
 						for {
 							old := atomic.LoadUint64(&ackedByServer)
 							if sAck <= old || atomic.CompareAndSwapUint64(&ackedByServer, old, sAck) {
@@ -732,13 +747,13 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						// header; the uplink window cannot drain without it. The
 						// next poll that carries X-Ack recovers, so this is a
 						// diagnostic, not a retry trigger.
-						logger.Warn("⚠️ [Pump] 200 响应缺少 X-Ack 头（疑似被 CDN/代理剥离），上行确认停滞", zap.String("session", sessionID))
+						logger.Warn("⚠️ [Pump] 200 response missing X-Ack header (likely stripped by a CDN/proxy), uplink acknowledgement stalled", zap.String("session", sessionID))
 					}
 
 					if resp.StatusCode != http.StatusOK {
 						downBuf := bytesBufPool.Get().(*bytes.Buffer)
 						downBuf.Reset()
-						downBuf.ReadFrom(resp.Body)
+						downBuf.ReadFrom(io.LimitReader(resp.Body, 4096))
 						bodyErr := downBuf.Bytes()
 						resp.Body.Close()
 						if handle != nil {
@@ -772,7 +787,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						// 504 (Gateway Timeout) / 524 (Cloudflare Timeout) are normal
 						// long-poll timeouts — go straight to the next poll round.
 						if resp.StatusCode == http.StatusGatewayTimeout || resp.StatusCode == 524 {
-							logger.Debug("⏱️ [Pump] CDN/网关轮询超时，立即发起下一轮轮询",
+							logger.Debug("⏱️ [Pump] CDN/gateway poll timeout, starting the next poll immediately",
 								zap.String("session", sessionID),
 								zap.Int("status", resp.StatusCode),
 							)
@@ -782,7 +797,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 
 						// 429 Too Many Requests: hit a CDN/WAF rate limit, back off briefly.
 						if resp.StatusCode == http.StatusTooManyRequests {
-							logger.Warn("⚠️ [Pump] 触发 CDN/WAF 频控限制 (429 Too Many Requests)，正在退避等待...",
+							logger.Warn("⚠️ [Pump] hit CDN/WAF rate limit (429 Too Many Requests), backing off...",
 								zap.String("session", sessionID),
 							)
 							bytesBufPool.Put(downBuf)
@@ -790,7 +805,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							continue
 						}
 
-						logger.Error("❌ [Pump] 收到异常 HTTP 状态码",
+						logger.Error("❌ [Pump] received an unexpected HTTP status code",
 							zap.String("session", sessionID),
 							zap.Int("status", resp.StatusCode),
 							zap.String("error_body", string(bodyErr)),
@@ -809,7 +824,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						// the tunnel would deadlock while the server looks healthy.
 						// Treat it like an untrusted edge response — drain the body,
 						// rewind to the last ack and ask the server to re-dispatch.
-						logger.Warn("⚠️ [Pump] 200 响应缺少 X-Seq 头（疑似被 CDN/代理剥离），回退并重试", zap.String("session", sessionID))
+						logger.Warn("⚠️ [Pump] 200 response missing X-Seq header (likely stripped by a CDN/proxy), rewinding and retrying", zap.String("session", sessionID))
 						io.Copy(io.Discard, resp.Body)
 						resp.Body.Close()
 						if handle != nil {
@@ -831,7 +846,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					// the classic "direct works, behind-CDN connects then breaks"
 					// signature. Surface it instead of silently corrupting.
 					if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
-						logger.Warn("⚠️ [Pump] CDN/代理对隧道响应做了内容编码，帧流将被破坏（请在 CDN 侧对该路径禁用压缩）",
+						logger.Warn("⚠️ [Pump] the CDN/proxy content-encoded the tunnel response, the frame stream will be corrupted (disable compression for this path at the CDN)",
 							zap.String("session", sessionID),
 							zap.String("content_encoding", ce),
 						)
@@ -846,7 +861,10 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					for {
 						n, err := resp.Body.Read(readChunk)
 						if n > 0 {
-							virtualConn.PutReadData(downSeq, readChunk[:n])
+							_, errBody = virtualConn.PutReadDataContext(pumpCtx, downSeq, readChunk[:n])
+							if errBody != nil {
+								break
+							}
 							downSeq += uint64(n)
 							totalDownBytes += n
 						}
@@ -864,7 +882,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					safelyPutSendBuf(bufPtr)
 
 					if errBody != nil {
-						logger.Warn("⚠️ [Pump] 读取下行 Body 失败或异常中断，触发安全重传", zap.Error(errBody))
+						logger.Warn("⚠️ [Pump] failed to read downlink body or it ended unexpectedly, triggering a safe retransmit", zap.Error(errBody))
 
 						windowMu.Lock()
 						dispatchSeq = atomic.LoadUint64(&ackedByServer)
@@ -874,7 +892,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						continue
 					}
 
-					logger.Debug("📥 [Pump] 收到 HTTP 轮询响应",
+					logger.Debug("📥 [Pump] received HTTP poll response",
 						zap.String("session", sessionID),
 						zap.Uint64("Server_Seq", sSeq),
 						zap.Uint64("Server_Ack", sAck),
@@ -943,7 +961,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		// closing a pooled HTTP/1.1, H2, or H3 connection.
 		if ownTransport {
 			if rt3, ok := rt.(*http3.Transport); ok {
-				logger.Debug("🧹 [Dialer] 关闭 HTTP/3 Transport", zap.String("session", sessionID))
+				logger.Debug("🧹 [Dialer] closing HTTP/3 Transport", zap.String("session", sessionID))
 				rt3.Close()
 			}
 		}
@@ -973,7 +991,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 			select {
 			case <-pumpDone:
 			case <-time.After(closeFlushTimeout):
-				logger.Debug("⏱️ [Pump] 关闭帧 flush 超时，强制取消数据泵", zap.String("session", sessionID))
+				logger.Debug("⏱️ [Pump] close-frame flush timed out, force-cancelling the data pump", zap.String("session", sessionID))
 				pumpCancel()
 			}
 		}
@@ -1085,8 +1103,8 @@ type ClientConfig struct {
 	// are rejected by NewClient.
 	StreamMode string
 	// Fingerprint is the expected server certificate SHA-256 fingerprint for
-	// pinning. Strongly recommended: without it TLS verification is skipped
-	// and an on-path attacker can terminate the tunnel.
+	// pinning (required for self-signed certificates). When empty, the client
+	// verifies the normal CA chain and SNI hostname, suitable for CDN edges.
 	Fingerprint string
 	// Target is where ListenAndServe forwards local connections when the
 	// embedding program does not dial per-connection through DialContext.
@@ -1227,16 +1245,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		log:                    cfg.Logger,
 	}
 
-	logger.Debug("🔧 客户端配置初始化", zap.String("SNI", sni), zap.String("Host", host), zap.String("Target", cfg.Target), zap.String("ALPN", alpn), zap.String("CertificateFingerprint", cfg.Fingerprint))
+	logger.Debug("🔧 client configuration initialised", zap.String("SNI", sni), zap.String("Host", host), zap.String("Target", cfg.Target), zap.String("ALPN", alpn), zap.String("CertificateFingerprint", cfg.Fingerprint))
 
-	// The TLS dials below set InsecureSkipVerify and only install
-	// verifyFingerprint, which is a no-op when no fingerprint is configured.
-	// That combination means the server certificate is accepted sight unseen,
-	// so an on-path attacker can terminate the tunnel. Say so loudly rather
-	// than letting the operator assume the padlock is real.
-	if serverURL.Scheme == "https" && cfg.Fingerprint == "" {
-		logger.Warn("⚠️ 未配置证书指纹 (fingerprint)：TLS 证书将不被校验，存在中间人风险。建议设置 fingerprint 做证书锁定。")
-	}
 	return c, nil
 }
 
@@ -1326,20 +1336,37 @@ func (c *Client) dialTracked(ctx context.Context, network, addr string) (net.Con
 		c.dialCount.Add(-1)
 		return nil, err
 	}
-	return &trackedConn{Conn: conn, client: c}, nil
+	tracked := &trackedConn{Conn: conn, client: c}
+	// Release the MaxConns slot the moment the tunnel dies on its own
+	// (peer closed / transport failure), not only when the caller closes it.
+	// Without this, a caller that forgets to Close a dead session leaks its
+	// slot for the process lifetime and can eventually lock itself out of
+	// MaxConns. The release is idempotent via tracked.release.
+	if doneable, ok := conn.(interface{ Done() <-chan struct{} }); ok {
+		go func() {
+			<-doneable.Done()
+			tracked.releaseSlot()
+		}()
+	}
+	return tracked, nil
 }
 
-// trackedConn releases its MaxConns slot exactly once, when the caller
-// closes the session.
+// trackedConn releases its MaxConns slot exactly once — either when the
+// caller closes the session or when the underlying tunnel dies, whichever
+// happens first.
 type trackedConn struct {
 	net.Conn
 	client  *Client
 	release sync.Once
 }
 
+func (t *trackedConn) releaseSlot() {
+	t.release.Do(func() { t.client.dialCount.Add(-1) })
+}
+
 func (t *trackedConn) Close() error {
 	err := t.Conn.Close()
-	t.release.Do(func() { t.client.dialCount.Add(-1) })
+	t.releaseSlot()
 	return err
 }
 
@@ -1431,10 +1458,10 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 	c.registerCloser(ln)
 	defer c.unregisterCloser(ln)
 
-	logger.Info("🚀 Client 启动成功", zap.String("addr", hostPort), zap.String("ALPN", c.dialCfg.ALPN))
+	logger.Info("🚀 Client started successfully", zap.String("addr", hostPort), zap.String("ALPN", c.dialCfg.ALPN))
 	go func() {
 		<-ctx.Done()
-		logger.Info("🛑 收到退出信号，正在关闭客户端 TCP 监听...")
+		logger.Info("🛑 shutdown signal received, closing the client TCP listener...")
 		ln.Close()
 	}()
 
@@ -1446,12 +1473,12 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 			if ctx.Err() != nil || c.isClosed() {
 				return nil
 			}
-			logger.Error("❌ Accept 接收本地连接失败", zap.Error(err))
+			logger.Error("❌ failed to Accept a local connection", zap.Error(err))
 			continue
 		}
 
 		if atomic.LoadInt32(&activeTCPConns) >= int32(c.maxConns) {
-			logger.Warn("❌ [TCP] 拒绝本地连接: 达到最大并发连接数限制", zap.Int("limit", c.maxConns), zap.String("client", conn.RemoteAddr().String()))
+			logger.Warn("❌ [TCP] refused local connection: reached max concurrent connections", zap.Int("limit", c.maxConns), zap.String("client", conn.RemoteAddr().String()))
 			conn.Close()
 			continue
 		}
@@ -1461,16 +1488,16 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 			defer atomic.AddInt32(&activeTCPConns, -1)
 			defer conn.Close()
 			connID := generateRandomHex(4)
-			logger.Debug("🔌 [TCP] 收到本地客户端连接", zap.String("id", connID), zap.String("client", conn.RemoteAddr().String()))
+			logger.Debug("🔌 [TCP] accepted a local client connection", zap.String("id", connID), zap.String("client", conn.RemoteAddr().String()))
 
-			logger.Debug("⏳ [TCP] 正在拨号远程 XHTTP 隧道...", zap.String("id", connID), zap.String("server", c.serverURL.Host))
+			logger.Debug("⏳ [TCP] dialing the remote XHTTP tunnel...", zap.String("id", connID), zap.String("server", c.serverURL.Host))
 			xc, err := c.dialTracked(ctx, "tcp", c.target)
 			if err != nil {
-				logger.Error("❌ [TCP] XHTTP 隧道拨号失败", zap.String("id", connID), zap.Error(err))
+				logger.Error("❌ [TCP] XHTTP tunnel dial failed", zap.String("id", connID), zap.Error(err))
 				return
 			}
 			defer xc.Close()
-			logger.Debug("✅ [TCP] XHTTP 隧道拨号成功", zap.String("id", connID))
+			logger.Debug("✅ [TCP] XHTTP tunnel dial succeeded", zap.String("id", connID))
 
 			var clientConn net.Conn = conn
 			if c.dump {
@@ -1518,20 +1545,20 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 				}
 
 				if upErr != nil && upErr != io.EOF {
-					logger.Debug("⚠️ [TCP] 上行转发 (Local->Server) 异常结束", zap.String("id", connID), zap.Int64("bytes", written), zap.Error(upErr))
+					logger.Debug("⚠️ [TCP] uplink relay (local->server) ended abnormally", zap.String("id", connID), zap.Int64("bytes", written), zap.Error(upErr))
 				} else {
-					logger.Debug("🛑 [TCP] 上行转发 (Local->Server) 正常结束", zap.String("id", connID), zap.Int64("bytes", written))
+					logger.Debug("🛑 [TCP] uplink relay (local->server) ended normally", zap.String("id", connID), zap.Int64("bytes", written))
 				}
 			}()
 
 			downN, downErr := io.Copy(&idleRefresher{Conn: clientConn, idle: c.idleTimeout}, xc)
 			if downErr != nil && downErr != io.EOF {
-				logger.Debug("⚠️ [TCP] 下行转发 (Server->Local) 异常结束", zap.String("id", connID), zap.Int64("bytes", downN), zap.Error(downErr))
+				logger.Debug("⚠️ [TCP] downlink relay (server->local) ended abnormally", zap.String("id", connID), zap.Int64("bytes", downN), zap.Error(downErr))
 			} else {
-				logger.Debug("🛑 [TCP] 下行转发 (Server->Local) 正常结束", zap.String("id", connID), zap.Int64("bytes", downN))
+				logger.Debug("🛑 [TCP] downlink relay (server->local) ended normally", zap.String("id", connID), zap.Int64("bytes", downN))
 			}
 			closeBoth()
-			logger.Debug("💀 [TCP] 本地会话清理完毕", zap.String("id", connID))
+			logger.Debug("💀 [TCP] local session cleaned up", zap.String("id", connID))
 		}()
 	}
 }
@@ -1552,10 +1579,10 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 		}
 	}
 
-	logger.Info("🚀 Client(UDP) 启动成功", zap.String("addr", hostPort))
+	logger.Info("🚀 Client(UDP) started successfully", zap.String("addr", hostPort))
 	go func() {
 		<-ctx.Done()
-		logger.Info("🛑 收到退出信号，正在关闭客户端 UDP 监听...")
+		logger.Info("🛑 shutdown signal received, closing the client UDP listener...")
 		pc.Close()
 	}()
 
@@ -1578,7 +1605,7 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 				mu.Lock()
 				for addr, sess := range sessionMap {
 					if now-atomic.LoadInt64(&sess.lastActive) > 30 {
-						logger.Debug("🧹 [UDP] 清理长时间空闲的本地 UDP 会话", zap.String("client", addr))
+						logger.Debug("🧹 [UDP] reclaiming a long-idle local UDP session", zap.String("client", addr))
 						sess.conn.Close()
 						delete(sessionMap, addr)
 					}
@@ -1596,7 +1623,7 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 			if ctx.Err() != nil || c.isClosed() {
 				return nil
 			}
-			logger.Error("❌ [UDP] 本地读取失败", zap.Error(err))
+			logger.Error("❌ [UDP] local read failed", zap.Error(err))
 			continue
 		}
 
@@ -1609,22 +1636,22 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 
 		if !exists {
 			if full {
-				logger.Warn("❌ [UDP] 拒绝本地新会话: 达到最大并发限制", zap.Int("limit", c.maxConns), zap.String("client", key))
+				logger.Warn("❌ [UDP] refused local session: reached max concurrent connections", zap.Int("limit", c.maxConns), zap.String("client", key))
 				continue
 			}
 
 			connID := generateRandomHex(4)
-			logger.Debug("🔌 [UDP] 发现新本地客户端，准备建立隧道", zap.String("id", connID), zap.String("client", key))
+			logger.Debug("🔌 [UDP] new local client detected, establishing tunnel", zap.String("id", connID), zap.String("client", key))
 
 			// Dial outside the lock: DialXHTTP can block for seconds on
 			// the network, and holding mu meanwhile would stall the
 			// reaper and every other local UDP client with it.
 			xc, dialErr := c.dialTracked(ctx, "udp", c.target)
 			if dialErr != nil {
-				logger.Error("❌ [UDP] XHTTP 隧道拨号失败", zap.String("id", connID), zap.Error(dialErr))
+				logger.Error("❌ [UDP] XHTTP tunnel dial failed", zap.String("id", connID), zap.Error(dialErr))
 				continue
 			}
-			logger.Debug("✅ [UDP] XHTTP 隧道拨号成功", zap.String("id", connID))
+			logger.Debug("✅ [UDP] XHTTP tunnel dial succeeded", zap.String("id", connID))
 
 			mu.Lock()
 			if racing, ok := sessionMap[key]; ok {
@@ -1636,7 +1663,7 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 			} else if len(sessionMap) >= c.maxConns {
 				mu.Unlock()
 				xc.Close()
-				logger.Warn("❌ [UDP] 拒绝本地新会话: 达到最大并发限制", zap.Int("limit", c.maxConns), zap.String("client", key))
+				logger.Warn("❌ [UDP] refused local session: reached max concurrent connections", zap.Int("limit", c.maxConns), zap.String("client", key))
 				continue
 			} else {
 				sess = &udpSession{conn: xc, lastActive: time.Now().Unix()}
@@ -1649,7 +1676,7 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 						mu.Lock()
 						delete(sessionMap, addr.String())
 						mu.Unlock()
-						logger.Debug("💀 [UDP] 本地会话清理完毕", zap.String("id", id), zap.String("client", addr.String()))
+						logger.Debug("💀 [UDP] local session cleaned up", zap.String("id", id), zap.String("client", addr.String()))
 					}()
 
 					dBuf := make([]byte, maxUDPFrameSize)
@@ -1657,9 +1684,9 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 						l, err := ReadUDPFrameInto(session.conn, dBuf)
 						if err != nil {
 							if err != io.EOF && !strings.Contains(err.Error(), "closed network connection") {
-								logger.Debug("⚠️ [UDP] 下行读取 Frame 失败", zap.String("id", id), zap.Error(err))
+								logger.Debug("⚠️ [UDP] failed to read downlink frame", zap.String("id", id), zap.Error(err))
 							} else {
-								logger.Debug("🛑 [UDP] 下行监听结束 (EOF/Closed)", zap.String("id", id))
+								logger.Debug("🛑 [UDP] downlink listener ended (EOF/closed)", zap.String("id", id))
 							}
 							return
 						}
@@ -1672,7 +1699,7 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 
 		atomic.StoreInt64(&sess.lastActive, time.Now().Unix())
 		if err := WriteUDPFrame(sess.conn, buf[:n]); err != nil {
-			logger.Debug("⚠️ [UDP] 写入上行 Frame 失败", zap.String("client", key), zap.Error(err))
+			logger.Debug("⚠️ [UDP] failed to write uplink frame", zap.String("client", key), zap.Error(err))
 		}
 	}
 }
