@@ -6,6 +6,11 @@ on:
       - "v1.0.*"
   workflow_dispatch:
     inputs:
+      tag:
+        description: "Release tag. Leave empty to auto-generate v1.0.yyyyMMdd.<commit count>-<short hash>"
+        required: false
+        default: ""
+        type: string
       target:
         description: Binary target uploaded as the single manual artifact
         required: true
@@ -60,6 +65,8 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # contents: write is required to push the auto-created tag and to
+    # create/update the release.
     permissions:
       contents: write
     steps:
@@ -77,26 +84,43 @@ jobs:
       - name: Resolve version and output name
         id: metadata
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           short_sha="$(git rev-parse --short=7 HEAD)"
 
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             version="${GITHUB_REF_NAME}"
-            if [[ ! "${version}" =~ ^v1\.0\.[0-9]{8}\.[0-9]+-([0-9a-f]{7,40})$ ]]; then
-              echo "Tag must match v1.0.yyyyMMdd.<commit count>-<commit hash>: ${version}" >&2
-              exit 1
+            tagged_hash=""
+          else
+            # Manual dispatch: honour a caller-supplied tag, otherwise derive
+            # v1.0.yyyyMMdd.<commit count>-<short hash> from the checked-out
+            # commit.
+            version="${{ inputs.tag }}"
+            if [[ -z "${version}" ]]; then
+              commit_count="$(git rev-list --count HEAD)"
+              version="v1.0.$(date -u +%Y%m%d).${commit_count}-${short_sha}"
             fi
-            tagged_hash="${BASH_REMATCH[1]}"
-            if [[ "${GITHUB_SHA}" != "${tagged_hash}"* ]]; then
-              echo "Tag hash ${tagged_hash} does not match commit ${GITHUB_SHA}" >&2
-              exit 1
-            fi
+          fi
+
+          if [[ ! "${version}" =~ ^v1\.0\.[0-9]{8}\.[0-9]+-([0-9a-f]{7,40})$ ]]; then
+            echo "Tag must match v1.0.yyyyMMdd.<commit count>-<commit hash>: ${version}" >&2
+            exit 1
+          fi
+          tagged_hash="${BASH_REMATCH[1]}"
+
+          # The tag must point at the commit being released; for an
+          # auto-generated tag that is trivially true (hash == HEAD).
+          if [[ "${GITHUB_SHA}" != "${tagged_hash}"* ]]; then
+            echo "Tag hash ${tagged_hash} does not match commit ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             target=""
             asset=""
           else
-            commit_count="$(git rev-list --count HEAD)"
-            version="v1.0.$(date -u +%Y%m%d).${commit_count}-${short_sha}"
             target="${{ inputs.target }}"
             goos="${target%/*}"
             goarch="${target#*/}"
@@ -104,9 +128,27 @@ jobs:
             if [[ "${goos}" == "windows" ]]; then
               asset="${asset}.exe"
             fi
+
+            # Tag existence check: create the tag when it is missing, reuse it
+            # when it already points at this commit. A tag that exists on a
+            # different commit is a hard error — silently moving it would
+            # rewrite published history.
+            if git rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
+              existing="$(git rev-list -n1 "${version}")"
+              if [[ "${existing}" != "${GITHUB_SHA}" ]]; then
+                echo "Tag ${version} already exists on ${existing}, not ${GITHUB_SHA}" >&2
+                exit 1
+              fi
+              echo "Tag ${version} already exists on this commit; will overwrite the release."
+            else
+              git tag "${version}" "${GITHUB_SHA}"
+              git push origin "refs/tags/${version}"
+              echo "Created tag ${version} on ${GITHUB_SHA}."
+            fi
           fi
 
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${version}" >> "${GITHUB_OUTPUT}"
           echo "target=${target}" >> "${GITHUB_OUTPUT}"
           echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
           echo "Resolved version: ${version}"
@@ -149,17 +191,19 @@ jobs:
           retention-days: 14
 
       - name: Create or update GitHub Release with raw binaries
-        if: github.event_name == 'push'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
         run: |
           set -euo pipefail
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" bin/* --clobber
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; overwriting its assets."
+            gh release upload "${TAG}" bin/* --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" bin/* \
+            echo "Creating release ${TAG}."
+            gh release create "${TAG}" bin/* \
               --verify-tag \
-              --title "${GITHUB_REF_NAME}" \
+              --title "${TAG}" \
               --generate-notes
           fi
