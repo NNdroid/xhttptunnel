@@ -83,8 +83,8 @@ jobs:
 
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             version="${GITHUB_REF_NAME}"
-            if [[ ! "${version}" =~ ^v1\.0\.[0-9]{8}-([0-9a-f]{7,40})$ ]]; then
-              echo "Tag must match v1.0.yyyyMMdd-<commit hash>: ${version}" >&2
+            if [[ ! "${version}" =~ ^v1\.0\.[0-9]{8}\.[0-9]+-([0-9a-f]{7,40})$ ]]; then
+              echo "Tag must match v1.0.yyyyMMdd.<commit count>-<commit hash>: ${version}" >&2
               exit 1
             fi
             tagged_hash="${BASH_REMATCH[1]}"
@@ -95,7 +95,8 @@ jobs:
             target=""
             asset=""
           else
-            version="v1.0.$(date -u +%Y%m%d)-${short_sha}"
+            commit_count="$(git rev-list --count HEAD)"
+            version="v1.0.$(date -u +%Y%m%d).${commit_count}-${short_sha}"
             target="${{ inputs.target }}"
             goos="${target%/*}"
             goarch="${target#*/}"

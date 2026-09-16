@@ -7,16 +7,21 @@ mkdir -p "${BIN_DIR}"
 
 APP_NAME="xhttptunnel"
 
-# Release versions use v1.0.yyyyMMdd-<short commit hash>. CI passes the tag
-# explicitly; local builds derive the same shape from the current UTC date and
-# HEAD. Override without editing this script: VERSION=v1.0.20260904-8f60417 ...
+# Release versions use v1.0.yyyyMMdd.<commit count>-<short commit hash>.
+# CI passes the tag explicitly; local builds derive the same shape from the
+# current UTC date, the commit count, and HEAD. Override without editing this
+# script: VERSION=v1.0.20260916.1234-a1b2c3d ...
 if [ -z "${VERSION:-}" ]; then
   BUILD_DATE="$(date -u +%Y%m%d)"
+  GIT_COUNT="$(git -C "${PROJECT_ROOT}" rev-list --count HEAD 2>/dev/null || true)"
+  if [ -z "${GIT_COUNT}" ]; then
+    GIT_COUNT="0"
+  fi
   GIT_HASH="$(git -C "${PROJECT_ROOT}" rev-parse --short=7 HEAD 2>/dev/null || true)"
   if [ -z "${GIT_HASH}" ]; then
     GIT_HASH="unknown"
   fi
-  VERSION="v1.0.${BUILD_DATE}-${GIT_HASH}"
+  VERSION="v1.0.${BUILD_DATE}.${GIT_COUNT}-${GIT_HASH}"
 fi
 
 LDFLAGS="-s -w -X main.version=${VERSION}"
