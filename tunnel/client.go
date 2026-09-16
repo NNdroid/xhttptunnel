@@ -83,11 +83,66 @@ var (
 	// explicit TransportKey. Reusing a transport created for another Android
 	// Network / bound interface would route traffic through the wrong network.
 	customTransportSerial atomic.Uint64
+
+	// protoInflight / transportInflight collapse concurrent cache misses for
+	// the same endpoint into one piece of work. Without them a cold cache (or
+	// one that expired a second ago) lets N concurrent dials each pay for a
+	// QUIC probe plus a TCP/TLS handshake, and lets N transports be built for
+	// one endpoint with all but the last one silently discarded — its pooled
+	// connections then sit idle until IdleConnTimeout instead of being reused.
+	protoInflight     inflightGroup
+	transportInflight inflightGroup
 )
 
 type protoEntry struct {
 	protocol string
 	expiry   time.Time
+}
+
+// inflightGroup is a minimal per-key singleflight: the first caller for a key
+// runs fn, later callers wait for and reuse its result instead of repeating
+// the work. It exists so this package does not have to pull in
+// golang.org/x/sync for one call site.
+type inflightGroup struct {
+	mu sync.Mutex
+	m  map[string]*inflightCall
+}
+
+type inflightCall struct {
+	done sync.WaitGroup
+	val  interface{}
+	err  error
+}
+
+// Do runs fn at most once per key at a time. fn MUST be safe to skip: a
+// caller that finds the value already cached while waiting should return that
+// value instead of redoing the work.
+func (g *inflightGroup) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[string]*inflightCall)
+	}
+	if c, ok := g.m[key]; ok {
+		g.mu.Unlock()
+		c.done.Wait()
+		return c.val, c.err
+	}
+	c := &inflightCall{}
+	c.done.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	c.val, c.err = fn()
+
+	g.mu.Lock()
+	// Only remove our own entry: a later caller may already have registered a
+	// fresh one after we finished.
+	if g.m[key] == c {
+		delete(g.m, key)
+	}
+	g.mu.Unlock()
+	c.done.Done()
+	return c.val, c.err
 }
 
 // pooledBody hands a send-buffer back to the pool exactly once, when the
@@ -203,23 +258,35 @@ func detectProtocol(ctx context.Context, cfg *DialConfig, nextProtos []string, i
 	}
 
 	key := strings.Join(nextProtos, ",") + "|" + hostPort + "|" + cfg.SNI + "|" + cfg.CertificateFingerprint + "|" + cfg.TransportKey
-	now := time.Now()
 
 	protoMu.Lock()
-	if e, ok := protoCache[key]; ok && now.Before(e.expiry) {
+	if e, ok := protoCache[key]; ok && time.Now().Before(e.expiry) {
 		protoMu.Unlock()
 		logger.Debug("[Sniffer] ♻️ reusing cached protocol probe result", zap.String("hostport", hostPort), zap.String("protocol", e.protocol))
 		return e.protocol, nil
 	}
 	protoMu.Unlock()
 
-	protocol, err := sniffProtocol(ctx, cfg, nextProtos, hostPort)
+	// Cache miss: collapse concurrent misses for this endpoint into one probe.
+	// Otherwise N dials arriving together each pay for a QUIC handshake plus a
+	// TCP/TLS handshake, which is exactly the cold-start stampede the cache was
+	// meant to prevent.
+	v, err := protoInflight.Do(key, func() (interface{}, error) {
+		protoMu.Lock()
+		if e, ok := protoCache[key]; ok && time.Now().Before(e.expiry) {
+			protoMu.Unlock()
+			return e.protocol, nil
+		}
+		protoMu.Unlock()
+		return sniffProtocol(ctx, cfg, nextProtos, hostPort)
+	})
 	if err != nil {
 		return "", err
 	}
+	protocol, _ := v.(string)
 
 	protoMu.Lock()
-	protoCache[key] = protoEntry{protocol: protocol, expiry: now.Add(protoCacheTTL)}
+	protoCache[key] = protoEntry{protocol: protocol, expiry: time.Now().Add(protoCacheTTL)}
 	protoMu.Unlock()
 	return protocol, nil
 }
@@ -342,15 +409,54 @@ func (p *dialParams) dial(ctx context.Context, network, addr string) (net.Conn, 
 // handshake on every dial.
 func selectTransport(protocol string, cfg *DialConfig, nextProtos []string, isTLS bool, hostPort string) (http.RoundTripper, bool) {
 	logger := cfg.lg()
-	if protocol == "h3" {
-		key := protocol + "|" + hostPort + "|" + cfg.SNI + "|" + cfg.CertificateFingerprint + "|" + strings.Join(nextProtos, ",") + "|" + cfg.TransportKey
+	key := protocol + "|" + hostPort + "|" + cfg.SNI + "|" + cfg.CertificateFingerprint + "|" + strings.Join(nextProtos, ",") + "|" + cfg.TransportKey
+
+	transportMu.Lock()
+	if rt, ok := transportCache[key]; ok {
+		transportMu.Unlock()
+		logger.Debug("♻️ [Dialer] reusing shared Transport", zap.String("protocol", protocol), zap.String("hostport", hostPort))
+		return rt, false
+	}
+	transportMu.Unlock()
+
+	// Cache miss: build the transport once per endpoint even when many dials
+	// arrive together. Building two and keeping the second would orphan the
+	// first one's connection pool until IdleConnTimeout expired.
+	v, err := transportInflight.Do(key, func() (interface{}, error) {
 		transportMu.Lock()
-		defer transportMu.Unlock()
 		if rt, ok := transportCache[key]; ok {
-			return rt, false
+			transportMu.Unlock()
+			return rt, nil
 		}
+		transportMu.Unlock()
+
+		rt := buildTransport(protocol, cfg, nextProtos, isTLS, hostPort)
+
+		transportMu.Lock()
+		if existing, ok := transportCache[key]; ok {
+			// Lost a race with another builder: keep the winner so there is
+			// exactly one pool per endpoint.
+			transportMu.Unlock()
+			return existing, nil
+		}
+		transportCache[key] = rt
+		transportMu.Unlock()
+		return rt, nil
+	})
+	if err != nil {
+		return nil, false
+	}
+	rt, _ := v.(http.RoundTripper)
+	return rt, false
+}
+
+// buildTransport constructs the per-endpoint RoundTripper for a negotiated
+// protocol. Called at most once per endpoint key (see selectTransport).
+func buildTransport(protocol string, cfg *DialConfig, nextProtos []string, isTLS bool, hostPort string) http.RoundTripper {
+	logger := cfg.lg()
+	if protocol == "h3" {
 		logger.Debug("🚀 [Dialer] preparing HTTP/3 (QUIC) transport")
-		rt := &http3.Transport{
+		return &http3.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify:    cfg.CertificateFingerprint != "",
 				ServerName:            cfg.SNI,
@@ -368,45 +474,31 @@ func selectTransport(protocol string, cfg *DialConfig, nextProtos []string, isTL
 			},
 			Dial: cfg.QUICDial,
 		}
-		transportCache[key] = rt
-		return rt, false
-	}
-
-	key := protocol + "|" + hostPort + "|" + cfg.SNI + "|" + cfg.CertificateFingerprint + "|" + strings.Join(nextProtos, ",") + "|" + cfg.TransportKey
-
-	transportMu.Lock()
-	defer transportMu.Unlock()
-	if rt, ok := transportCache[key]; ok {
-		logger.Debug("♻️ [Dialer] reusing shared Transport", zap.String("protocol", protocol), zap.String("hostport", hostPort))
-		return rt, false
 	}
 
 	p := &dialParams{hostPort: hostPort, sni: cfg.SNI, fingerprint: cfg.CertificateFingerprint, nextProtos: nextProtos, isTLS: isTLS, log: cfg.lg(), dialContext: cfg.DialContext}
 
-	var rt http.RoundTripper
 	if protocol == "h2" {
 		logger.Debug("🚀 [Dialer] preparing HTTP/2 transport")
-		rt = &http2.Transport{
+		return &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 				return p.dial(ctx, network, addr)
 			},
 		}
-	} else {
-		logger.Debug("🚀 [Dialer] preparing HTTP/1.1 transport")
-		t1 := &http.Transport{
-			ForceAttemptHTTP2:   false,
-			MaxIdleConns:        sharedMaxIdleConns,
-			MaxIdleConnsPerHost: sharedMaxIdleConns,
-			DisableKeepAlives:   false,
-			IdleConnTimeout:     90 * time.Second,
-		}
-		t1.DialTLSContext = p.dial
-		t1.DialContext = p.dial
-		rt = t1
 	}
-	transportCache[key] = rt
-	return rt, false
+
+	logger.Debug("🚀 [Dialer] preparing HTTP/1.1 transport")
+	t1 := &http.Transport{
+		ForceAttemptHTTP2:   false,
+		MaxIdleConns:        sharedMaxIdleConns,
+		MaxIdleConnsPerHost: sharedMaxIdleConns,
+		DisableKeepAlives:   false,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	t1.DialTLSContext = p.dial
+	t1.DialContext = p.dial
+	return t1
 }
 
 func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetAddr, network string) (net.Conn, error) {
@@ -668,13 +760,18 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						req.Header.Set("X-Retry", "1")
 					}
 
-					logger.Debug("📤 [Pump] issuing HTTP poll request",
-						zap.String("session", sessionID),
-						zap.Uint64("Client_Seq", currentSeq),
-						zap.Uint64("Client_Ack", myAck),
-						zap.Int("Up_Bytes", len(upData)),
-						zap.Int("worker", id),
-					)
+					// Hot path: this runs once per poll. Checking the level
+					// first keeps the zap.Field slice from being allocated
+					// (and formatted) on every round when debug is off.
+					if ce := logger.Check(zap.DebugLevel, "📤 [Pump] issuing HTTP poll request"); ce != nil {
+						ce.Write(
+							zap.String("session", sessionID),
+							zap.Uint64("Client_Seq", currentSeq),
+							zap.Uint64("Client_Ack", myAck),
+							zap.Int("Up_Bytes", len(upData)),
+							zap.Int("worker", id),
+						)
+					}
 
 					resp, err := client.Do(req)
 
@@ -721,7 +818,11 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							logger.Warn("❌ [Pump] too many consecutive errors, worker exiting to trigger a data pump restart", zap.Int("worker", id))
 							break
 						}
-						time.Sleep(300 * time.Millisecond)
+						// Interruptible: a teardown during the backoff must not
+						// leave the worker parked for the full interval.
+						if !sleepCtx(pumpCtx, 300*time.Millisecond) {
+							break
+						}
 						continue
 					}
 					atomic.StoreInt32(&consecutiveErrors, 0)
@@ -801,7 +902,9 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 								zap.String("session", sessionID),
 							)
 							bytesBufPool.Put(downBuf)
-							time.Sleep(1 * time.Second)
+							if !sleepCtx(pumpCtx, 1*time.Second) {
+								break
+							}
 							continue
 						}
 
@@ -812,7 +915,9 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						)
 
 						bytesBufPool.Put(downBuf)
-						time.Sleep(1 * time.Second)
+						if !sleepCtx(pumpCtx, 1*time.Second) {
+							break
+						}
 						continue
 					}
 
@@ -834,7 +939,9 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						dispatchSeq = atomic.LoadUint64(&ackedByServer)
 						windowMu.Unlock()
 						atomic.StoreInt32(&triggerRetry, 1)
-						time.Sleep(300 * time.Millisecond)
+						if !sleepCtx(pumpCtx, 300*time.Millisecond) {
+							break
+						}
 						continue
 					}
 					sSeq, _ := strconv.ParseUint(sSeqStr, 10, 64)
@@ -888,16 +995,20 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						dispatchSeq = atomic.LoadUint64(&ackedByServer)
 						windowMu.Unlock()
 						atomic.StoreInt32(&triggerRetry, 1)
-						time.Sleep(300 * time.Millisecond)
+						if !sleepCtx(pumpCtx, 300*time.Millisecond) {
+							break
+						}
 						continue
 					}
 
-					logger.Debug("📥 [Pump] received HTTP poll response",
-						zap.String("session", sessionID),
-						zap.Uint64("Server_Seq", sSeq),
-						zap.Uint64("Server_Ack", sAck),
-						zap.Int("Down_Bytes", totalDownBytes),
-					)
+					if ce := logger.Check(zap.DebugLevel, "📥 [Pump] received HTTP poll response"); ce != nil {
+						ce.Write(
+							zap.String("session", sessionID),
+							zap.Uint64("Server_Seq", sSeq),
+							zap.Uint64("Server_Ack", sAck),
+							zap.Int("Down_Bytes", totalDownBytes),
+						)
+					}
 
 					if totalDownBytes == 0 && sSeqStr != "" {
 						virtualConn.PutReadData(sSeq, nil)
@@ -916,7 +1027,11 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					}
 
 					if len(upData) == 0 && totalDownBytes == 0 && virtualConn.writeBuf.Len() == 0 {
-						time.Sleep(100 * time.Millisecond)
+						// Idle anti-spin pause. Interruptible so a closing
+						// session does not wait out the full 100ms.
+						if !sleepCtx(pumpCtx, 100*time.Millisecond) {
+							break
+						}
 					}
 				}
 			}

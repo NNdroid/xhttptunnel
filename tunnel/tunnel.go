@@ -24,6 +24,7 @@
 package tunnel
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -171,6 +172,26 @@ func SetLogger(l *zap.Logger) {
 		return
 	}
 	logger = l
+}
+
+// sleepCtx pauses for d, returning early when ctx is done. Every backoff and
+// idle pause inside a pump worker must go through this: a bare time.Sleep
+// keeps the worker parked for the full interval after the session has already
+// been torn down, which delays shutdown and holds a worker slot that the
+// data pump is waiting on to scale. It reports whether the full interval
+// elapsed (false means ctx finished first).
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // stringAddr is a net.Addr backed by a plain string. It labels the virtual
@@ -578,16 +599,27 @@ func (st *serverState) startSessionCleaner() {
 
 func (st *serverState) sweepIdleSessions() {
 	now := time.Now().Unix()
+
+	// Collect first, then act without holding sessionsMu. Closing a session
+	// takes its own locks (readCond/writeBuf) and wakes parked goroutines;
+	// doing that under the session-table lock stalls every concurrent
+	// register/lookup/remove for the whole sweep, which on a busy server with
+	// a batch of expired sessions shows up as a periodic latency spike.
 	st.sessionsMu.Lock()
-	defer st.sessionsMu.Unlock()
+	var victims []*meekVirtualConn
 	for id, v := range st.sessions {
 		if now-v.lastActive.Load() > int64(sessionIdleTimeout.Seconds()) {
 			logger.Debug("🧹 [Cleaner] found an idle session, reclaiming resources", zap.String("session", id))
-			st.events.emit(SessionClosed{SessionID: id, Reason: "reaped"})
-			st.stats.sessionsReaped.Add(1)
-			v.Close()
 			st.removeSessionLocked(id)
+			victims = append(victims, v)
 		}
+	}
+	st.sessionsMu.Unlock()
+
+	for _, v := range victims {
+		st.events.emit(SessionClosed{SessionID: v.sessionID, Reason: "reaped"})
+		st.stats.sessionsReaped.Add(1)
+		v.Close()
 	}
 }
 
@@ -607,10 +639,18 @@ func (st *serverState) stop() {
 }
 
 func (st *serverState) sweepAllSessions() {
+	// Same shape as sweepIdleSessions: detach under the lock, close outside
+	// it, so shutting down a server with thousands of sessions cannot hold
+	// the session-table lock across every Close().
 	st.sessionsMu.Lock()
-	defer st.sessionsMu.Unlock()
+	victims := make([]*meekVirtualConn, 0, len(st.sessions))
 	for id, v := range st.sessions {
-		v.Close()
 		st.removeSessionLocked(id)
+		victims = append(victims, v)
+	}
+	st.sessionsMu.Unlock()
+
+	for _, v := range victims {
+		v.Close()
 	}
 }

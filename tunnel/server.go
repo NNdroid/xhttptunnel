@@ -260,13 +260,17 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		clientIP := st.getClientIP(r)
-		logger.Debug("👀 [HTTP] received raw HTTP request",
-			zap.String("method", r.Method),
-			zap.String("path", r.URL.Path),
-			zap.String("remote", clientIP),
-			zap.String("session", r.Header.Get("X-Session-ID")),
-			zap.String("auth", redactAuth(r.Header.Get("Proxy-Authorization"))),
-		)
+		// Per-request hot path: level-check first so the Field slice and the
+		// redaction are skipped when debug logging is off.
+		if ce := logger.Check(zap.DebugLevel, "👀 [HTTP] received raw HTTP request"); ce != nil {
+			ce.Write(
+				zap.String("method", r.Method),
+				zap.String("path", r.URL.Path),
+				zap.String("remote", clientIP),
+				zap.String("session", r.Header.Get("X-Session-ID")),
+				zap.String("auth", redactAuth(r.Header.Get("Proxy-Authorization"))),
+			)
+		}
 		if r.URL.Path != path {
 			if fallbackProxy != nil {
 				fallbackProxy.ServeHTTP(w, r)
@@ -423,13 +427,15 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			myUpAck = vConn.PutReadData(cSeq, nil)
 		}
 
-		logger.Debug("📥 [HTTP] parsing uplink request",
-			zap.String("session", sessionID),
-			zap.Uint64("Client_Seq", cSeq),
-			zap.Uint64("Client_Ack", cAck),
-			zap.Int("Up_Bytes", totalUpBytes),
-			zap.Uint64("Server_Expect_Ack", myUpAck),
-		)
+		if ce := logger.Check(zap.DebugLevel, "📥 [HTTP] parsing uplink request"); ce != nil {
+			ce.Write(
+				zap.String("session", sessionID),
+				zap.Uint64("Client_Seq", cSeq),
+				zap.Uint64("Client_Ack", cAck),
+				zap.Int("Up_Bytes", totalUpBytes),
+				zap.Uint64("Server_Expect_Ack", myUpAck),
+			)
+		}
 
 		var downData []byte
 		var myDownSeq uint64
@@ -492,12 +498,14 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			downData, downBufPtr = owned, nil
 		}
 
-		logger.Debug("📤 [HTTP] preparing downlink response",
-			zap.String("session", sessionID),
-			zap.Uint64("Server_Seq", myDownSeq),
-			zap.Uint64("Server_Ack", myUpAck),
-			zap.Int("Down_Bytes", len(downData)),
-		)
+		if ce := logger.Check(zap.DebugLevel, "📤 [HTTP] preparing downlink response"); ce != nil {
+			ce.Write(
+				zap.String("session", sessionID),
+				zap.Uint64("Server_Seq", myDownSeq),
+				zap.Uint64("Server_Ack", myUpAck),
+				zap.Int("Down_Bytes", len(downData)),
+			)
+		}
 
 		// Key CDN / reverse-proxy traversal headers: disable CDN edge caching and intermediate buffering
 		w.Header().Set("Cache-Control", "no-cache, no-store, no-transform, must-revalidate, max-age=0")

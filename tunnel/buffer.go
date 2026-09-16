@@ -42,6 +42,14 @@ const (
 	// Counting chunks alone is not a bound: a single chunk can be hundreds
 	// of KB, so 1024 of them would be ~350MB per session.
 	maxOutOfOrderBytes = 4 * 1024 * 1024
+
+	// readBufShrinkThreshold is the reassembly buffer capacity above which an
+	// idle session is worth releasing. Freeing anything smaller costs more in
+	// re-growth than it saves.
+	readBufShrinkThreshold = 1 << 20
+	// readBufIdleGrace is how long the reassembly buffer must sit drained
+	// before its backing array is released.
+	readBufIdleGrace = 5 * time.Second
 )
 
 var (
@@ -201,8 +209,12 @@ func (rb *reliableBuffer) GetSlice(remoteAck uint64, dispatchSeq uint64, maxLen 
 
 	bufPtr := sendBuf.Get().(*[]byte)
 	if cap(*bufPtr) < length {
-		newBuf := make([]byte, length)
-		bufPtr = &newBuf
+		// Swap in a bigger backing array but keep the pooled *[]byte
+		// container. Replacing the pointer outright drops the pooled object
+		// on the floor, so the pool slowly drains and every request pays a
+		// fresh allocation again. The grown container still passes the
+		// capacity check in safelyPutSendBuf, so it comes back on release.
+		*bufPtr = make([]byte, length)
 	}
 	res := (*bufPtr)[:length]
 
@@ -214,6 +226,13 @@ func (rb *reliableBuffer) GetSlice(remoteAck uint64, dispatchSeq uint64, maxLen 
 	} else {
 		copy(res[:firstPart], rb.buf[startIdx:startIdx+firstPart])
 		copy(res[firstPart:], rb.buf[0:length-firstPart])
+	}
+
+	// This hand-out moves the dispatch cursor, which the freed branch above
+	// does not cover. Wake a waitDrained sleeper only when the queue actually
+	// emptied, so the common streaming case pays nothing.
+	if length > 0 && !rb.pendingBeyond(dispatchSeq+uint64(length)) {
+		rb.cond.Broadcast()
 	}
 
 	return res, dispatchSeq, bufPtr
@@ -317,6 +336,23 @@ func (rb *reliableBuffer) pendingBeyond(dispatchSeq uint64) bool {
 	return dispatchSeq-rb.baseOffset < uint64(rb.count)
 }
 
+// waitDrained parks until every byte buffered at call time has been handed out
+// past dispatchSeq, the buffer is closed, or the timeout elapses. It replaces
+// a polling loop: GetSlice and Close both broadcast, so the waiter wakes the
+// instant the queue empties instead of up to one poll interval later.
+func (rb *reliableBuffer) waitDrained(timeout time.Duration, dispatchSeq uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if !rb.pendingBeyond(dispatchSeq) || rb.closed {
+		return
+	}
+	timer := time.AfterFunc(timeout, func() { rb.broadcast() })
+	defer timer.Stop()
+	for rb.pendingBeyond(dispatchSeq) && !rb.closed {
+		rb.cond.Wait()
+	}
+}
+
 func (rb *reliableBuffer) Close() {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -333,11 +369,25 @@ type meekVirtualConn struct {
 	local     net.Addr
 	remote    net.Addr
 
-	readCond    *sync.Cond
-	readBuf     bytes.Buffer
-	nextReadSeq uint64            // next Seq we expect to receive
-	oooBuf      map[uint64][]byte // out-of-order cache
-	oooBytes    int               // total bytes held by oooBuf
+	readCond *sync.Cond
+	readBuf  bytes.Buffer
+	// readBufBusyAt is the last time readBuf held data. bytes.Buffer never
+	// returns its backing array, so a session that once peaked at
+	// maxReassemblyBytes would pin that memory for its whole lifetime even
+	// while completely idle. Read releases the array when the buffer has been
+	// drained and quiet for readBufIdleGrace. Guarded by readCond.L.
+	readBufBusyAt time.Time
+	nextReadSeq   uint64            // next Seq we expect to receive
+	oooBuf        map[uint64][]byte // out-of-order cache
+	oooBytes      int               // total bytes held by oooBuf
+	// oooMinSeq caches the smallest key in oooBuf so drainContiguous can skip
+	// its cleanup scan whenever nothing sits behind the read cursor — the
+	// common case, since out-of-order chunks almost always arrive ahead of it.
+	// oooMinValid is false when the cached value is unknown (after removing
+	// the minimum, or on an empty cache) and must be recomputed on the next
+	// scan. Callers must hold readCond.L.
+	oooMinSeq   uint64
+	oooMinValid bool
 
 	writeBuf *reliableBuffer
 
@@ -460,6 +510,13 @@ func (c *meekVirtualConn) Read(p []byte) (int, error) {
 	c.readCond.L.Lock()
 	defer c.readCond.L.Unlock()
 	for c.readBuf.Len() == 0 && !c.isClosed() {
+		// About to park with nothing to hand over: give back a peak-sized
+		// reassembly array if the session has been quiet for a while. The
+		// grace period keeps a bursty-but-active session from trading its
+		// buffer for a fresh allocation on every short lull.
+		if c.readBuf.Cap() >= readBufShrinkThreshold && time.Since(c.readBufBusyAt) > readBufIdleGrace {
+			c.readBuf = bytes.Buffer{}
+		}
 		c.readCond.Wait()
 	}
 	if c.isClosed() && c.readBuf.Len() == 0 {
@@ -500,17 +557,26 @@ func (c *meekVirtualConn) closePending() bool { return c.closeRequested.Load() }
 func (c *meekVirtualConn) waitDrained(timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for {
-		c.downWindowMu.Lock()
-		pending := c.writeBuf.undispatched(c.downDispatchSeq)
-		c.downWindowMu.Unlock()
-		if pending == 0 || c.isClosed() {
+		if c.isClosed() {
 			return
 		}
-		if !time.Now().Before(deadline) {
+		c.downWindowMu.Lock()
+		dispatchSeq := c.downDispatchSeq
+		pending := c.writeBuf.undispatched(dispatchSeq)
+		c.downWindowMu.Unlock()
+		if pending == 0 {
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			c.log().Warn("[Session] downlink drain timed out, closing with data still queued", zap.String("session", c.sessionID))
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
+		// Park on the ring buffer's condition variable rather than sleeping
+		// in 20ms increments: the dispatch path broadcasts as soon as the
+		// queue empties, so this returns immediately instead of adding up to
+		// 20ms of latency to every session teardown.
+		c.writeBuf.waitDrained(remaining, dispatchSeq)
 	}
 }
 
@@ -573,6 +639,7 @@ func (c *meekVirtualConn) PutReadDataContext(ctx context.Context, seq uint64, da
 		switch {
 		case seq == c.nextReadSeq && c.readBuf.Len()+len(data) <= maxReassemblyBytes:
 			c.readBuf.Write(data)
+			c.readBufBusyAt = time.Now()
 			c.nextReadSeq += uint64(len(data))
 			c.drainContiguous()
 			c.readCond.Broadcast()
@@ -599,6 +666,10 @@ func (c *meekVirtualConn) PutReadDataContext(ctx context.Context, seq uint64, da
 				dataCopy := bytes.Clone(data)
 				c.oooBuf[seq] = dataCopy
 				c.oooBytes += len(dataCopy)
+				if !c.oooMinValid || seq < c.oooMinSeq {
+					c.oooMinSeq = seq
+					c.oooMinValid = true
+				}
 				return c.nextReadSeq, nil
 			}
 		}
@@ -613,6 +684,46 @@ func (c *meekVirtualConn) PutReadDataContext(ctx context.Context, seq uint64, da
 	}
 }
 
+// reapStaleOOO drops out-of-order entries the read cursor has already passed
+// and re-keys a partially covered tail at the cursor. It refreshes the cached
+// minimum on the way out, so the next call is O(1) instead of another scan.
+// Caller must hold readCond.L.
+func (c *meekVirtualConn) reapStaleOOO() {
+	min, valid := uint64(0), false
+	for seq, data := range c.oooBuf {
+		if seq >= c.nextReadSeq {
+			if !valid || seq < min {
+				min, valid = seq, true
+			}
+			continue
+		}
+		delete(c.oooBuf, seq)
+		c.oooBytes -= len(data)
+		end := seq + uint64(len(data)) // insertion rejects overflow
+		if end <= c.nextReadSeq {
+			continue
+		}
+		suffix := data[int(c.nextReadSeq-seq):]
+		if existing, ok := c.oooBuf[c.nextReadSeq]; ok {
+			if len(existing) >= len(suffix) {
+				// The suffix adds nothing; keep the longer cached copy.
+				if !valid || c.nextReadSeq < min {
+					min, valid = c.nextReadSeq, true
+				}
+				continue
+			}
+			c.oooBytes -= len(existing)
+		}
+		c.oooBuf[c.nextReadSeq] = suffix
+		c.oooBytes += len(suffix)
+		if !valid || c.nextReadSeq < min {
+			min, valid = c.nextReadSeq, true
+		}
+	}
+	c.oooMinSeq = min
+	c.oooMinValid = valid
+}
+
 // drainContiguous flushes every cached chunk that now sits immediately after
 // the read cursor. Caller must hold readCond.L.
 func (c *meekVirtualConn) drainContiguous() {
@@ -621,25 +732,13 @@ func (c *meekVirtualConn) drainContiguous() {
 		// Remove fully covered entries and re-key a surviving suffix at the
 		// current cursor; otherwise stale entries can consume the OOO budget
 		// forever because their original key is now behind nextReadSeq.
-		for seq, data := range c.oooBuf {
-			if seq >= c.nextReadSeq {
-				continue
-			}
-			delete(c.oooBuf, seq)
-			c.oooBytes -= len(data)
-			end := seq + uint64(len(data)) // insertion rejects overflow
-			if end <= c.nextReadSeq {
-				continue
-			}
-			suffix := data[int(c.nextReadSeq-seq):]
-			if existing, ok := c.oooBuf[c.nextReadSeq]; ok {
-				if len(existing) >= len(suffix) {
-					continue
-				}
-				c.oooBytes -= len(existing)
-			}
-			c.oooBuf[c.nextReadSeq] = suffix
-			c.oooBytes += len(suffix)
+		//
+		// The cached minimum makes this O(1) in the common case: when it is
+		// already ahead of the read cursor nothing can be stale, so the full
+		// scan — which is O(len(oooBuf)) and runs on every single delivered
+		// chunk — is skipped entirely.
+		if !c.oooMinValid || c.oooMinSeq < c.nextReadSeq {
+			c.reapStaleOOO()
 		}
 		nextData, ok := c.oooBuf[c.nextReadSeq]
 		if !ok {
@@ -650,9 +749,15 @@ func (c *meekVirtualConn) drainContiguous() {
 		if c.isClosed() || c.readBuf.Len()+len(nextData) > maxReassemblyBytes {
 			return
 		}
+		// Dropping the smallest key invalidates the cached minimum: the next
+		// iteration re-scans and recomputes it.
+		if c.oooMinValid && c.oooMinSeq == c.nextReadSeq {
+			c.oooMinValid = false
+		}
 		delete(c.oooBuf, c.nextReadSeq)
 		c.oooBytes -= len(nextData)
 		c.readBuf.Write(nextData)
+		c.readBufBusyAt = time.Now()
 		c.nextReadSeq += uint64(len(nextData))
 	}
 }
@@ -673,6 +778,8 @@ func (c *meekVirtualConn) Close() error {
 	c.readCond.L.Lock()
 	c.oooBuf = nil
 	c.oooBytes = 0
+	c.oooMinSeq = 0
+	c.oooMinValid = false
 	c.readCond.Broadcast()
 	c.readCond.L.Unlock()
 
