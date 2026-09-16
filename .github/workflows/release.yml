@@ -12,11 +12,12 @@ on:
         default: ""
         type: string
       target:
-        description: Binary target uploaded as the single manual artifact
-        required: true
-        default: linux/amd64
+        description: "Optional single platform to build. Leave empty to build ALL platforms and publish a full release."
+        required: false
+        default: ""
         type: choice
         options:
+          - ""
           - linux/amd64
           - linux/arm64
           - linux/arm
@@ -121,12 +122,17 @@ jobs:
             target=""
             asset=""
           else
+            # Optional single-target override. Empty target => build every
+            # supported platform and publish a full release.
             target="${{ inputs.target }}"
-            goos="${target%/*}"
-            goarch="${target#*/}"
-            asset="xhttptunnel_${goos}_${goarch}"
-            if [[ "${goos}" == "windows" ]]; then
-              asset="${asset}.exe"
+            asset=""
+            if [[ -n "${target}" ]]; then
+              goos="${target%/*}"
+              goarch="${target#*/}"
+              asset="xhttptunnel_${goos}_${goarch}"
+              if [[ "${goos}" == "windows" ]]; then
+                asset="${asset}.exe"
+              fi
             fi
 
             # Tag existence check: create the tag when it is missing, reuse it
@@ -158,7 +164,9 @@ jobs:
         env:
           VERSION: ${{ steps.metadata.outputs.version }}
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+          # Empty target => build every supported platform; otherwise just the
+          # single platform requested for a manual artifact.
+          if [[ -n "${{ steps.metadata.outputs.target }}" ]]; then
             bash ./scripts/build.sh "${{ steps.metadata.outputs.target }}"
           else
             bash ./scripts/build.sh
@@ -168,7 +176,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+          if [[ -n "${{ steps.metadata.outputs.target }}" ]]; then
             test -f "bin/${{ steps.metadata.outputs.asset }}"
             expected=1
           else
@@ -182,7 +190,7 @@ jobs:
           fi
 
       - name: Upload the single manual binary artifact
-        if: github.event_name == 'workflow_dispatch'
+        if: ${{ steps.metadata.outputs.target != '' }}
         uses: actions/upload-artifact@v7
         with:
           path: bin/${{ steps.metadata.outputs.asset }}
