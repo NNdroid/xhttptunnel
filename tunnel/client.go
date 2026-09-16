@@ -1587,8 +1587,13 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 	}()
 
 	type udpSession struct {
+		// lastActive must be atomic.Int64, not int64: on 32-bit targets a
+		// plain int64 reached via atomic.LoadInt64/StoreInt64 traps with
+		// "unaligned 64-bit atomic operation". atomic.Int64 is always
+		// 8-byte aligned. (The struct is heap-allocated, so placing it first
+		// would also work, but the atomic type is self-enforcing.)
+		lastActive atomic.Int64
 		conn       net.Conn
-		lastActive int64
 	}
 	sessionMap := make(map[string]*udpSession)
 	var mu sync.Mutex
@@ -1604,7 +1609,7 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 				now := time.Now().Unix()
 				mu.Lock()
 				for addr, sess := range sessionMap {
-					if now-atomic.LoadInt64(&sess.lastActive) > 30 {
+					if now-sess.lastActive.Load() > 30 {
 						logger.Debug("🧹 [UDP] reclaiming a long-idle local UDP session", zap.String("client", addr))
 						sess.conn.Close()
 						delete(sessionMap, addr)
@@ -1666,7 +1671,8 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 				logger.Warn("❌ [UDP] refused local session: reached max concurrent connections", zap.Int("limit", c.maxConns), zap.String("client", key))
 				continue
 			} else {
-				sess = &udpSession{conn: xc, lastActive: time.Now().Unix()}
+				sess = &udpSession{conn: xc}
+				sess.lastActive.Store(time.Now().Unix())
 				sessionMap[key] = sess
 				mu.Unlock()
 
@@ -1690,14 +1696,14 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 							}
 							return
 						}
-						atomic.StoreInt64(&session.lastActive, time.Now().Unix())
+						session.lastActive.Store(time.Now().Unix())
 						pc.WriteTo(dBuf[:l], addr)
 					}
 				}(cAddr, sess, connID)
 			}
 		}
 
-		atomic.StoreInt64(&sess.lastActive, time.Now().Unix())
+		sess.lastActive.Store(time.Now().Unix())
 		if err := WriteUDPFrame(sess.conn, buf[:n]); err != nil {
 			logger.Debug("⚠️ [UDP] failed to write uplink frame", zap.String("client", key), zap.Error(err))
 		}

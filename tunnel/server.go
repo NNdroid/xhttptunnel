@@ -47,6 +47,14 @@ const (
 )
 
 type XHTTPListener struct {
+	// RequestCount MUST stay the first field. On 32-bit targets (386/arm) a
+	// plain uint64 accessed with atomic.AddUint64 traps with "unaligned 64-bit
+	// atomic operation" unless it sits on an 8-byte boundary. The Go memory
+	// model guarantees the first word of an allocated struct is 8-byte aligned,
+	// so keeping it first makes the atomic op safe without changing the public
+	// uint64 type. Do not reorder fields above it.
+	RequestCount uint64
+
 	connCh        chan *XHTTPConn
 	ln            net.Listener
 	uln           net.PacketConn
@@ -56,8 +64,7 @@ type XHTTPListener struct {
 	// chOnly marks a listener that exists only for its session channel (the
 	// mounted Server.Handler mode). Closing it closes the channel so an
 	// external drain loop can exit; there are no sockets to release.
-	chOnly       bool
-	RequestCount uint64
+	chOnly bool
 }
 
 func (l *XHTTPListener) Accept(ctx context.Context) (net.Conn, error) {
@@ -106,8 +113,11 @@ func (l *XHTTPListener) Addr() net.Addr {
 }
 
 type ActiveTracker struct {
-	wg    sync.WaitGroup
-	n     int64
+	wg sync.WaitGroup
+	// n must be atomic.Int64, not int64: on 32-bit targets a plain int64
+	// reached via atomic.AddInt64/LoadInt64 traps with "unaligned 64-bit
+	// atomic operation". atomic.Int64 is always 8-byte aligned.
+	n     atomic.Int64
 	quiet chan struct{}
 }
 
@@ -117,11 +127,11 @@ func NewActiveTracker() *ActiveTracker {
 
 func (t *ActiveTracker) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt64(&t.n, 1)
+		t.n.Add(1)
 		t.wg.Add(1)
 		defer func() {
 			t.wg.Done()
-			if atomic.AddInt64(&t.n, -1) == 0 {
+			if t.n.Add(-1) == 0 {
 				select {
 				case <-t.quiet:
 				default:
@@ -134,7 +144,7 @@ func (t *ActiveTracker) Middleware(next http.Handler) http.Handler {
 }
 
 func (t *ActiveTracker) Wait(ctx context.Context) error {
-	if atomic.LoadInt64(&t.n) == 0 {
+	if t.n.Load() == 0 {
 		return nil
 	}
 	select {
@@ -145,7 +155,7 @@ func (t *ActiveTracker) Wait(ctx context.Context) error {
 	}
 }
 
-func (t *ActiveTracker) Active() int64 { return atomic.LoadInt64(&t.n) }
+func (t *ActiveTracker) Active() int64 { return t.n.Load() }
 
 func nginxError(w http.ResponseWriter, code int) {
 	statusText := http.StatusText(code)

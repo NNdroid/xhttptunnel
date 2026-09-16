@@ -581,7 +581,7 @@ func (st *serverState) sweepIdleSessions() {
 	st.sessionsMu.Lock()
 	defer st.sessionsMu.Unlock()
 	for id, v := range st.sessions {
-		if now-atomic.LoadInt64(&v.lastActive) > int64(sessionIdleTimeout.Seconds()) {
+		if now-v.lastActive.Load() > int64(sessionIdleTimeout.Seconds()) {
 			logger.Debug("🧹 [Cleaner] found an idle session, reclaiming resources", zap.String("session", id))
 			st.events.emit(SessionClosed{SessionID: id, Reason: "reaped"})
 			st.stats.sessionsReaped.Add(1)

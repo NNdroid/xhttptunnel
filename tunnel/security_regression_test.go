@@ -59,14 +59,14 @@ func TestStreamDownlinkStopsOnFailure(t *testing.T) {
 			defer cancel()
 			vc := newMeekVirtualConn("idle", nil, nil, nil)
 			defer vc.Close()
-			atomic.StoreInt64(&vc.lastActive, 1)
+			vc.lastActive.Store(1)
 			w := &failingStreamResponse{header: make(http.Header), failWrite: tc.write, failFlush: tc.flush, cancel: cancel, vc: vc}
 			r := httptest.NewRequest(http.MethodGet, "/stream", nil).WithContext(ctx)
 			serveStreamDownlink(w, r, newServerState(1), vc, "idle", false)
 			if w.writes > 2 {
 				t.Fatalf("abandoned handler kept writing: %d writes", w.writes)
 			}
-			if tc.name != "cancel" && atomic.LoadInt64(&vc.lastActive) != 1 {
+			if tc.name != "cancel" && vc.lastActive.Load() != 1 {
 				t.Fatal("failed stream refreshed liveness")
 			}
 		})

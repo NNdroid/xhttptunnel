@@ -341,13 +341,18 @@ type meekVirtualConn struct {
 
 	writeBuf *reliableBuffer
 
-	logField        *zap.Logger
-	closedFlag      atomic.Bool // set once Close() wins; safe to read without the lock
-	closeRequested  atomic.Bool // graceful stop: ship what is queued, then exit
-	kicked          atomic.Bool // set by Kick: the downlink must NOT send a close marker, so the client re-establishes
-	closedCh        chan struct{}
-	closedOnce      sync.Once
-	lastActive      int64
+	logField       *zap.Logger
+	closedFlag     atomic.Bool // set once Close() wins; safe to read without the lock
+	closeRequested atomic.Bool // graceful stop: ship what is queued, then exit
+	kicked         atomic.Bool // set by Kick: the downlink must NOT send a close marker, so the client re-establishes
+	closedCh       chan struct{}
+	closedOnce     sync.Once
+	// lastActive must stay an atomic.Int64, never a plain int64: on 32-bit
+	// targets (386/arm) a plain int64 deep inside this struct lands on a
+	// 4-byte boundary, and atomic.LoadInt64/StoreInt64 on it traps with
+	// "unaligned 64-bit atomic operation". atomic.Int64 carries the
+	// compiler's align64 marker, so it is 8-byte aligned wherever placed.
+	lastActive      atomic.Int64
 	downDispatchSeq uint64     // server->client dispatch cursor
 	downWindowMu    sync.Mutex // guards concurrent access to the dispatch cursor
 	// downWriter is the exclusive owner of the downlink dispatch cursor. A
@@ -419,7 +424,7 @@ func (c *meekVirtualConn) downWriterActive() bool {
 }
 
 func newMeekVirtualConn(sessionID string, local, remote net.Addr, lg *zap.Logger) *meekVirtualConn {
-	return &meekVirtualConn{
+	c := &meekVirtualConn{
 		sessionID:   sessionID,
 		local:       local,
 		remote:      remote,
@@ -428,9 +433,10 @@ func newMeekVirtualConn(sessionID string, local, remote net.Addr, lg *zap.Logger
 		streamReady: make(chan struct{}),
 		readCond:    sync.NewCond(&sync.Mutex{}),
 		writeBuf:    newReliableBuffer(4 * 1024 * 1024), // 4MB max buffer
-		lastActive:  time.Now().Unix(),
 		oooBuf:      make(map[uint64][]byte),
 	}
+	c.lastActive.Store(time.Now().Unix())
+	return c
 }
 
 func (c *meekVirtualConn) signalStreamReady() {
@@ -652,7 +658,7 @@ func (c *meekVirtualConn) drainContiguous() {
 }
 
 func (c *meekVirtualConn) updateActive() {
-	atomic.StoreInt64(&c.lastActive, time.Now().Unix())
+	c.lastActive.Store(time.Now().Unix())
 }
 
 func (c *meekVirtualConn) Close() error {
