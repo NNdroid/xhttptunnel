@@ -116,9 +116,9 @@ jobs:
           VERSION: ${{ steps.metadata.outputs.version }}
         run: |
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            ./scripts/build.sh "${{ steps.metadata.outputs.target }}"
+            bash ./scripts/build.sh "${{ steps.metadata.outputs.target }}"
           else
-            ./scripts/build.sh
+            bash ./scripts/build.sh
           fi
 
       - name: Verify build outputs
