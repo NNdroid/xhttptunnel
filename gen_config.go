@@ -1010,8 +1010,12 @@ type unitSystemdSpec struct {
 // the unit is valid on Linux regardless of which OS the generator ran on.
 // path.Dir alone would leave Windows backslashes behind, which systemd reads as
 // escapes.
+//
+// The slashes are normalised before splitting, not after: a backslash is a
+// legal filename byte on Unix, so on Linux a path that has never been
+// converted would contain no separator at all and Dir would return ".".
 func linuxDir(p string) string {
-	return filepath.ToSlash(filepath.Dir(p))
+	return filepath.ToSlash(filepath.Dir(filepath.ToSlash(p)))
 }
 
 // sdQuote wraps an argument so systemd parses it as one token. Space, backslash

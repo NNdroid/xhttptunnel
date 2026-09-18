@@ -157,22 +157,22 @@ func TestNonceWindowRejectsReplay(t *testing.T) {
 
 func TestNonceWindowExpiresNonce(t *testing.T) {
 	w := newNonceWindow()
-	w.ttl = time.Nanosecond
+	c := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	w.now = func() time.Time { return c }
 
-	if !w.mark("n-1") || w.mark("n-1") {
-		t.Fatal("mark did not report first-accept then replay-reject")
+	// A nanosecond TTL would not work here: any two calls are spaced by more
+	// than a nanosecond, so the "replay" mark would already see an expired
+	// entry and report it as fresh. The clock is stepped instead.
+	if !w.mark("n-1") {
+		t.Fatal("the first use of a nonce was rejected")
+	}
+	if w.mark("n-1") {
+		t.Fatal("a replay inside the window was accepted")
 	}
 	// Past the TTL the same nonce is spendable again: it is no longer inside
 	// the window where a replay could still reach a live session.
-	expired := false
-	for i := 0; i < 100; i++ {
-		if w.mark("n-1") {
-			expired = true
-			break
-		}
-		time.Sleep(50 * time.Microsecond)
-	}
-	if !expired {
+	c = c.Add(w.ttl + time.Nanosecond)
+	if !w.mark("n-1") {
 		t.Fatal("a nonce older than the TTL was still treated as a replay")
 	}
 	// Spending it put it back inside the window.
@@ -210,7 +210,8 @@ func TestNonceWindowSingleWinnerUnderConcurrency(t *testing.T) {
 
 func TestNonceWindowSweepsWhenOverCapacity(t *testing.T) {
 	w := newNonceWindow()
-	w.ttl = time.Nanosecond
+	c := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	w.now = func() time.Time { return c }
 	w.maxLen = 4
 
 	for i := 0; i < 4; i++ {
@@ -224,7 +225,7 @@ func TestNonceWindowSweepsWhenOverCapacity(t *testing.T) {
 
 	// Everything is expired by now. The next insert trips the capacity guard and
 	// the sweep drops the dead entries instead of letting the map grow.
-	time.Sleep(time.Millisecond)
+	c = c.Add(authNonceTTL)
 	if !w.mark("4") {
 		t.Fatal("mark 4 was refused")
 	}

@@ -54,6 +54,10 @@ type nonceWindow struct {
 	ttl    time.Duration
 	seen   map[string]time.Time
 	maxLen int
+	// now is the clock mark reads. Injectable so a test can step past the TTL
+	// without sleeping, and without relying on two calls being spaced by more
+	// than a nanosecond.
+	now func() time.Time
 }
 
 func newNonceWindow() *nonceWindow {
@@ -61,6 +65,7 @@ func newNonceWindow() *nonceWindow {
 		ttl:    authNonceTTL,
 		seen:   make(map[string]time.Time),
 		maxLen: authNonceMaxEntries,
+		now:    time.Now,
 	}
 }
 
@@ -68,7 +73,7 @@ func newNonceWindow() *nonceWindow {
 // the window (false). Expired entries are overwritten as fresh, which is
 // correct: outside the window a nonce has no replay meaning left.
 func (w *nonceWindow) mark(nonce string) bool {
-	now := time.Now()
+	now := w.now()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if exp, ok := w.seen[nonce]; ok && now.Before(exp) {
