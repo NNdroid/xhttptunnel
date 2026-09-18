@@ -1011,6 +1011,16 @@ func TestLinuxDir(t *testing.T) {
 			t.Errorf("linuxDir(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
+
+	// On a Unix host a backslash inside a path is a filename byte, not a
+	// separator, so the directory name must come back untouched. This only holds
+	// where the OS really treats it as data, which is why it is guarded. It pins
+	// filepath.ToSlash as the converter rather than a blanket replacement.
+	if runtime.GOOS != "windows" {
+		if got := linuxDir(`/opt/x\y/config.json`); got != `/opt/x\y` {
+			t.Errorf("linuxDir rewrote a backslash in a directory name: %q", got)
+		}
+	}
 }
 
 func TestChangedFlags(t *testing.T) {
