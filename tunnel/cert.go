@@ -39,6 +39,31 @@ func verifyFingerprint(expectedHex string) func([][]byte, [][]*x509.Certificate)
 	}
 }
 
+// CertFingerprint returns the SHA-256 fingerprint of the leaf certificate in a
+// PEM file as colon-separated hex. It hashes the raw DER, which is what
+// verifyFingerprint compares against, so the value also matches
+// `openssl x509 -in cert.pem -outform der | sha256sum` byte for byte.
+func CertFingerprint(certFile string) (string, error) {
+	der, err := os.ReadFile(certFile)
+	if err != nil {
+		return "", fmt.Errorf("read certificate %q: %w", certFile, err)
+	}
+	block, _ := pem.Decode(der)
+	if block == nil {
+		return "", fmt.Errorf("certificate %q has no PEM block", certFile)
+	}
+	sum := sha256.Sum256(block.Bytes)
+	hexStr := hex.EncodeToString(sum[:])
+	var b strings.Builder
+	for i, c := range hexStr {
+		if i > 0 && i%2 == 0 {
+			b.WriteByte(':')
+		}
+		b.WriteByte(byte(c))
+	}
+	return b.String(), nil
+}
+
 // GenerateSelfSignedCert generates a realistic-looking self-signed certificate
 // valid for 10 years and saves it to disk.
 func GenerateSelfSignedCert(certPath, keyPath, commonName string) error {

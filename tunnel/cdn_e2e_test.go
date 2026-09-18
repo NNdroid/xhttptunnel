@@ -3,6 +3,7 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -407,7 +408,14 @@ func (c *cdnTestServer) assert(t *testing.T) {
 		if h.Get("Accept-Encoding") == "identity" {
 			sawIdentity = true
 		}
-		if h.Get("X-Auth-Token") == "cdn-test-secret" {
+		// The credential must survive the CDN. Proxy-Authorization is hop-by-hop
+		// and gets stripped at the edge, so the signed scheme carries its
+		// evidence in two end-to-end headers instead. Both are required: a MAC
+		// without a nonce is unverifiable, and a nonce without a MAC is not a
+		// credential at all.
+		nonce := h.Get(AuthNonceHeader)
+		mac := h.Get(AuthMACHeader)
+		if validAuthNonce(nonce) && validHex(mac, sha256.Size) {
 			sawEndToEndAuth = true
 		}
 	}

@@ -1,11 +1,133 @@
 package tunnel
 
 import (
+	"encoding/json"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
 	qrcode "github.com/skip2/go-qrcode"
 )
+
+// captureStdout runs fn and returns whatever it printed to stdout, along with
+// fn's own return value. The reader must run in its own goroutine: the QR code
+// is large enough to fill the pipe buffer and block fn().
+func captureStdout(fn func() string) (string, string, error) {
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		return "", "", err
+	}
+	done := make(chan []byte, 1)
+	go func() {
+		out, _ := io.ReadAll(r)
+		done <- out
+	}()
+	os.Stdout = w
+	got := fn()
+	_ = w.Close()
+	os.Stdout = old
+	out := <-done
+	return string(out), got, nil
+}
+
+// TestShareURIProfileShape pins the fields the Stun importer consumes. A
+// "tcp://" prefix in sshAddr produces a node that imports cleanly but never
+// connects, so the QR looks correct while being unusable; a missing SNI breaks
+// the client's TLS handshake to the origin right after the scan; and the
+// certificate pin must reach the importer too, otherwise the node trusts
+// whatever certificate it is offered.
+func TestShareURIProfileShape(t *testing.T) {
+	_, uri, err := captureStdout(func() string {
+		return GenerateXHTTPTunnelURI("1.2.3.4", "9443", "/custom",
+			"tcp://192.168.1.10:22", "top-secret", "www.sushiwei.com", "AA:BB:CC:DD", "Node", "123456", true)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plain, err := decryptStunURI(uri, "123456")
+	if err != nil {
+		t.Fatalf("decrypt share URI: %v", err)
+	}
+	var prof StunProfile
+	if err := json.Unmarshal([]byte(plain), &prof); err != nil {
+		t.Fatalf("unmarshal profile: %v", err)
+	}
+	if prof.SSHAddr != "192.168.1.10:22" {
+		t.Errorf("sshAddr = %q, want the bare address %q", prof.SSHAddr, "192.168.1.10:22")
+	}
+	if prof.CustomHost != "www.sushiwei.com" || prof.ServerName != "www.sushiwei.com" {
+		t.Errorf("SNI = customHost %q / serverName %q, want www.sushiwei.com", prof.CustomHost, prof.ServerName)
+	}
+	if prof.ProxyAddr != "1.2.3.4:9443" {
+		t.Errorf("proxyAddr = %q, want 1.2.3.4:9443", prof.ProxyAddr)
+	}
+	if prof.Fingerprint != "AA:BB:CC:DD" {
+		t.Errorf("fingerprint = %q, want the pin handed to the generator", prof.Fingerprint)
+	}
+
+	// The plaintext protocol URI printed alongside carries the same pin, so a
+	// node imported from either form verifies the same certificate.
+	out, _, _ := captureStdout(func() string {
+		return GenerateXHTTPTunnelURI("1.2.3.4", "9443", "/custom",
+			"tcp://192.168.1.10:22", "top-secret", "www.sushiwei.com", "AA:BB:CC:DD", "Node", "123456", true)
+	})
+	if !strings.Contains(out, "fp=AA%3ABB%3ACC%3ADD") {
+		t.Error("the plaintext xhttp:// URI does not carry the fp pin")
+	}
+}
+
+// TestShareURIWithoutPin checks the default path: with no pin there is no
+// fingerprint field value and no fp parameter, so an importer sees an ordinary
+// node rather than a pin it cannot satisfy.
+func TestShareURIWithoutPin(t *testing.T) {
+	out, uri, err := captureStdout(func() string {
+		return GenerateXHTTPTunnelURI("1.2.3.4", "9443", "/custom",
+			"192.168.1.10:22", "top-secret", "www.sushiwei.com", "", "Node", "123456", true)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := decryptStunURI(uri, "123456")
+	if err != nil {
+		t.Fatalf("decrypt share URI: %v", err)
+	}
+	var prof StunProfile
+	if err := json.Unmarshal([]byte(plain), &prof); err != nil {
+		t.Fatalf("unmarshal profile: %v", err)
+	}
+	if prof.Fingerprint != "" {
+		t.Errorf("fingerprint = %q, want empty", prof.Fingerprint)
+	}
+	if strings.Contains(out, "fp=") {
+		t.Error("an unpinned share URI must not advertise an fp parameter")
+	}
+	if !strings.Contains(out, "no certificate pin") {
+		t.Error("an unpinned share URI should say so, so the operator is not misled")
+	}
+}
+
+// TestStripTargetScheme checks the scheme removal itself, including the case
+// where the prefix is uppercase or the string is not a scheme at all.
+func TestStripTargetScheme(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"tcp://127.0.0.1:22", "127.0.0.1:22"},
+		{"TCP://127.0.0.1:22", "127.0.0.1:22"},
+		{"udp://[::1]:53", "[::1]:53"},
+		{"udp://:53", ":53"},
+		{"127.0.0.1:22", "127.0.0.1:22"},
+		{"[::1]:22", "[::1]:22"},
+		{"", ""},
+		{"tcp://", "tcp://"}, // nothing after the prefix is not an address
+		{"http://1.2.3.4:80", "http://1.2.3.4:80"},
+	} {
+		if got := stripTargetScheme(tc.in); got != tc.want {
+			t.Errorf("stripTargetScheme(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
 
 // decodeTerminalQR reverses renderTerminalQR: it parses the ANSI escape codes
 // around each '▀' glyph and rebuilds the module grid (true = dark module),

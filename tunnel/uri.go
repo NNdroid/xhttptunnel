@@ -26,9 +26,10 @@ type StunProfile struct {
 	EnableCustomPath  bool   `json:"enableCustomPath"`
 	ProxyAuthRequired bool   `json:"proxyAuthRequired"`
 	ProxyAuthToken    string `json:"proxyAuthToken"`
+	Fingerprint       string `json:"fingerprint"`
 }
 
-func GenerateXHTTPTunnelURI(host, port, path, target, psk, sni, remark, pin string, insecure bool) string {
+func GenerateXHTTPTunnelURI(host, port, path, target, psk, sni, fingerprint, remark, pin string, insecure bool) string {
 	serverAddr := fmt.Sprintf("%s:%s", host, port)
 	if host == "" || host == "0.0.0.0" || host == ":" {
 		serverAddr = "YOUR_SERVER_IP:" + port
@@ -39,10 +40,16 @@ func GenerateXHTTPTunnelURI(host, port, path, target, psk, sni, remark, pin stri
 		name = "XHTTP - " + serverAddr
 	}
 
+	// The Stun importer reads sshAddr as a bare "host:port". Server configs
+	// store the value as "tcp://host:port" because the server dialer wants the
+	// scheme; passing it through unchanged yields a node that imports fine but
+	// never connects, so a scan of the QR looks plausible while being useless.
+	sshAddr := stripTargetScheme(target)
+
 	// 1. Official stun:// URI
 	prof := StunProfile{
 		Name:              name,
-		SSHAddr:           target,
+		SSHAddr:           sshAddr,
 		User:              "root",
 		AuthType:          "password",
 		TunnelType:        "xhttp",
@@ -53,10 +60,12 @@ func GenerateXHTTPTunnelURI(host, port, path, target, psk, sni, remark, pin stri
 		EnableCustomPath:  path != "" && path != "/stream",
 		ProxyAuthRequired: psk != "",
 		ProxyAuthToken:    psk,
+		Fingerprint:       fingerprint,
 	}
 	if prof.SSHAddr == "" {
 		prof.SSHAddr = "127.0.0.1:22"
 	}
+
 	profJSON, _ := json.Marshal(prof)
 	stunURI, usedPin, err := encryptStunURI(profJSON, pin)
 	if err != nil {
@@ -71,14 +80,17 @@ func GenerateXHTTPTunnelURI(host, port, path, target, psk, sni, remark, pin stri
 		Path:   path,
 	}
 	q := u.Query()
-	if target != "" && target != "tcp://127.0.0.1:22" {
-		q.Set("target", target)
+	if sshAddr != "" && sshAddr != "127.0.0.1:22" {
+		q.Set("target", sshAddr)
 	}
 	if psk != "" {
 		q.Set("psk", psk)
 	}
 	if sni != "" {
 		q.Set("sni", sni)
+	}
+	if fingerprint != "" {
+		q.Set("fp", fingerprint)
 	}
 	if insecure {
 		q.Set("insecure", "1")
@@ -91,9 +103,27 @@ func GenerateXHTTPTunnelURI(host, port, path, target, psk, sni, remark, pin stri
 	} else {
 		fmt.Printf("\n[PIN] (using provided PIN)\n")
 	}
-	fmt.Printf("\n[2] Direct Protocol URI (plaintext):\n  %s\n\n", u.String())
+	fmt.Printf("\n[2] Direct Protocol URI (plaintext):\n  %s\n", u.String())
+	if fingerprint != "" {
+		fmt.Printf("\n[FP] certificate pinned (SHA-256):\n  %s\n\n", fingerprint)
+	} else {
+		fmt.Printf("\n[FP] no certificate pin: the node verifies the server against the system CA roots instead\n\n")
+	}
 
 	return stunURI
+}
+
+// stripTargetScheme removes a leading "tcp://" or "udp://" from an address
+// string, leaving the bare "host:port" form that external importers (Stun,
+// other Stun-like apps) expect in sshAddr. Any other prefix is not a network
+// scheme we emit, so the string is returned unchanged rather than truncated.
+func stripTargetScheme(addr string) string {
+	for _, s := range []string{"tcp://", "udp://"} {
+		if len(addr) > len(s) && strings.EqualFold(addr[:len(s)], s) {
+			return addr[len(s):]
+		}
+	}
+	return addr
 }
 
 // PrintTerminalQR renders text as a scannable QR code on the terminal.

@@ -39,6 +39,10 @@ const (
 	closeFlushTimeout = longPollTimeout + time.Second
 	// dialTimeout bounds establishing the underlying TCP connection.
 	dialTimeout = 10 * time.Second
+	// bwExchangeTimeout bounds one bandwidth exchange attempt. It is a fraction
+	// of a poll: the exchange must never become the slow path, and it does not
+	// carry tunnel data, so it is free to fail and retry next interval.
+	bwExchangeTimeout = 5 * time.Second
 	// sharedMaxIdleConns caps idle keep-alive sockets for one shared transport.
 	sharedMaxIdleConns = 512
 
@@ -360,6 +364,10 @@ type dialParams struct {
 	isTLS       bool
 	log         *zap.Logger
 	dialContext func(context.Context, string, string) (net.Conn, error)
+	// brutal applies TCP Brutal to the freshly connected socket, or nil when
+	// this client does not configure it. nil means the dial path is exactly
+	// what it was before brutal existed.
+	brutal func(net.Conn)
 }
 
 func (p *dialParams) dial(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -374,6 +382,14 @@ func (p *dialParams) dial(ctx context.Context, network, addr string) (net.Conn, 
 	if err != nil {
 		logger.Error("❌ [Dialer] failed to establish underlying connection", zap.Error(err))
 		return nil, err
+	}
+	// Brutal belongs on the socket, not on the HTTP leg, so it is applied to
+	// the bare TCP connection before TLS runs on top of it: the first
+	// handshake byte is already rate-limited. It is deliberately here rather
+	// than in a net.Dialer Control hook, which would only reach one of the two
+	// dial paths — an embedder's injected DialContext bypasses it.
+	if p.brutal != nil {
+		p.brutal(c)
 	}
 	if !p.isTLS {
 		return c, nil
@@ -476,7 +492,16 @@ func buildTransport(protocol string, cfg *DialConfig, nextProtos []string, isTLS
 		}
 	}
 
-	p := &dialParams{hostPort: hostPort, sni: cfg.SNI, fingerprint: cfg.CertificateFingerprint, nextProtos: nextProtos, isTLS: isTLS, log: cfg.lg(), dialContext: cfg.DialContext}
+	p := &dialParams{
+		hostPort:    hostPort,
+		sni:         cfg.SNI,
+		fingerprint: cfg.CertificateFingerprint,
+		nextProtos:  nextProtos,
+		isTLS:       isTLS,
+		log:         cfg.lg(),
+		dialContext: cfg.DialContext,
+		brutal:      newBrutalApplier(cfg),
+	}
 
 	if protocol == "h2" {
 		logger.Debug("🚀 [Dialer] preparing HTTP/2 transport")
@@ -501,23 +526,33 @@ func buildTransport(protocol string, cfg *DialConfig, nextProtos []string, isTLS
 	return t1
 }
 
-func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetAddr, network string) (net.Conn, error) {
-	logger := cfg.lg()
-	isTLS := serverURL.Scheme == "https"
-	basePort := serverURL.Port()
-	if basePort == "" {
+func serverEndpoint(u *url.URL, path string) (isTLS bool, hostPort, reqURL string) {
+	isTLS = u.Scheme == "https"
+	port := u.Port()
+	if port == "" {
 		if isTLS {
-			basePort = "443"
+			port = "443"
 		} else {
-			basePort = "80"
+			port = "80"
 		}
 	}
+	hostPort = net.JoinHostPort(u.Hostname(), port)
+	scheme := "http"
+	if isTLS {
+		scheme = "https"
+	}
+	reqURL = fmt.Sprintf("%s://%s%s", scheme, hostPort, path)
+	return
+}
+
+func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetAddr, network string) (net.Conn, error) {
+	logger := cfg.lg()
+	isTLS, hostPort, reqURL := serverEndpoint(serverURL, cfg.Path)
 	// Deliberately NOT writing cfg.Path here. cfg is shared by every session
 	// spawned from this client, so mutating it from concurrent dials is a
 	// data race — and pointless, since NewClient already seeds Path from the
-	// server URL. reqURL below reads cfg.Path, which is that same value.
+	// server URL. reqURL above reads cfg.Path, which is that same value.
 	nextProtos := buildNextProtos(cfg.ALPN)
-	hostPort := net.JoinHostPort(serverURL.Hostname(), basePort)
 
 	protocol, err := detectProtocol(ctx, cfg, nextProtos, isTLS, hostPort)
 	if err != nil {
@@ -529,11 +564,6 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 	localAddr := stringAddr("tunnel-local")
 	remoteAddr := stringAddr(hostPort)
 
-	scheme := "http"
-	if isTLS {
-		scheme = "https"
-	}
-	reqURL := fmt.Sprintf("%s://%s%s", scheme, hostPort, cfg.Path)
 	sessionID := generateRandomHex(16)
 
 	rt, ownTransport := selectTransport(protocol, cfg, nextProtos, isTLS, hostPort)
@@ -735,14 +765,22 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						req.Host = cfg.SNI
 					}
 					req.Header.Set("User-Agent", clientUserAgent)
-					if cfg.Password != "" {
-						req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Password)
-						// Proxy-Authorization is hop-by-hop and is commonly stripped
-						// by CDNs and reverse proxies. The server also accepts this
-						// end-to-end header, keeping authenticated tunnels working
-						// behind standards-compliant intermediaries.
-						req.Header.Set("X-Auth-Token", cfg.Password)
+					// Signed credentials: the PSK itself is never sent, only its
+					// HMAC over a per-request nonce. The nonce is what makes
+					// replay impossible, so a failure here is fatal rather than
+					// retryable — retrying would just keep drawing the same
+					// broken entropy source and mint predictable nonces.
+					if authErr := setAuthHeaders(req, cfg.Password, sessionID, targetAddr); authErr != nil {
+						logger.Error("❌ [Pump] could not draw a nonce, closing the tunnel",
+							zap.String("session", sessionID),
+							zap.Error(authErr),
+						)
+						virtualConn.setCloseErr(fmt.Errorf("tunnel: could not generate a nonce: %w", authErr))
+						virtualConn.Close()
+						pumpCancel()
+						return
 					}
+					req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
 					req.Header.Set("X-Target", targetAddr)
 					req.Header.Set("X-Network", network)
 					req.Header.Set("X-Session-ID", sessionID)
@@ -871,18 +909,37 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						windowMu.Unlock()
 						atomic.StoreInt32(&triggerRetry, 1)
 
-						// Credential rejections will not fix themselves on a retry;
-						// surface them as a typed tunnel death with the real cause.
-						if resp.StatusCode == http.StatusProxyAuthRequired || resp.StatusCode == http.StatusUnauthorized {
+						// Credential and policy rejections will not fix themselves on a
+						// retry. The 403 belongs here too: the allowlist runs before a
+						// session is registered, so there is nothing to poll and every
+						// retry hits the same refusal. 429 and 504 below stay
+						// recoverable because those are transient edge states.
+						//
+						// Closing the virtual conn is what actually stops the pump: a
+						// bare worker return only exits this goroutine, and the loop
+						// below respawns the whole worker set and the refusal comes
+						// straight back (up to 7 restarts, up to 30s of backoff each).
+						if resp.StatusCode == http.StatusProxyAuthRequired ||
+							resp.StatusCode == http.StatusUnauthorized ||
+							resp.StatusCode == http.StatusForbidden {
 							if cfg.events != nil {
-								cfg.events.emit(TunnelDied{SessionID: sessionID, Target: targetAddr, Network: network, Reason: "auth rejected", Detail: string(bodyErr)})
+								if resp.StatusCode == http.StatusForbidden {
+									cfg.events.emit(TargetDenied{SessionID: sessionID, Target: targetAddr, Network: network})
+									cfg.events.emit(TunnelDied{SessionID: sessionID, Target: targetAddr, Network: network, Reason: "target denied", Detail: string(bodyErr)})
+								} else {
+									cfg.events.emit(TunnelDied{SessionID: sessionID, Target: targetAddr, Network: network, Reason: "auth rejected", Detail: string(bodyErr)})
+								}
 							}
-							resp.Body.Close()
+							logger.Warn("❌ [Pump] server refused the request, closing the tunnel",
+								zap.String("session", sessionID),
+								zap.Int("status", resp.StatusCode),
+								zap.String("error_body", string(bodyErr)),
+							)
+							virtualConn.setCloseErr(fmt.Errorf("tunnel: server refused the request (HTTP %d)", resp.StatusCode))
+							virtualConn.Close()
+							pumpCancel()
 							bytesBufPool.Put(downBuf)
 							return
-						}
-						if resp.StatusCode == http.StatusForbidden && cfg.events != nil {
-							cfg.events.emit(TargetDenied{SessionID: sessionID, Target: targetAddr, Network: network})
 						}
 
 						// 504 (Gateway Timeout) / 524 (Cloudflare Timeout) are normal
@@ -1184,6 +1241,30 @@ type DialConfig struct {
 	// watchdog, cached per endpoint), "poll" forces the legacy long-poll
 	// mode, "stream" forces the streaming downlink. See README.
 	StreamMode string
+	// Brutal configures TCP Brutal on this client's TCP tunnel sockets, and
+	// with it the bandwidth exchange that lets each side advertise how fast
+	// it can ingest. ClientConfig.Brutal in the SDK path.
+	Brutal BrutalConfig
+
+	// bwRateFn returns the ingest capacity the peer advertised in the last
+	// bandwidth exchange, in bytes/s. Zero means no exchange has succeeded
+	// yet. Unexported: it is wired by NewClient from the client's own state,
+	// and a hand-built config leaves it nil, which reads as zero.
+	bwRateFn func() uint64
+
+	// brutalWarns deduplicates the per-socket failure messages across every
+	// pooled connection this client opens. One gate per config, so a missing
+	// kernel module is reported once rather than once per connection.
+	brutalWarns *warnGate
+}
+
+// bwRate reports the rate negotiated with the peer, if any. It is the value
+// the dial path merges against the configured ceiling.
+func (c *DialConfig) bwRate() uint64 {
+	if c.bwRateFn == nil {
+		return 0
+	}
+	return c.bwRateFn()
 }
 
 // lg returns the per-client logger, falling back to the package default when
@@ -1201,8 +1282,10 @@ type ClientConfig struct {
 	// ServerURL is the xhttptunnel server endpoint, e.g.
 	// "https://cdn.example.com:8443/stream".
 	ServerURL string
-	// PSK is the pre-shared token the server expects (Proxy-Authorization /
-	// X-Auth-Token). Empty disables authentication.
+	// PSK is the pre-shared key. It is never sent: each request carries a
+	// fresh nonce plus its HMAC-SHA256 over the nonce, session id and target,
+	// so a captured request leaks nothing and cannot be replayed. Empty
+	// disables authentication.
 	PSK string
 	// SNI overrides the TLS SNI. Empty derives it from ServerURL's host.
 	SNI string
@@ -1253,6 +1336,11 @@ type ClientConfig struct {
 	// ChunkSizeKB caps each upstream HTTP request body for this client.
 	// Zero uses the package default configured by SetChunkSizeKB.
 	ChunkSizeKB int
+	// Brutal configures TCP Brutal on the client's TCP tunnel sockets.
+	// Invalid combinations are rejected by NewClient. HTTP/3 sessions run over
+	// QUIC/UDP, which brutal does not cap, so the setting has no effect on
+	// them; the bandwidth exchange is skipped for a pure-h3 client.
+	Brutal BrutalConfig
 }
 
 // Client is an embeddable xhttptunnel client.
@@ -1280,6 +1368,21 @@ type Client struct {
 	// MaxConns budget covers both.
 	dialCount atomic.Int64
 
+	// bwNegotiated is the ingest capacity the server advertised in the last
+	// successful bandwidth exchange, in bytes/s. Zero means nothing has been
+	// negotiated, so the configured rate stands alone.
+	bwNegotiated atomic.Uint64
+	// bwDone is set once an exchange fails because the server does not
+	// implement it. The loop is never retried after that, so a client pointed
+	// at an older server spends at most one session on the probe per process.
+	bwDone atomic.Bool
+	// bwBusy is 1 while one exchange attempt is in flight, so a dial burst
+	// cannot fan the probe out into many concurrent requests.
+	bwBusy atomic.Int32
+	// bwLastAttempt is the Unix second of the last attempt, which throttles
+	// the exchange to at most one per bw_interval regardless of dial volume.
+	bwLastAttempt atomic.Int64
+
 	// events delivers typed lifecycle/session events to the embedder.
 	events *eventHub
 
@@ -1298,6 +1401,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		// Fail loudly: a typo here would silently disable (or force) the
 		// streaming downlink with no other symptom.
 		return nil, fmt.Errorf("tunnel: invalid StreamMode %q (want \"\", \"auto\", \"poll\" or \"stream\")", cfg.StreamMode)
+	}
+	if err := cfg.Brutal.Validate("client"); err != nil {
+		return nil, err
 	}
 	if cfg.ServerURL == "" {
 		return nil, fmt.Errorf("tunnel: ServerURL is required")
@@ -1356,8 +1462,18 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		TransportKey:           transportKey,
 		ChunkSizeKB:            cfg.ChunkSizeKB,
 		StreamMode:             cfg.StreamMode,
+		Brutal:                 cfg.Brutal,
+		bwRateFn:               func() uint64 { return c.bwNegotiated.Load() },
+		brutalWarns:            newWarnGate(),
 		events:                 c.events,
 		log:                    cfg.Logger,
+	}
+
+	if cfg.Brutal.Enabled && !brutalAvailable() {
+		// brutal's syscalls are Linux-only, so on any other platform the
+		// per-connection hook is never installed at all. Say so once at startup
+		// instead of once per pooled connection.
+		c.lg().Warn("⚠️ [TCP] TCP Brutal is configured but it is only available on Linux; the tunnel runs without it")
 	}
 
 	logger.Debug("🔧 client configuration initialised", zap.String("SNI", sni), zap.String("Host", host), zap.String("Target", cfg.Target), zap.String("ALPN", alpn), zap.String("CertificateFingerprint", cfg.Fingerprint))
@@ -1438,6 +1554,13 @@ func (c *Client) dialTracked(ctx context.Context, network, addr string) (net.Con
 	default:
 		return nil, fmt.Errorf("tunnel: unsupported network %q (want tcp or udp)", network)
 	}
+	// A tunnel dial is the moment to refresh a negotiated bandwidth: the
+	// client is provably alive and a socket is about to be opened, which is
+	// exactly when the value matters. Non-blocking by contract — see
+	// maybeBwExchange — so this never adds latency to the dial.
+	if c.dialCfg.Brutal.bwCapable() {
+		c.maybeBwExchange(ctx)
+	}
 	for {
 		n := c.dialCount.Add(1)
 		if n <= int64(c.maxConns) {
@@ -1464,6 +1587,192 @@ func (c *Client) dialTracked(ctx context.Context, network, addr string) (net.Con
 		}()
 	}
 	return tracked, nil
+}
+
+// maybeBwExchange starts a bandwidth exchange if one is due, and returns
+// immediately. The exchange is a full request round trip and a tunnel dial
+// must not wait for it, so it runs on its own goroutine. bw_busy keeps at
+// most one attempt in flight, and bw_last_attempt caps the cadence at
+// bw_interval no matter how many dials arrive.
+//
+// This is deliberately a per-dial check rather than a ticker goroutine:
+// nothing needs a negotiated rate while the client is idle, so an idle client
+// leaks no goroutine and spends no sessions. A client that keeps tunneling
+// therefore re-negotiates naturally, at least once per bw_interval.
+func (c *Client) maybeBwExchange(ctx context.Context) {
+	if c.bwDone.Load() {
+		return
+	}
+	interval := time.Duration(c.dialCfg.Brutal.BWInterval) * time.Second
+	if time.Since(time.Unix(c.bwLastAttempt.Load(), 0)) < interval {
+		return
+	}
+	if !c.bwBusy.CompareAndSwap(0, 1) {
+		return
+	}
+	// Re-check after winning the race: a concurrent dial may have started the
+	// attempt while this one was deciding.
+	if time.Since(time.Unix(c.bwLastAttempt.Load(), 0)) < interval {
+		c.bwBusy.Store(0)
+		return
+	}
+	c.bwLastAttempt.Store(time.Now().Unix())
+	go func() {
+		defer c.bwBusy.Store(0)
+		if !c.doBwExchange(ctx) {
+			c.bwDone.Store(true)
+		}
+	}()
+}
+
+// doBwExchange runs one bandwidth exchange and applies the result. It
+// reports whether the loop should be attempted again: false means the server
+// will never answer one and further attempts are pure waste.
+//
+// The two failure classes are kept apart on purpose. A request that did not
+// even complete — server unreachable, timeout, nonce entropy broken — may
+// recur, so the loop survives it and retries after bw_interval. A request that
+// completed but was not an exchange is permanent: an older server rejects
+// TargetBwExchange like any unparseable target, so retrying it can only burn
+// sessions.
+func (c *Client) doBwExchange(ctx context.Context) bool {
+	cfg := c.dialCfg
+	logger := c.lg()
+	bc := cfg.Brutal
+
+	ctx, cancel := context.WithTimeout(ctx, bwExchangeTimeout)
+	defer cancel()
+	if c.isClosed() {
+		return false
+	}
+
+	isTLS, hostPort, reqURL := serverEndpoint(c.serverURL, cfg.Path)
+	nextProtos := buildNextProtos(cfg.ALPN)
+
+	protocol, err := detectProtocol(ctx, cfg, nextProtos, isTLS, hostPort)
+	if err != nil {
+		return true // unreachable: transient
+	}
+	if protocol == "h3" {
+		// HTTP/3 tunnels run over QUIC/UDP and brutal caps TCP sockets, so
+		// there is nothing here to negotiate a rate for. Not a failure.
+		return true
+	}
+	rt, _ := selectTransport(protocol, cfg, nextProtos, isTLS, hostPort)
+	if rt == nil {
+		return true
+	}
+
+	sessionID := generateRandomHex(16)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, http.NoBody)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "identity")
+	// Deliberately not sending a stream request type: the exchange branch on
+	// the server runs before stream-mode dispatch, and advertising a type the
+	// handler ignores would only be a wasted byte.
+	if cfg.Host != "" {
+		req.Host = cfg.Host
+	} else if cfg.SNI != "" {
+		req.Host = cfg.SNI
+	}
+	req.Header.Set("User-Agent", clientUserAgent)
+	if bc.BWAdvertise > 0 {
+		req.Header.Set(BwHeader, strconv.FormatUint(bc.BWAdvertise, 10))
+	}
+	// The existing signed-nonce auth covers the special target with no change:
+	// the signature binds the target string, and TargetBwExchange is exactly
+	// what the server will read back out of X-Target.
+	if err := setAuthHeaders(req, cfg.Password, sessionID, TargetBwExchange); err != nil {
+		logger.Error("❌ [BW] could not draw a nonce for the bandwidth exchange", zap.Error(err))
+		return false
+	}
+	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
+	req.Header.Set("X-Target", TargetBwExchange)
+	req.Header.Set("X-Network", "tcp")
+	req.Header.Set("X-Session-ID", sessionID)
+
+	resp, err := (&http.Client{Transport: rt, Timeout: bwExchangeTimeout}).Do(req)
+	if err != nil {
+		return true // unreachable: transient
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		// A non-200 means the server rejected the special target as an
+		// ordinary address, which is what an older server does. Never retry.
+		logger.Warn("⚠️ [BW] the server does not support the bandwidth exchange; keeping the configured rate",
+			zap.Int("status", resp.StatusCode))
+		return false
+	}
+	if !hasBrutalBwCap(resp.Header.Get(CapsHeader)) {
+		logger.Warn("⚠️ [BW] the server answered an exchange request without advertising the capability; not retrying",
+			zap.Int("status", resp.StatusCode))
+		return false
+	}
+	advertised := resp.Header.Get(BwHeader)
+	if advertised == "" {
+		// The server implemented the protocol but declined to advertise.
+		// Nothing to apply; the exchange itself succeeded.
+		return true
+	}
+	v, ok := parseBwValue(advertised)
+	if !ok {
+		logger.Warn("⚠️ [BW] ignoring an invalid bandwidth advertisement", zap.String("value", advertised))
+		return true
+	}
+	c.applyBw(v)
+	return true
+}
+
+// applyBw records a peer's advertised ingest capacity and applies the rate it
+// results in. The configured rate stays a ceiling (mergeBrutalRate), so a
+// peer can only lower the send rate, never raise it.
+//
+// Reaching existing sockets is indirect: the transport pools own them. A
+// brutal group shares its rate across members, so one setsockopt on any member
+// updates them all, and a freshly dialled connection reads bwNegotiated and
+// applies the new value — which is what pushes the group. Without a group every
+// connection carries its own rate, so the idle ones have to be dropped and
+// redialled. Either way the update is best effort: a connection mid-transfer
+// keeps the rate it was opened with until it is recycled.
+func (c *Client) applyBw(advertised uint64) {
+	effective := mergeBrutalRate(c.dialCfg.Brutal.Rate, advertised)
+	if effective == 0 {
+		return
+	}
+	if advertised == c.bwNegotiated.Swap(advertised) {
+		return // unchanged: nothing to push
+	}
+	logger := c.lg()
+	if ce := logger.Check(zap.InfoLevel, "📶 [BW] applied bandwidth negotiated with the server"); ce != nil {
+		ce.Write(
+			zap.Uint64("peer_advertised", advertised),
+			zap.Uint64("configured_ceiling", c.dialCfg.Brutal.Rate),
+			zap.Uint64("effective_rate", effective),
+			zap.Uint64("group_id", c.dialCfg.Brutal.GroupID),
+		)
+	}
+	flushIdleTunnelConns()
+}
+
+// flushIdleTunnelConns drops the idle keep-alive sockets of every cached
+// transport so the next request redials them and picks up the rate that is in
+// force. Only idle sockets are closed; a connection carrying a session in
+// flight is left exactly as it is.
+func flushIdleTunnelConns() {
+	transportMu.Lock()
+	defer transportMu.Unlock()
+	for _, rt := range transportCache {
+		if flusher, ok := rt.(interface{ CloseIdleConnections() }); ok {
+			flusher.CloseIdleConnections()
+		}
+	}
 }
 
 // trackedConn releases its MaxConns slot exactly once — either when the

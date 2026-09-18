@@ -236,8 +236,20 @@ const defaultMaxSessions = 2000
 // single place to change when a frame-format revision lands; clients refuse
 // servers that report a newer generation rather than corrupting silently.
 const (
-	ProtoHeader        = "X-XHTTP-Proto"
+	ProtoHeader = "X-XHTTP-Proto"
+	// tunnelProtoVersion names the frame generation the X-XHTTP-Proto header
+	// carries. Servers advertise it and clients refuse a newer one, so it only
+	// moves when the frame layout changes.
 	tunnelProtoVersion = 1
+	// offeredProtoVersion is the generation a current client announces. It
+	// tracks tunnelProtoVersion and additionally advances for changes that do
+	// not alter frames — the credential scheme in auth.go. MinProtoVersion
+	// gates on it, which is what lets an operator force the whole fleet onto
+	// the signed-nonce scheme by setting min_proto_version to 2. A client
+	// advertising 2 must send X-HTTP-Tunnel-MAC or it is refused outright
+	// (see authorize), so that gate cannot be satisfied by a downgraded
+	// credential.
+	offeredProtoVersion = 2
 )
 
 // errProtoTooNew reports a server speaking a protocol generation this client
@@ -305,6 +317,10 @@ type serverState struct {
 	// minProto rejects requests whose advertised X-XHTTP-Proto is below this
 	// (0 = accept everything, including legacy clients that send no header).
 	minProto int
+	// nonces absorbs replayed signed requests. It is shared by every handler
+	// of this server, which is what makes the replay window a property of the
+	// server rather than of one request goroutine.
+	nonces *nonceWindow
 	// stats are monotonic counters surfaced by Server.Stats and the optional
 	// health endpoint. Atomic so the read side never takes sessionsMu.
 	stats struct {
@@ -340,6 +356,26 @@ type serverState struct {
 	// these headers on ingress. Never enable it for direct public exposure.
 	trustProxy atomic.Bool
 
+	// brutalCfg is this server's TCP Brutal configuration; the zero value is
+	// inert. Only the TCP listener is affected, never the HTTP/3 socket.
+	brutalCfg BrutalConfig
+	// brutalWarns deduplicates the per-socket failure messages across every
+	// accepted connection.
+	brutalWarns *warnGate
+	// brutalMu guards brutalRates and brutalConns.
+	brutalMu sync.Mutex
+	// brutalRates holds the rate in force per connection group, in bytes/s.
+	// A brutal group's state lives in the kernel only while at least one
+	// member is open, so a group that empties and is then refilled would
+	// otherwise restart at the kernel's defaults; the table is what carries
+	// a negotiated value across that gap.
+	brutalRates map[uint64]uint64
+	// brutalConns remembers the newest member of each group so a rate change
+	// can be pushed to an existing connection rather than waiting for the
+	// next accept. Only the newest matters: applying the parameters to any
+	// one member updates the whole group.
+	brutalConns map[uint64]net.Conn
+
 	cleanerOnce sync.Once
 	stopOnce    sync.Once
 	// stopCleaner terminates the session reaper when closed. The package
@@ -365,6 +401,9 @@ func newServerState(maxSessions int) *serverState {
 		sessions:    make(map[string]*meekVirtualConn),
 		perIP:       make(map[string]int),
 		maxSessions: maxSessions,
+		nonces:      newNonceWindow(),
+		brutalRates: make(map[uint64]uint64),
+		brutalConns: make(map[uint64]net.Conn),
 		stopCleaner: make(chan struct{}),
 	}
 }
@@ -400,10 +439,20 @@ func SetTrustProxyHeaders(trust bool) { defaultServerState.trustProxy.Store(trus
 func TrustProxyHeaders() bool { return defaultServerState.trustProxy.Load() }
 
 // TargetAllowed reports whether a client-requested forwarding target may be
-// dialed under the default state's allowlist.
+// dialed under the default state's allowlist, without protocol information.
+// A scheme-restricted entry ("tcp://host:port") can therefore never be
+// satisfied here; use TargetAllowedOn when the protocol is known.
 // Deprecated: configures the shared low-level ListenXHTTP state; use
 // ServerConfig.AllowedTargets / ServerConfig.TrustProxyHeaders instead.
-func TargetAllowed(target string) bool { return defaultServerState.targetAllowed(target) }
+func TargetAllowed(target string) bool { return defaultServerState.targetAllowed(target, "") }
+
+// TargetAllowedOn is TargetAllowed with the protocol the client asked for, so
+// a "tcp://host:port" entry can be honoured.
+// Deprecated: configures the shared low-level ListenXHTTP state; use
+// ServerConfig.AllowedTargets / ServerConfig.TrustProxyHeaders instead.
+func TargetAllowedOn(target, network string) bool {
+	return defaultServerState.targetAllowed(target, network)
+}
 
 func (st *serverState) setAllowedTargets(targets []string) {
 	if len(targets) == 0 {
@@ -422,26 +471,123 @@ func (st *serverState) currentAllowedTargets() []string {
 	return *targets
 }
 
+// targetPattern is one allowed_targets entry: an optional protocol restriction
+// plus a host and port, each of which may be empty or "*" to mean "any".
+// valid distinguishes a parsed entry from one that could not be parsed at all;
+// an empty pattern is "any host, any port", so without the flag a typo would
+// have been the widest rule in the list instead of a dead one.
+type targetPattern struct {
+	valid   bool
+	network string
+	host    string
+	port    string
+}
+
+// splitTargetScheme separates a "tcp://" prefix from its authority. An address
+// without a scheme returns an empty scheme and the input unchanged.
+func splitTargetScheme(s string) (scheme, authority string) {
+	if before, after, found := strings.Cut(s, "://"); found && before != "" {
+		return strings.ToLower(before), after
+	}
+	return "", s
+}
+
+// splitHostPortAny splits a bare address into host and port. A missing host or
+// port stays empty, so ":53", "1.2.3.4:" and a bare "db" all parse; bracketed
+// IPv6 is handled. ok is false only for an empty or malformed input.
+func splitHostPortAny(addr string) (host, port string, ok bool) {
+	if addr == "" {
+		return "", "", false
+	}
+	if strings.HasPrefix(addr, "[") {
+		end := strings.Index(addr, "]")
+		if end < 0 {
+			return "", "", false
+		}
+		rest := addr[end+1:]
+		if rest == "" {
+			return addr[1:end], "", true
+		}
+		if strings.HasPrefix(rest, ":") {
+			return addr[1:end], rest[1:], true
+		}
+		return "", "", false
+	}
+	i := strings.LastIndex(addr, ":")
+	if i < 0 {
+		return addr, "", true
+	}
+	return addr[:i], addr[i+1:], true
+}
+
+// targetPatternOf parses an allowed_targets entry. "tcp://1.2.3.4:80" applies
+// to TCP only; a bare "1.2.3.4:80" applies to either protocol, which is what
+// keeps every existing config behaving exactly as it did. An omitted host or
+// port, or "*", means "any". A colon is mandatory: "1.2.3.4:" means any port
+// on that host and "db" would be ambiguous between a host and a forgotten port
+// number, so an entry without a colon matches nothing rather than looking
+// active. Anything unparseable parses to an entry that matches nothing, so a
+// typo cannot widen the policy.
+func targetPatternOf(entry string) targetPattern {
+	p := targetPattern{}
+	if scheme, authority := splitTargetScheme(entry); scheme != "" {
+		p.network = scheme
+		entry = authority
+	}
+	if entry == "" || entry == "*" {
+		return targetPattern{valid: true, network: p.network}
+	}
+	if !strings.Contains(entry, ":") {
+		return targetPattern{}
+	}
+	host, port, ok := splitHostPortAny(entry)
+	if !ok {
+		return targetPattern{}
+	}
+	return targetPattern{valid: true, network: p.network, host: host, port: port}
+}
+
+// patternMatches reports whether a resolved target satisfies pattern.
+func patternMatches(p targetPattern, network, host, port string) bool {
+	if !p.valid {
+		return false
+	}
+	if p.network != "" && p.network != network {
+		return false
+	}
+	if p.host != "" && p.host != "*" && p.host != host {
+		return false
+	}
+	if p.port != "" && p.port != "*" && p.port != port {
+		return false
+	}
+	return true
+}
+
 // targetAllowed reports whether a client-requested forwarding target may be
-// dialed. Allowlist entries support three forms: "host:port" (exact),
-// ":port" (any host on that port) and "host:" (any port on that host).
-func (st *serverState) targetAllowed(target string) bool {
+// dialed on network. Entries carry an optional "tcp://" or "udp://" prefix and
+// one of three address forms: "host:port" (exact), ":port" (any host on that
+// port) or "host:" (any port on that host); "*" is shorthand for both being
+// any. A scheme restricts the protocol; an absent scheme matches either, so a
+// bare entry keeps matching whatever protocol the client asked for.
+func (st *serverState) targetAllowed(target, network string) bool {
 	targets := st.currentAllowedTargets()
 	if len(targets) == 0 {
 		return true
+	}
+	// A scheme on the target must not be able to dodge the allowlist: resolve
+	// it away before comparing.
+	_, authority := splitTargetScheme(target)
+	host, port, ok := splitHostPortAny(authority)
+	if !ok {
+		return false
 	}
 	for _, entry := range targets {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
-		if strings.HasSuffix(entry, ":") && strings.HasPrefix(target, entry) {
-			return true
-		}
-		if strings.HasPrefix(entry, ":") && strings.HasSuffix(target, entry) {
-			return true
-		}
-		if target == entry {
+		if patternMatches(targetPatternOf(entry), network, host, port) {
 			return true
 		}
 	}
@@ -652,5 +798,76 @@ func (st *serverState) sweepAllSessions() {
 
 	for _, v := range victims {
 		v.Close()
+	}
+}
+
+// groupRate returns the rate in force for a connection group, falling back to
+// the configured static rate. The table wins: it holds a value negotiated by
+// the bandwidth exchange, which is newer than anything in the config file.
+func (st *serverState) groupRate(groupID uint64, configured uint64) uint64 {
+	st.brutalMu.Lock()
+	defer st.brutalMu.Unlock()
+	if v, ok := st.brutalRates[groupID]; ok {
+		return v
+	}
+	return configured
+}
+
+// noteGroupConn remembers the newest member of a connection group so a later
+// rate change can be pushed to an existing connection. Only the newest one
+// matters: applying the parameters to any member updates the whole group in
+// the kernel.
+func (st *serverState) noteGroupConn(groupID uint64, c net.Conn) {
+	st.brutalMu.Lock()
+	defer st.brutalMu.Unlock()
+	st.brutalConns[groupID] = c
+}
+
+// setGroupRate records the rate in force for a group and pushes it to the
+// newest member of that group, which updates the whole group. A group with no
+// remembered member — empty because its connections closed — only gets the
+// value from the table on its next accept.
+func (st *serverState) setGroupRate(groupID uint64, rate uint64) {
+	if rate == 0 {
+		return
+	}
+	st.brutalMu.Lock()
+	st.brutalRates[groupID] = rate
+	conn, ok := st.brutalConns[groupID]
+	st.brutalMu.Unlock()
+	if !ok {
+		return
+	}
+	applyBrutal(brutalParams{rate: rate, cwndGain: st.brutalCfg.CwndGain, groupID: groupID}, conn, st.brutalWarns, st.lg())
+}
+
+// newBrutalServerApplier returns the hook that wraps the TCP listener, or nil
+// when this server does not configure brutal. Each accepted connection gets
+// the rate in force for its group, so a group that survived across members
+// keeps the value the bandwidth exchange negotiated.
+//
+// The group id is keyed off the real TCP peer address. TrustProxyHeaders is
+// deliberately not honoured here: the kernel names a group by the connection,
+// so a spoofable proxy header would let a client choose its own group and
+// therefore its own aggregate ceiling.
+func (st *serverState) newBrutalServerApplier() func(net.Conn) {
+	if !st.brutalCfg.Enabled || !brutalAvailable() {
+		return nil
+	}
+	if st.brutalWarns == nil {
+		st.brutalWarns = newWarnGate()
+	}
+	cfg := st.brutalCfg
+	return func(c net.Conn) {
+		groupID := cfg.GroupID
+		if cfg.GroupFromRemote {
+			groupID = groupIDFromRemote(c.RemoteAddr().String())
+		}
+		st.noteGroupConn(groupID, c)
+		applyBrutal(brutalParams{
+			rate:     st.groupRate(groupID, cfg.Rate),
+			cwndGain: cfg.CwndGain,
+			groupID:  groupID,
+		}, c, st.brutalWarns, st.lg())
 	}
 }

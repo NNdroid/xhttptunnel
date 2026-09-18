@@ -225,6 +225,154 @@ func redactAuth(header string) string {
 	return fmt.Sprintf("%s <%d bytes>", scheme, len(token))
 }
 
+// describeAuth renders the credential a request presented, redacted. A v2
+// client sends no key at all, so Proxy-Authorization alone is "-": this
+// distinguishes a signed request from an unsigned one, which is what an
+// operator needs to see when debugging why a client was refused. The nonce is
+// logged verbatim because it is public by design — it is the value the replay
+// window is keyed on — while the digest is reduced to its byte length.
+func describeAuth(r *http.Request) string {
+	if mac := r.Header.Get(AuthMACHeader); mac != "" {
+		return fmt.Sprintf("signed nonce=%s mac=%d bytes", r.Header.Get(AuthNonceHeader), len(mac))
+	}
+	return redactAuth(r.Header.Get("Proxy-Authorization"))
+}
+
+// tunnelRequestHeaders is every header this protocol uses to carry session or
+// policy state. The fallback proxy forwards camouflage traffic to an external
+// site, so none of them may leave the origin. X-Auth-Token matters most: it
+// carries the bare pre-shared key (Proxy-Authorization is hop-by-hop and Go's
+// ReverseProxy already strips it, which is exactly why this duplicate exists),
+// and X-Target names the internal address clients are dialing through.
+var tunnelRequestHeaders = []string{
+	"X-Auth-Token",
+	AuthNonceHeader,
+	AuthMACHeader,
+	"X-Target",
+	"X-Network",
+	"X-Session-ID",
+	ProtoHeader,
+	"X-Seq",
+	"X-Ack",
+	"X-Retry",
+	"X-Downstream",
+	"X-Stream-Resume",
+}
+
+// scrubTunnelRequest strips protocol state before a request leaves the origin
+// through the fallback proxy. The body is emptied as well: it carries raw
+// tunnel frames, which a disguise site has no business parsing. The method is
+// kept so the forwarded request still looks like an ordinary web request.
+func scrubTunnelRequest(req *http.Request) {
+	for _, h := range tunnelRequestHeaders {
+		req.Header.Del(h)
+	}
+	if req.Body != nil && req.Body != http.NoBody {
+		_ = req.Body.Close()
+	}
+	req.Body = http.NoBody
+	req.ContentLength = 0
+	req.GetBody = nil
+}
+
+// authorize decides whether one request may use this tunnel. Two credential
+// shapes are accepted:
+//
+//   - v2, the signed path: X-HTTP-Tunnel-Nonce plus X-HTTP-Tunnel-MAC. The
+//     PSK never crosses the wire, and the nonce stops the request from being
+//     replayed. This is the only path a current client uses.
+//   - legacy, the bare path: the PSK itself in Proxy-Authorization or
+//     X-Auth-Token. Kept only so a fleet can be upgraded in place — servers
+//     first, clients after — instead of having to restart every client at once.
+//
+// Either credential is sufficient, so an in-flight session is not cut when its
+// endpoint is upgraded. To retire the legacy path set min_proto_version to 2:
+// a v2 client that does not sign is refused below rather than downgraded, so
+// that setting genuinely closes the bare-token hole.
+func (st *serverState) authorize(r *http.Request, expected string) bool {
+	if requiresMAC(r) {
+		// This client announced the signed generation, so it commits to it: the
+		// bare-token path is closed to it. Without this rule min_proto_version
+		// would be a gate with a hole — a v2 client could keep replayable
+		// credentials and still satisfy the minimum, so rotating the PSK would
+		// read as a success.
+		return st.authorizeByMAC(r, expected, r.Header.Get(AuthMACHeader))
+	}
+	if mac := r.Header.Get(AuthMACHeader); mac != "" {
+		// A legacy-generation client that still signs is a migration hybrid.
+		// Take the signature; if it is wrong, fall through to the bare token
+		// rather than treating it as a protocol error.
+		if st.authorizeByMAC(r, expected, mac) {
+			return true
+		}
+	}
+	return st.authorizeByToken(r, expected)
+}
+
+// requiresMAC reports whether a request announced the signed protocol
+// generation. A request that sends no X-XHTTP-Proto at all is a pre-v2 client
+// and is not held to it, which is what keeps the dual-mode window open.
+func requiresMAC(r *http.Request) bool {
+	v, err := strconv.Atoi(r.Header.Get(ProtoHeader))
+	return err == nil && v >= offeredProtoVersion
+}
+
+func (st *serverState) authorizeByMAC(r *http.Request, expected, mac string) bool {
+	nonce := r.Header.Get(AuthNonceHeader)
+	if !validAuthNonce(nonce) {
+		return false
+	}
+	// The session id and target are bound into the signature so a valid
+	// request cannot be replayed against a different session or aimed at a
+	// different address. They are read from the headers, not from local state,
+	// so the value verified here is exactly the value the dispatcher uses.
+	msg := authMessage(nonce, r.Header.Get("X-Session-ID"), r.Header.Get("X-Target"))
+	for _, tok := range splitTokens(expected) {
+		if tok == "" {
+			continue
+		}
+		if authMACMatches(tok, msg, mac) {
+			// Consume the nonce only after the signature checks out: a caller
+			// who cannot sign must not be able to fill the window and evict
+			// legitimate requests by flooding it.
+			return st.nonces.mark(nonce)
+		}
+	}
+	return false
+}
+
+func (st *serverState) authorizeByToken(r *http.Request, expected string) bool {
+	authHeader := r.Header.Get("Proxy-Authorization")
+	if authHeader == "" {
+		authHeader = r.Header.Get("Authorization")
+	}
+	customTokenHeader := r.Header.Get("X-Auth-Token")
+	for _, tok := range splitTokens(expected) {
+		if tok == "" {
+			continue
+		}
+		// Compared in constant time: a plain == short-circuits on the first
+		// differing byte, which hands an attacker a byte-at-a-time oracle on
+		// the shared secret.
+		if constTimeEqual(authHeader, "Bearer "+tok) ||
+			constTimeEqual(authHeader, tok) ||
+			constTimeEqual(customTokenHeader, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitTokens splits a configured PSK list on commas and trims each element.
+// Empty elements are left in place so callers can skip them explicitly.
+func splitTokens(expected string) []string {
+	parts := strings.Split(expected, ",")
+	for i, p := range parts {
+		parts[i] = strings.TrimSpace(p)
+	}
+	return parts
+}
+
 // buildSessionHandler assembles the Split-HTTP session handler: the mux that
 // authenticates polls, feeds the session registry and bridges long polls, plus
 // the fallback camouflage and panic/active middleware. It is shared by
@@ -240,6 +388,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			fallbackProxy.Director = func(req *http.Request) {
 				originalDirector(req)
 				req.Host = u.Host
+				scrubTunnelRequest(req)
 			}
 			logger.Info("🛡️ fallback camouflage site enabled", zap.String("target", fallbackURL))
 		} else {
@@ -268,10 +417,22 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 				zap.String("path", r.URL.Path),
 				zap.String("remote", clientIP),
 				zap.String("session", r.Header.Get("X-Session-ID")),
-				zap.String("auth", redactAuth(r.Header.Get("Proxy-Authorization"))),
+				zap.String("auth", describeAuth(r)),
 			)
 		}
 		if r.URL.Path != path {
+			// This branch is silent by default, so a client configured with the
+			// wrong path leaves no trace at all: the disguise site's status code
+			// (often 403) comes back and the client reports it as a target
+			// refusal. Debug level, because scanners hit non-tunnel paths
+			// constantly.
+			if ce := logger.Check(zap.DebugLevel, "🛡️ [HTTP] path mismatch, serving fallback camouflage"); ce != nil {
+				ce.Write(
+					zap.String("path", r.URL.Path),
+					zap.String("want", path),
+					zap.String("remote", clientIP),
+				)
+			}
 			if fallbackProxy != nil {
 				fallbackProxy.ServeHTTP(w, r)
 				return
@@ -295,6 +456,14 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		}
 
 		target := r.Header.Get("X-Target")
+		// A "tcp://" prefix is resolved away before both the allowlist check
+		// and the dial. Left in place the dialer would receive
+		// "tcp://host:port" and fail with "too many colons". The strip also
+		// means the prefix is dropped silently rather than honoured: the
+		// client's protocol comes from X-Network, never from the target's
+		// scheme, so gen-config refuses the prefix as decoration.
+		_, authority := splitTargetScheme(target)
+		target = authority
 		network := r.Header.Get("X-Network")
 		sessionID := r.Header.Get("X-Session-ID")
 
@@ -303,37 +472,32 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			nginxError(w, http.StatusBadRequest)
 			return
 		}
-		if xl.expectedToken != "" {
-			authHeader := r.Header.Get("Proxy-Authorization")
-			if authHeader == "" {
-				authHeader = r.Header.Get("Authorization")
-			}
-			customTokenHeader := r.Header.Get("X-Auth-Token")
-			tokens := strings.Split(xl.expectedToken, ",")
-			authed := false
-			for _, tok := range tokens {
-				cleanTok := strings.TrimSpace(tok)
-				if cleanTok == "" {
-					continue
-				}
-				// Compared in constant time: a plain == short-circuits on the
-				// first differing byte, which hands an attacker a byte-at-a-
-				// time oracle on the shared secret.
-				if constTimeEqual(authHeader, "Bearer "+cleanTok) ||
-					constTimeEqual(authHeader, cleanTok) ||
-					constTimeEqual(customTokenHeader, cleanTok) {
-					authed = true
-					break
-				}
-			}
-			if !authed {
-				logger.Warn("❌ [HTTP] rejected request: bad password or unauthorized",
-					zap.String("remote", r.RemoteAddr),
-				)
-				st.events.emit(AuthRejected{Remote: r.RemoteAddr, Path: r.URL.Path})
-				nginxError(w, http.StatusProxyAuthRequired)
+		if xl.expectedToken != "" && !st.authorize(r, xl.expectedToken) {
+			logger.Warn("❌ [HTTP] rejected request: bad password or unauthorized",
+				zap.String("remote", r.RemoteAddr),
+				zap.Bool("signed", r.Header.Get(AuthMACHeader) != ""),
+			)
+			st.events.emit(AuthRejected{Remote: r.RemoteAddr, Path: r.URL.Path})
+			nginxError(w, http.StatusProxyAuthRequired)
+			return
+		}
+
+		if target == TargetBwExchange {
+			if !st.brutalCfg.BWExchange {
+				// The server does not participate in the exchange. Answer like
+				// any unparseable target: the client probes once, sees a
+				// non-200 and disables itself instead of retrying forever.
+				nginxError(w, http.StatusNotFound)
 				return
 			}
+			// The exchange carries no tunnel data and dials no address, so it
+			// sits after authentication — the signed nonce binds this target
+			// like any other — and before attachOrCreateSession, whose
+			// allowlist is a policy for addresses, not protocol requests. It
+			// registers no session, so it does not consume MaxSessions or the
+			// per-IP budget.
+			st.handleBwExchange(w, r, clientIP)
+			return
 		}
 
 		// Lookup, policy check and registration must be atomic: the pump's
@@ -532,6 +696,54 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 	return panicRecoveryMiddleware(tracker.Middleware(mux))
 }
 
+// handleBwExchange serves the bandwidth exchange. The caller reports how fast
+// it can ingest, and this server applies that as its own send rate for the
+// caller's connection group; the response carries this server's advertised
+// ingest capacity in the same sense. Both sides converge on the slower link.
+//
+// The request registers no session: it opens no bridge and costs far less
+// than a poll, so it does not draw on the session budget. It is still
+// authenticated, and on the client side it is bounded by bw_interval, so the
+// exchange cannot be used to probe the server at high rate.
+func (st *serverState) handleBwExchange(w http.ResponseWriter, r *http.Request, clientIP string) {
+	logger := st.lg()
+	cfg := st.brutalCfg
+	groupID := cfg.GroupID
+	if cfg.GroupFromRemote {
+		groupID = groupIDFromRemote(r.RemoteAddr)
+	}
+	if raw := r.Header.Get(BwHeader); raw != "" {
+		v, ok := parseBwValue(raw)
+		if ok {
+			// The configured rate stays a ceiling, so a client can only lower
+			// this server's send rate for its own group, never raise it — which
+			// also bounds a hostile advertisement.
+			st.setGroupRate(groupID, mergeBrutalRate(cfg.Rate, v))
+		} else {
+			// Invalid or out of range. Keep the rate that is in force: applying
+			// zero would stall every connection in the group.
+			logger.Warn("⚠️ [BW] ignoring an invalid bandwidth advertisement",
+				zap.String("remote", clientIP), zap.String("value", raw))
+		}
+	}
+	if ce := logger.Check(zap.DebugLevel, "📶 [BW] served a bandwidth exchange"); ce != nil {
+		ce.Write(
+			zap.String("remote", clientIP),
+			zap.String("advertised", r.Header.Get(BwHeader)),
+			zap.Uint64("group_id", groupID),
+			zap.Uint64("rate", st.groupRate(groupID, cfg.Rate)),
+		)
+	}
+	w.Header().Set(CapsHeader, CapBrutalBw)
+	if cfg.BWAdvertise > 0 {
+		w.Header().Set(BwHeader, strconv.FormatUint(cfg.BWAdvertise, 10))
+	}
+	// One tiny request per bw_interval; there is no reason to keep the socket
+	// warm for it.
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(http.StatusOK)
+}
+
 // ListenXHTTP starts the low-level Split-HTTP server listener. It keeps the
 // historical process-global session registry and policy state; embedding
 // processes that want instance isolation should use [Server] instead. The
@@ -564,6 +776,13 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		ln, err := net.Listen("tcp", rListenAddr)
 		if err != nil {
 			return nil, err
+		}
+		// Wrapping the listener covers every TCP path that shares xl.ln —
+		// ServeTLS and the h2c Serve both accept from it — and it happens
+		// before the TLS handshake begins. Wrapping xl.uln would be wrong:
+		// brutal caps TCP sockets, not the QUIC path.
+		if apply := st.newBrutalServerApplier(); apply != nil {
+			ln = newBrutalListener(ln, apply)
 		}
 		xl.ln = ln
 		xl.srvTCP = true
@@ -734,9 +953,13 @@ type ServerConfig struct {
 	Listen string
 	// Path is the Split-HTTP endpoint path requests must hit.
 	Path string
-	// PSK is the pre-shared token. Clients present it as
-	// "Proxy-Authorization: Bearer <token>" or "X-Auth-Token". Comma-separated
-	// values accept multiple tokens. Empty disables authentication.
+	// PSK is the pre-shared key. A current client never sends it: it sends a
+	// fresh nonce plus its HMAC over the nonce, session id and target. A
+	// legacy client presents the key itself as "Proxy-Authorization: Bearer
+	// <token>" or "X-Auth-Token"; that path is still accepted so a fleet can
+	// be upgraded in place (servers first, clients after), and it is closed to
+	// any client that advertises protocol version 2. Comma-separated values
+	// accept multiple keys. Empty disables authentication.
 	PSK string
 	// CertFile/KeyFile enable TLS when both are set. Leave both empty for a
 	// cleartext origin (typically behind a TLS-terminating CDN).
@@ -756,11 +979,15 @@ type ServerConfig struct {
 	// request a specific target, in "tcp://host:port" form. Only used when
 	// Handler is nil.
 	DefaultTarget string
-	// AllowedTargets restricts which targets clients may request. Entries may
-	// be "host:port", ":port" (any host on that port) or "host:" (any port on
-	// that host). Empty allows everything. Enforcement happens when a session
-	// is created, so it applies to custom Handlers too — the built-in bridge
-	// and a Handler both only ever see allowlisted targets.
+	// AllowedTargets restricts which targets clients may request. Each entry
+	// may carry a "tcp://" or "udp://" prefix and one of three address forms:
+	// "host:port" (exact), ":port" (any host on that port) or "host:" (any
+	// port on that host); "*" means any. A scheme restricts the protocol the
+	// client asked for, so "tcp://192.168.1.10:" admits only TCP; an entry
+	// without a scheme admits either protocol. Empty allows everything.
+	// Enforcement happens when a session is created, so it applies to custom
+	// Handlers too — the built-in bridge and a Handler both only ever see
+	// allowlisted targets.
 	AllowedTargets []string
 	// TrustProxyHeaders makes client-address logging honour
 	// CF-Connecting-IP / X-Forwarded-For / X-Real-IP. Those headers are
@@ -787,6 +1014,14 @@ type ServerConfig struct {
 	HealthPath string
 	// Dump hex-dumps tunnelled traffic to stdout (debugging only).
 	Dump bool
+	// Brutal configures TCP Brutal on this server's accepted TCP connections.
+	// Invalid combinations are rejected by NewServer. The HTTP/3 socket is
+	// never affected: brutal caps TCP sockets, and QUIC is UDP.
+	//
+	// A static GroupID on a server would pool every client into one aggregate
+	// ceiling, which is a global rate cap rather than a per-client one; set
+	// GroupFromRemote instead to derive a group from the peer's address.
+	Brutal BrutalConfig
 	// Logger is the per-instance logger: every log line this server emits goes
 	// here, independently of other servers in the process. Nil inherits the
 	// package logger (see SetLogger). This no longer swaps the global logger.
@@ -840,6 +1075,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Path == "" {
 		cfg.Path = "/stream"
 	}
+	if err := cfg.Brutal.Validate("server"); err != nil {
+		return nil, err
+	}
 
 	certFile, keyFile := cfg.CertFile, cfg.KeyFile
 	var certDir string
@@ -869,6 +1107,22 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	state.maxPerIP = cfg.MaxSessionsPerIP
 	state.minProto = cfg.MinProtoVersion
 	state.healthPath = cfg.HealthPath
+	state.brutalCfg = cfg.Brutal
+	if cfg.Brutal.Enabled {
+		state.brutalWarns = newWarnGate()
+		if !brutalAvailable() {
+			// brutal's syscalls are Linux-only, so on any other platform the
+			// listener is never even wrapped. Say so once rather than per
+			// accepted connection.
+			state.lg().Warn("⚠️ [TCP] TCP Brutal is configured but it is only available on Linux; the server runs without it")
+		}
+		if cfg.Brutal.GroupID != 0 && !cfg.Brutal.GroupFromRemote && cfg.Brutal.BWExchange {
+			// A static group pools every client into one aggregate ceiling, so
+			// one client's exchange updates the whole pool. Per-client
+			// isolation needs group_from_remote.
+			state.lg().Warn("⚠️ [TCP] a static brutal.group_id pools every client into one rate ceiling; the bandwidth exchange will update all of them. Use group_from_remote for per-client isolation")
+		}
+	}
 
 	s := &Server{cfg: cfg, state: state, certDir: certDir}
 	if cfg.DefaultTarget != "" {

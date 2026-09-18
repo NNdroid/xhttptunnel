@@ -176,10 +176,10 @@ func TestServerStateIsolation(t *testing.T) {
 
 	st1.setAllowedTargets([]string{"127.0.0.1:22"})
 	st2.setAllowedTargets([]string{":8080"})
-	if !st1.targetAllowed("127.0.0.1:22") || st1.targetAllowed("10.0.0.1:8080") {
+	if !st1.targetAllowed("127.0.0.1:22", "tcp") || st1.targetAllowed("10.0.0.1:8080", "tcp") {
 		t.Error("st1 allowlist not honoured")
 	}
-	if !st2.targetAllowed("10.0.0.1:8080") || st2.targetAllowed("127.0.0.1:22") {
+	if !st2.targetAllowed("10.0.0.1:8080", "tcp") || st2.targetAllowed("127.0.0.1:22", "tcp") {
 		t.Error("st2 allowlist not honoured")
 	}
 
@@ -203,4 +203,85 @@ func TestServerStateIsolation(t *testing.T) {
 	// The default state must never be stopped by instance lifecycle calls.
 	st1.stop()
 	st2.stop()
+}
+
+func TestTargetAllowlistSchemes(t *testing.T) {
+	cases := []struct {
+		name      string
+		entries   []string
+		target    string
+		network   string
+		wantAllow bool
+	}{
+		// --- the five forms operators will actually type ---
+		{"tcp exact", []string{"tcp://example.com:443"}, "example.com:443", "tcp", true},
+		{"tcp exact blocks udp", []string{"tcp://example.com:443"}, "example.com:443", "udp", false},
+		{"udp any host on port", []string{"udp://:53"}, "10.0.0.5:53", "udp", true},
+		{"udp any host blocks other port", []string{"udp://:53"}, "10.0.0.5:54", "udp", false},
+		{"udp any host blocks tcp", []string{"udp://:53"}, "10.0.0.5:53", "tcp", false},
+		{"tcp any port on host", []string{"tcp://192.168.1.10:"}, "192.168.1.10:22", "tcp", true},
+		{"tcp any port blocks other host", []string{"tcp://192.168.1.10:"}, "192.168.1.11:22", "tcp", false},
+		{"tcp any port blocks udp", []string{"tcp://192.168.1.10:"}, "192.168.1.10:22", "udp", false},
+		{"tcp wildcard", []string{"tcp://*:"}, "93.184.216.34:443", "tcp", true},
+		{"tcp wildcard blocks udp", []string{"tcp://*:"}, "93.184.216.34:443", "udp", false},
+		{"udp wildcard", []string{"udp://*:"}, "93.184.216.34:53", "udp", true},
+		{"udp wildcard blocks tcp", []string{"udp://*:"}, "93.184.216.34:53", "tcp", false},
+
+		// --- scheme spelling must not be a bypass ---
+		{"scheme case insensitive", []string{"TCP://example.com:443"}, "example.com:443", "tcp", true},
+		{"unknown scheme is a no-op entry", []string{"grpc://example.com:443"}, "example.com:443", "tcp", false},
+
+		// --- bare entries keep working and match either protocol ---
+		{"bare exact", []string{"127.0.0.1:22"}, "127.0.0.1:22", "udp", true},
+		{"bare any port", []string{"127.0.0.1:"}, "127.0.0.1:2222", "tcp", true},
+		{"bare any host on port", []string{":8080"}, "10.0.0.1:8080", "udp", true},
+		{"bare port is not a prefix", []string{":8080"}, "10.0.0.1:80801", "tcp", false},
+		{"bare host is not a prefix", []string{"192.168.1.10:"}, "192.168.1.100:22", "tcp", false},
+		{"bare wildcard", []string{"*:"}, "anything:1", "tcp", true},
+		// A colon-less entry is ambiguous ("db" or a forgotten ":5432") and so
+		// matches nothing instead of looking like an active rule.
+		{"no colon matches nothing", []string{"db"}, "db:5432", "tcp", false},
+		{"no colon not a host either", []string{"db"}, "db", "tcp", false},
+		{"scheme without colon matches nothing", []string{"tcp://db"}, "db:5432", "tcp", false},
+		{"naked port number is not a rule", []string{"22"}, "127.0.0.1:22", "tcp", false},
+
+		// --- bracketed IPv6 ---
+		{"ipv6 exact", []string{"tcp://[::1]:22"}, "::1:22", "tcp", true},
+		{"ipv6 exact blocks udp", []string{"tcp://[::1]:22"}, "::1:22", "udp", false},
+		{"ipv6 any port", []string{"udp://[::1]:"}, "::1:53", "udp", true},
+		{"ipv6 pattern not a string match", []string{"tcp://[::1]:22"}, "127.0.0.1:22", "tcp", false},
+
+		// --- a scheme on the target must not dodge the list ---
+		{"target scheme stripped", []string{"127.0.0.1:22"}, "tcp://127.0.0.1:22", "tcp", true},
+		{"target scheme still denied", []string{"127.0.0.1:22"}, "tcp://10.0.0.1:22", "tcp", false},
+		{"target scheme vs tcp entry", []string{"tcp://127.0.0.1:22"}, "tcp://127.0.0.1:22", "tcp", true},
+
+		// --- fail closed ---
+		{"empty entry ignored", []string{""}, "127.0.0.1:22", "tcp", false},
+		{"whitespace entry ignored", []string{"   "}, "127.0.0.1:22", "tcp", false},
+		{"garbage entry matches nothing", []string{"not an address"}, "127.0.0.1:22", "tcp", false},
+		{"malformed target denied", []string{"*:"}, "", "tcp", false},
+		{"unknown network denied", []string{"tcp://*:"}, "127.0.0.1:22", "http", false},
+
+		// --- several entries, first match wins ---
+		{"or list", []string{"tcp://10.0.0.1:80", "udp://10.0.0.1:53"}, "10.0.0.1:53", "udp", true},
+		{"or list miss", []string{"tcp://10.0.0.1:80", "udp://10.0.0.1:53"}, "10.0.0.1:53", "tcp", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newServerState(8)
+			st.setAllowedTargets(tc.entries)
+			if got := st.targetAllowed(tc.target, tc.network); got != tc.wantAllow {
+				t.Errorf("allowed_targets=%v target=%q network=%q => %v, want %v",
+					tc.entries, tc.target, tc.network, got, tc.wantAllow)
+			}
+		})
+	}
+}
+
+func TestTargetAllowlistEmptyAllowsAll(t *testing.T) {
+	st := newServerState(8)
+	if !st.targetAllowed("10.0.0.1:22", "tcp") || !st.targetAllowed("10.0.0.1:53", "udp") {
+		t.Error("an empty allowlist must allow everything")
+	}
 }

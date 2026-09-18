@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -114,6 +115,10 @@ type FileConfig struct {
 	// socket peer. Those headers are spoofable, so keep this OFF unless the
 	// server is reachable only through a trusted CDN/proxy that strips them.
 	TrustProxyHeaders bool `json:"trust_proxy_headers"`
+	// Brutal configures TCP Brutal (Linux only) on the tunnel's TCP sockets.
+	// Nested object; see the "brutal" block in the sample configs. Disabled by
+	// default, so a config without this key behaves exactly as before.
+	Brutal tunnel.BrutalConfig `json:"brutal"`
 }
 
 func (fc *FileConfig) UnmarshalJSON(data []byte) error {
@@ -204,6 +209,7 @@ func runGenURI(args []string) {
 	target := fs.String("target", "", "Forward target")
 	psk := fs.String("psk", "", "PSK token")
 	sni := fs.String("sni", "", "SNI disguise")
+	fingerprint := fs.String("fingerprint", "", "Server certificate SHA-256 pin")
 	remark := fs.String("name", "", "Node remark name")
 	insecure := fs.Bool("insecure", true, "Skip TLS verify")
 	pin := fs.String("pin", "", "Share PIN (6 digits). Empty = auto-generate a random PIN")
@@ -211,6 +217,8 @@ func runGenURI(args []string) {
 
 	// The config file takes precedence over built-in defaults, but command-line
 	// flags can override any field of the config.
+	var certFile string
+	var selfSigned bool
 	if *cfgPath != "" {
 		if fileCfg, err := loadConfigFile(*cfgPath); err == nil {
 			// Prefer deriving the public host/port from the client config's server URL
@@ -239,6 +247,21 @@ func runGenURI(args []string) {
 			if *sni == "" && fileCfg.SNI != "" {
 				*sni = fileCfg.SNI
 			}
+			// A server config keeps its disguise domain as selfsign_cn rather
+			// than sni, so without this a share URI generated from
+			// config.server.json would carry no SNI at all and the client's TLS
+			// handshake to the origin would fail right after the scan. The one
+			// value feeds both the SNI and the HTTP Host disguise. The check is
+			// not gated on selfsign: a static cert paired with a selfsign_cn
+			// still wants that domain as its disguise.
+			if *sni == "" && fileCfg.SelfSignCN != "" {
+				*sni = fileCfg.SelfSignCN
+			}
+			if *fingerprint == "" && fileCfg.Fingerprint != "" {
+				*fingerprint = fileCfg.Fingerprint
+			}
+			certFile = fileCfg.Cert
+			selfSigned = fileCfg.SelfSign
 		}
 	}
 
@@ -259,7 +282,21 @@ func runGenURI(args []string) {
 		*remark = "XHTTPTunnel Node"
 	}
 
-	uri := tunnel.GenerateXHTTPTunnelURI(*host, *port, *path, *target, *psk, *sni, *remark, *pin, *insecure)
+	// A pin only helps for a certificate that stays put. A static cert file can
+	// be hashed right here. gen-uri never runs applyServerDefaults, so a
+	// selfsign-only config gives it nothing to hash: the pair the server writes
+	// beside the config file is invisible from here.
+	if *fingerprint == "" && certFile != "" {
+		if fp, err := tunnel.CertFingerprint(certFile); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not derive the certificate fingerprint from %s (%v); the URI carries no pin\n\n", certFile, err)
+		} else {
+			*fingerprint = fp
+		}
+	} else if selfSigned && *fingerprint == "" {
+		fmt.Fprintf(os.Stderr, "Warning: selfsign is on but cert is empty, so the URI carries no pin and gen-uri has nothing to hash. Point cert at the pair the server writes beside the config file, or pass -fingerprint.\n\n")
+	}
+
+	uri := tunnel.GenerateXHTTPTunnelURI(*host, *port, *path, *target, *psk, *sni, *fingerprint, *remark, *pin, *insecure)
 	fmt.Printf("=== 📱 xhttptunnel Sharing URI (encrypted stun://) ===\n\n%s\n", uri)
 	tunnel.PrintTerminalQR(uri)
 }
@@ -288,9 +325,11 @@ func applyClientDefaults(cfg *FileConfig) {
 
 // applyServerDefaults fills the structural defaults shared by the `server`
 // subcommand and the -c config.json bootstrap, including self-signed
-// certificate generation. PSK handling is left to the caller (see
-// applyClientDefaults for the rationale).
-func applyServerDefaults(cfg *FileConfig) error {
+// certificate generation. configPath is the file those defaults came from,
+// or "" for a flag-only run; it anchors where a generated certificate pair
+// is written. PSK handling is left to the caller (see applyClientDefaults
+// for the rationale).
+func applyServerDefaults(cfg *FileConfig, configPath string) error {
 	if cfg.Listen == "" {
 		cfg.Listen = ":8443"
 	}
@@ -303,18 +342,59 @@ func applyServerDefaults(cfg *FileConfig) error {
 	if cfg.Target == "" {
 		cfg.Target = "tcp://127.0.0.1:22"
 	}
-	if cfg.SelfSign && (cfg.Cert == "" || cfg.Key == "") {
+	if cfg.SelfSign {
 		cn := cfg.SelfSignCN
 		if cn == "" {
 			cn = "www.bing.com"
 		}
-		if err := tunnel.GenerateSelfSignedCert("cert.pem", "key.pem", cn); err != nil {
-			return fmt.Errorf("generate self-signed certificate: %w", err)
+
+		// The pair lands beside the config file, never in the process working
+		// directory: systemd starts the binary from wherever it pleases, so a
+		// CWD-relative name would scatter a private key and could not match
+		// the path a deployed config advertises. An explicitly configured
+		// cert/key path is honoured as the generation target, so selfsign and
+		// a fixed certificate location can be combined instead of excluded.
+		certPath, keyPath := cfg.Cert, cfg.Key
+		if certPath == "" || keyPath == "" {
+			dir := configDir(configPath)
+			if certPath == "" {
+				certPath = filepath.Join(dir, "cert.pem")
+			}
+			if keyPath == "" {
+				keyPath = filepath.Join(dir, "key.pem")
+			}
 		}
-		cfg.Cert = "cert.pem"
-		cfg.Key = "key.pem"
+
+		missing := func(p string) bool { _, err := os.Stat(p); return err != nil }
+		if missing(certPath) || missing(keyPath) {
+			if !missing(certPath) || !missing(keyPath) {
+				// Exactly one half exists. Generating would overwrite it, so
+				// refuse instead of destroying a certificate the operator has.
+				return fmt.Errorf("selfsign needs a complete certificate pair: %s and %s must both be present or both absent", certPath, keyPath)
+			}
+			if err := tunnel.GenerateSelfSignedCert(certPath, keyPath, cn); err != nil {
+				return fmt.Errorf("generate self-signed certificate: %w", err)
+			}
+		}
+		// A complete pair already exists, so it is reused as-is. Regenerating
+		// on every boot would change the certificate and break a client that
+		// pins it by fingerprint.
+		cfg.Cert, cfg.Key = certPath, keyPath
 	}
 	return nil
+}
+
+// configDir resolves the directory a self-signed pair is written into. A flag
+// driven run has no config file, so it falls back to the working directory —
+// the only directory such a run has.
+func configDir(path string) string {
+	if path == "" {
+		return "."
+	}
+	if d := filepath.Dir(path); d != "" {
+		return d
+	}
+	return "."
 }
 
 func loadConfigFile(path string) (*FileConfig, error) {
@@ -364,16 +444,20 @@ func main() {
 		runGenNginx(os.Args[2:])
 	case "gen-systemd":
 		runGenSystemd(os.Args[2:])
+	// gen-conf is the short spelling operators reach for; keep both so an
+	// already-learned muscle memory still works.
+	case "gen-config", "gen-conf", "gen-cfg":
+		runGenConfig(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Printf("xhttptunnel version %s\n", versionString())
 	case "help", "-h", "--help":
 		printUsage()
 	case "server":
-		cfg := resolveConfig(os.Args[2:])
+		cfg, cfgPath := resolveConfig(os.Args[2:])
 		initLogger(cfg.LogLevel)
 		defer logger.Sync()
 		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
-		if err := applyServerDefaults(cfg); err != nil {
+		if err := applyServerDefaults(cfg, cfgPath); err != nil {
 			logger.Fatal("❌ server failed to start", zap.Error(err))
 		}
 		if cfg.PSK == "" {
@@ -385,7 +469,7 @@ func main() {
 		startServer(ctx, cfg)
 
 	case "client":
-		cfg := resolveConfig(os.Args[2:])
+		cfg, _ := resolveConfig(os.Args[2:])
 		initLogger(cfg.LogLevel)
 		defer logger.Sync()
 		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
@@ -409,7 +493,7 @@ func main() {
 // FileConfig. The per-parameter command-line flags have been removed; the
 // configuration file is now the single source of truth, and built-in defaults
 // are applied per subcommand so the program still runs with zero configuration.
-func resolveConfig(args []string) *FileConfig {
+func resolveConfig(args []string) (*FileConfig, string) {
 	fs := flag.NewFlagSet("xhttptunnel", flag.ExitOnError)
 	cfgPath := fs.String("c", "", "Path to configuration file")
 	confPath := fs.String("config", "", "Path to configuration file")
@@ -429,7 +513,7 @@ func resolveConfig(args []string) *FileConfig {
 		cfg = fileCfg
 	}
 	applyEnvOverrides(cfg)
-	return cfg
+	return cfg, cp
 }
 
 // startClient builds a tunnel.Client from the resolved configuration and runs
@@ -447,6 +531,7 @@ func startClient(ctx context.Context, cfg *FileConfig) {
 		IdleTimeout: time.Duration(cfg.IdleTimeout) * time.Second,
 		StreamMode:  cfg.StreamMode,
 		Dump:        cfg.Dump,
+		Brutal:      cfg.Brutal,
 	})
 	if err != nil {
 		logger.Fatal("❌ client failed to start", zap.Error(err))
@@ -474,6 +559,7 @@ func startServer(ctx context.Context, cfg *FileConfig) {
 		HealthPath:        cfg.HealthPath,
 		MinProtoVersion:   cfg.MinProtoVersion,
 		Dump:              cfg.Dump,
+		Brutal:            cfg.Brutal,
 	})
 	if err != nil {
 		logger.Fatal("❌ server failed to start", zap.Error(err))
@@ -508,7 +594,7 @@ func runFromConfig(path string) {
 		startClient(ctx, cfg)
 	} else {
 		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
-		if err := applyServerDefaults(cfg); err != nil {
+		if err := applyServerDefaults(cfg, path); err != nil {
 			logger.Fatal("❌ server failed to start", zap.Error(err))
 		}
 		if isPlaceholderPSK(cfg.PSK) {
@@ -568,8 +654,9 @@ func printUsage() {
 	fmt.Println("  server       Start tunnel server")
 	fmt.Println("  client       Start tunnel client")
 	fmt.Println("  gen-uri      Generate Stun client sharing URI link & QR Code")
-	fmt.Println("  gen-nginx    Generate Nginx reverse proxy configuration snippet")
-	fmt.Println("  gen-systemd  Generate Linux systemd service configuration")
+	fmt.Println("  gen-config   Generate a server/client configuration file (alias gen-conf)")
+	fmt.Println("  gen-nginx    Generate Nginx reverse proxy configuration")
+	fmt.Println("  gen-systemd  Generate a hardened Linux systemd service configuration")
 	fmt.Println("  version      Show version information")
 	fmt.Println("  help         Show help message")
 }

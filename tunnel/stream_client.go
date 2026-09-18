@@ -60,6 +60,13 @@ var errStreamUnavailable = errors.New("tunnel: streaming downlink unavailable")
 // (HTTP 401/407). Retrying cannot help, so the tunnel aborts with this.
 var errAuthRejected = errors.New("tunnel: authentication rejected by server")
 
+// errTargetDenied reports that the server refused the session's target (HTTP
+// 403). attachOrCreateSession runs the allowlist before it registers the
+// session, so a poll retry cannot succeed — there is no session to poll and
+// the same refusal would come back. The dial aborts rather than degrading into
+// a long-poll loop against a 403.
+var errTargetDenied = errors.New("tunnel: target refused by server policy")
+
 // errProbeAborted means the local session was closed while the stream
 // negotiation was still probing — not a path verdict, so no cache write and
 // no failure accounting.
@@ -180,6 +187,18 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 			if errors.Is(err, errAuthRejected) {
 				virtualConn.setCloseErr(err)
 				a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "auth rejected", Detail: err.Error()})
+				return
+			}
+			if errors.Is(err, errTargetDenied) {
+				// A 403 must not reach the reconnect loop below: policy will not
+				// change while we sit here, and retrying just hammers the origin
+				// (or whatever fronts it) with refusals forever.
+				virtualConn.setCloseErr(err)
+				logger.Warn("❌ [Stream] target refused by the server, not reconnecting",
+					zap.String("session", a.sessionID),
+					zap.String("target", a.targetAddr),
+				)
+				a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "target denied", Detail: err.Error()})
 				return
 			}
 			if errors.Is(err, errServerSessionGone) {
@@ -305,7 +324,9 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		req.Header.Set("X-Ack", strconv.FormatUint(*lastDown, 10))
 		req.Header.Set("X-Retry", "1")
 	}
-	applyStreamRequestHeaders(req, a.cfg, a.targetAddr, a.network, a.sessionID)
+	if err := applyStreamRequestHeaders(req, a.cfg, a.targetAddr, a.network, a.sessionID); err != nil {
+		return false, err
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -325,6 +346,7 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		}
 		if resp.StatusCode == http.StatusForbidden {
 			a.events.emit(TargetDenied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Remote: resp.Request.RemoteAddr})
+			return false, errTargetDenied
 		}
 		return false, errStreamUnavailable
 	}
@@ -384,7 +406,10 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 			failRound(uerr)
 			return
 		}
-		applyStreamRequestHeaders(upReq, a.cfg, a.targetAddr, a.network, a.sessionID)
+		if err := applyStreamRequestHeaders(upReq, a.cfg, a.targetAddr, a.network, a.sessionID); err != nil {
+			failRound(err)
+			return
+		}
 		upReq.Header.Set("Content-Type", streamContentType)
 		upReq.Header.Set("X-Stream-Resume", "1")
 		upResp, uerr := client.Do(upReq)
@@ -645,7 +670,7 @@ func (a streamDialArgs) isolatedClient() *http.Client {
 
 // applyStreamRequestHeaders sets the headers shared by the streaming GET and
 // its companion POST (auth, camouflage, routing).
-func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, network, sessionID string) {
+func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, network, sessionID string) error {
 	req.Header.Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Accept", "*/*")
@@ -656,14 +681,14 @@ func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, n
 		req.Host = cfg.SNI
 	}
 	req.Header.Set("User-Agent", clientUserAgent)
-	if cfg.Password != "" {
-		req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Password)
-		// Proxy-Authorization is hop-by-hop and is commonly stripped by CDNs;
-		// the end-to-end header keeps authentication working behind them.
-		req.Header.Set("X-Auth-Token", cfg.Password)
+	// Signed credentials: the PSK itself never goes on the wire, so a captured
+	// request leaks nothing, and the per-request nonce makes replay a no-op.
+	if err := setAuthHeaders(req, cfg.Password, sessionID, targetAddr); err != nil {
+		return fmt.Errorf("tunnel: could not generate a nonce: %w", err)
 	}
 	req.Header.Set("X-Target", targetAddr)
 	req.Header.Set("X-Network", network)
 	req.Header.Set("X-Session-ID", sessionID)
-	req.Header.Set(ProtoHeader, strconv.Itoa(tunnelProtoVersion))
+	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
+	return nil
 }

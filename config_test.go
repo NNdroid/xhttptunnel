@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -272,27 +273,117 @@ func TestApplyClientDefaults(t *testing.T) {
 }
 
 func TestApplyServerDefaultsSelfSign(t *testing.T) {
-	// applyServerDefaults generates cert.pem/key.pem into the working
-	// directory — exactly the files a real selfsign deployment uses. Run the
-	// test in a throwaway directory so it can never clobber the repo's own
-	// certificates.
+	cases := []struct {
+		name     string
+		explicit bool
+		cfgPath  string
+		wantCert string
+		wantKey  string
+	}{
+		{
+			name:     "a flag-only run falls back to the working directory",
+			wantCert: "cert.pem",
+			wantKey:  "key.pem",
+		},
+		{
+			name:     "the pair is written beside the config file",
+			cfgPath:  "confdir/config.server.json",
+			wantCert: filepath.Join("confdir", "cert.pem"),
+			wantKey:  filepath.Join("confdir", "key.pem"),
+		},
+		{
+			name:     "a configured cert/key path is honoured as the generation target",
+			explicit: true,
+			cfgPath:  "confdir/config.server.json",
+			wantCert: filepath.Join("confdir", "cert.crt"),
+			wantKey:  filepath.Join("confdir", "cert.key"),
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Run in a throwaway directory so the test can never clobber the
+			// repo's own certificates.
+			work := t.TempDir()
+			t.Chdir(work)
+			// A config file's own directory exists in reality; create it so the
+			// generation target resolves the same way.
+			if tc.cfgPath != "" {
+				if err := os.MkdirAll(filepath.Dir(tc.cfgPath), 0700); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+			}
+
+			cert, key := "", ""
+			if tc.explicit {
+				cert, key = tc.wantCert, tc.wantKey
+			}
+			scfg := &FileConfig{SelfSign: true, SelfSignCN: "www.bing.com", Cert: cert, Key: key}
+			if err := applyServerDefaults(scfg, tc.cfgPath); err != nil {
+				t.Fatalf("applyServerDefaults: %v", err)
+			}
+			if scfg.Listen != ":8443" || scfg.Path != "/stream" || scfg.Target != "tcp://127.0.0.1:22" {
+				t.Errorf("server defaults mismatch: %+v", scfg)
+			}
+			if scfg.Cert != tc.wantCert || scfg.Key != tc.wantKey {
+				t.Errorf("selfsign paths = %q/%q, want %q/%q", scfg.Cert, scfg.Key, tc.wantCert, tc.wantKey)
+			}
+			for _, p := range []string{scfg.Cert, scfg.Key} {
+				if _, err := os.Stat(p); err != nil {
+					t.Errorf("selfsign did not write %s: %v", p, err)
+				}
+			}
+		})
+	}
+}
+
+// TestApplyServerDefaultsSelfSignReusesExistingPair pins the second half of
+// the "no hardcoded paths" fix: a deployment that wants a stable fingerprint
+// needs the same certificate on every boot, so an existing pair must be loaded
+// rather than regenerated over.
+func TestApplyServerDefaultsSelfSignReusesExistingPair(t *testing.T) {
 	t.Chdir(t.TempDir())
 
-	scfg := &FileConfig{SelfSign: true}
-	if err := applyServerDefaults(scfg); err != nil {
-		t.Fatalf("applyServerDefaults: %v", err)
+	cfg := &FileConfig{SelfSign: true, SelfSignCN: "www.bing.com"}
+	if err := applyServerDefaults(cfg, "config.server.json"); err != nil {
+		t.Fatalf("first boot: %v", err)
 	}
-	if scfg.Listen != ":8443" || scfg.Path != "/stream" || scfg.Target != "tcp://127.0.0.1:22" {
-		t.Errorf("server defaults mismatch: %+v", scfg)
+	fp1, err := tunnel.CertFingerprint(cfg.Cert)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
 	}
-	if scfg.Cert != "cert.pem" || scfg.Key != "key.pem" {
-		t.Errorf("selfsign files = %q/%q, want cert.pem/key.pem", scfg.Cert, scfg.Key)
+	first := *cfg
+
+	again := &FileConfig{SelfSign: true, SelfSignCN: "www.bing.com"}
+	if err := applyServerDefaults(again, "config.server.json"); err != nil {
+		t.Fatalf("second boot: %v", err)
 	}
-	if _, err := os.Stat(scfg.Cert); err != nil {
-		t.Errorf("selfsign did not write %s: %v", scfg.Cert, err)
+	if again.Cert != first.Cert || again.Key != first.Key {
+		t.Errorf("certificate paths moved between boots: %q/%q -> %q/%q", first.Cert, first.Key, again.Cert, again.Key)
 	}
-	if _, err := os.Stat(scfg.Key); err != nil {
-		t.Errorf("selfsign did not write %s: %v", scfg.Key, err)
+	fp2, err := tunnel.CertFingerprint(again.Cert)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	if fp1 != fp2 {
+		t.Errorf("the self-signed pair is not stable across restarts: %s -> %s", fp1, fp2)
+	}
+}
+
+func TestApplyServerDefaultsSelfSignRefusesHalfPair(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	cfg := &FileConfig{SelfSign: true, SelfSignCN: "www.bing.com"}
+	if err := applyServerDefaults(cfg, "config.server.json"); err != nil {
+		t.Fatalf("first boot: %v", err)
+	}
+	if err := os.Remove(cfg.Key); err != nil {
+		t.Fatalf("remove key: %v", err)
+	}
+
+	again := &FileConfig{SelfSign: true, SelfSignCN: "www.bing.com"}
+	if err := applyServerDefaults(again, "config.server.json"); err == nil {
+		t.Error("a half-present pair must be refused, not overwritten: regenerating would destroy the operator's certificate")
 	}
 }
 
@@ -311,3 +402,61 @@ func waitStarted(errCh <-chan error, grace time.Duration) error {
 // The config-file idle_timeout → client mapping is covered by
 // tunnel.TestNewClientDefaults; the structural default coverage lives in
 // TestApplyClientDefaults above.
+
+// captureStdout returns whatever fn printed to stdout. The reader must run in
+// its own goroutine: the QR code alone is ~57KB, which blocks fn() against the
+// pipe buffer before a sequential read would ever start.
+func captureStdout(fn func()) string {
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		return ""
+	}
+	done := make(chan []byte, 1)
+	go func() {
+		out, _ := io.ReadAll(r)
+		done <- out
+	}()
+	os.Stdout = w
+	fn()
+	_ = w.Close()
+	os.Stdout = old
+	return string(<-done)
+}
+
+// TestGenURIFromServerConfig covers the two ways a freshly installed server
+// produced a share link nobody could scan: the disguise domain stayed in
+// selfsign_cn and never reached the URI's SNI, and the target arrived as
+// "tcp://127.0.0.1:22" where the importer expects a bare address.
+func TestGenURIFromServerConfig(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.server.json")
+	cfg := `{
+		"mode": "server",
+		"listen": ":9443",
+		"path": "/stream",
+		"target": "tcp://127.0.0.1:22",
+		"psk": "shared-secret",
+		"selfsign": true,
+		"selfsign_cn": "www.sushiwei.com",
+		"fallback": "https://www.sushiwei.com"
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	out := captureStdout(func() {
+		runGenURI([]string{"-c", cfgPath, "-host", "1.2.3.4", "-port", "9443"})
+	})
+
+	if !strings.Contains(out, "sni=www.sushiwei.com") {
+		t.Errorf("the share URI carries no SNI from selfsign_cn")
+	}
+	if !strings.Contains(out, "1.2.3.4:9443") {
+		t.Errorf("the share URI lost the server address")
+	}
+	for _, bad := range []string{"tcp%3A%2F%2F", "tcp://127.0.0.1:22"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("the share URI leaks a scheme-prefixed target %q", bad)
+		}
+	}
+}

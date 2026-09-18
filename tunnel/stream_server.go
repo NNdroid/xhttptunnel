@@ -41,8 +41,9 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 	}
 
 	// Policy check happens before a session is registered, otherwise a
-	// rejected target would still leave a phantom session behind.
-	if !st.targetAllowed(target) {
+	// rejected target would still leave a phantom session behind. The protocol
+	// goes along so a "tcp://host:port" entry can be honoured.
+	if !st.targetAllowed(target, network) {
 		st.sessionsMu.Unlock()
 		lg.Warn("❌ [Server] refused connection: target not in allow list", zap.String("target", target), zap.String("remote", remoteAddr))
 		st.events.emit(TargetDenied{Target: target, Network: network, Remote: remoteAddr})
