@@ -1012,18 +1012,18 @@ type unitSystemdSpec struct {
 // path.Dir alone would leave Windows backslashes behind, which systemd reads as
 // escapes.
 //
-// The conversion comes first, because the splitter is the OS-independent
-// path.Dir, which only knows "/". A backslash is a legal filename byte on Unix,
-// so on a Unix host a path that is never converted holds no separator at all and
-// the result is ".".
+// Both calls are deliberately platform-independent, so the result is the same
+// on every host and the test is meaningful on any of them. The conversion must
+// be a blanket replacement rather than filepath.ToSlash, which is a no-op on
+// Unix: its Separator is already "/", so it would rewrite nothing on the host
+// the unit actually runs on. Splitting must be path.Dir rather than
+// filepath.Dir for the same reason.
 //
-// filepath.ToSlash is the right converter for exactly that reason: it rewrites
-// "\\", which is the real separator, on Windows, and is a no-op on Unix, where
-// a backslash is data rather than a separator and must be left alone. It is not
-// the splitter's business, which is why Dir is path.Dir rather than
-// filepath.Dir.
+// The cost is that a Unix path whose directory name really does contain a
+// backslash cannot round-trip; that is a rarer layout than a Windows path on a
+// Windows generator, which is the case this exists for.
 func linuxDir(p string) string {
-	return path.Dir(filepath.ToSlash(p))
+	return path.Dir(strings.ReplaceAll(p, `\`, "/"))
 }
 
 // sdQuote wraps an argument so systemd parses it as one token. Space, backslash

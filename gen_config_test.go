@@ -1012,14 +1012,13 @@ func TestLinuxDir(t *testing.T) {
 		}
 	}
 
-	// On a Unix host a backslash inside a path is a filename byte, not a
-	// separator, so the directory name must come back untouched. This only holds
-	// where the OS really treats it as data, which is why it is guarded. It pins
-	// filepath.ToSlash as the converter rather than a blanket replacement.
-	if runtime.GOOS != "windows" {
-		if got := linuxDir(`/opt/x\y/config.json`); got != `/opt/x\y` {
-			t.Errorf("linuxDir rewrote a backslash in a directory name: %q", got)
-		}
+	// A backslash is always treated as a separator, on every host. That is the
+	// only way a Windows path is recognised at all, and it is what a Unix
+	// directory name that genuinely contains a backslash has to pay for: it
+	// does not round-trip through here. Asserted unconditionally, because both
+	// halves of linuxDir are platform-independent and so is this expectation.
+	if got := linuxDir(`/opt/x\y/config.json`); got != `/opt/x/y` {
+		t.Errorf("linuxDir did not treat backslash as a separator: %q", got)
 	}
 }
 
