@@ -37,6 +37,172 @@ jobs:
       - name: Run unit, integration, CDN, delay, TLS, and HTTP/3 tests
         run: go test ./... -count=1 -timeout=5m
 
+  crossarch-32bit:
+    name: "32-bit targets: compile, execute, benchmark"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Every other job only exercises the runner's own 64-bit word size, so a
+    # 32-bit target could trap on an unaligned 64-bit atomic (or fail to compile
+    # its tests) and still ship. linux/386 is the only 32-bit target this runner
+    # can execute — the x86_64 kernel runs i386 binaries directly, and with
+    # CGO_ENABLED=0 the test binary is statically linked, so no 32-bit libc is
+    # needed — so it gets the full suite, the benchmark gate and profiles.
+    # linux/arm needs qemu-user and the 32-bit windows target is a foreign OS,
+    # so both get compile + vet + test-compile only. -race is unsupported on 386,
+    # which is why the race job stays 64-bit.
+    env:
+      # Same regex and the same per-benchmark MIN method as benchmark-regression,
+      # so the two gates measure the same thing rather than two different ones.
+      # The threshold is wider than amd64's 1.25: the 32-bit runner is slower and
+      # noisier, and a real regression still lifts the floor well past 1.50.
+      BENCH_REGEX: 'Benchmark(XHTTPTunnel_(ThroughCDN_72KB|TCP_h[123]|UDP_h[123])|ReliableBuffer_.*)$'
+      BENCH_THRESHOLD: '1.50'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve baseline ref
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            ref="${{ github.event.pull_request.base.sha }}"
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            ref="${{ github.event.before }}"
+          else
+            ref="HEAD~1"
+          fi
+          zero="0000000000000000000000000000000000000000"
+          if [ -z "$ref" ] || [ "$ref" = "$zero" ] || ! git cat-file -e "${ref}^{commit}" 2>/dev/null; then
+            ref="HEAD~1"
+          fi
+          if git cat-file -e "${ref}^{commit}" 2>/dev/null; then
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          else
+            echo "No reachable baseline (first commit / shallow clone); skipping the 32-bit gate." >> "$GITHUB_STEP_SUMMARY"
+            echo "ref=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compile every 32-bit release target
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in linux/386 linux/arm windows/386; do
+            os="${target%/*}"; arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build ./... \
+              && echo "$os/$arch build OK"
+          done
+
+      - name: Vet and compile the test packages that cannot run here
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in linux/arm windows/386; do
+            os="${target%/*}"; arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go vet ./...
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go test -c -o /dev/null .
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go test -c -o /dev/null ./tunnel
+            echo "$os/$arch vet + test-compile OK"
+          done
+
+      - name: Verify this runner can execute 32-bit binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Everything after this step depends on the kernel running i386
+          # binaries (CONFIG_IA32_EMULATION). If the runner image ever changes
+          # that, fail here with a clear diagnosis instead of surfacing it later
+          # as a mysterious "exec format error" inside the test suite.
+          printf 'package main\nfunc main() {}\n' > probe.go
+          CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -o probe386 probe.go
+          if ! ./probe386; then
+            echo "::error::linux/386 binaries cannot execute on this runner." >> "$GITHUB_STEP_SUMMARY"
+            uname -a >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "linux/386 execution confirmed"
+          rm -f probe.go probe386
+
+      - name: Run the full suite natively on linux/386
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=386 go test ./... -count=1 -timeout=10m
+
+      - name: Benchmark 32-bit HEAD and baseline, then compare
+        if: steps.base.outputs.ref != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CGO_ENABLED=0 GOOS=linux GOARCH=386
+          go test ./... -run '^$' -bench "$BENCH_REGEX" -benchmem -benchtime=100ms -count=8 | tee new32.txt
+          git worktree add --detach ../bench-base32 "${{ steps.base.outputs.ref }}"
+          ( cd ../bench-base32 && CGO_ENABLED=0 GOOS=linux GOARCH=386 \
+              go test ./... -run '^$' -bench "$BENCH_REGEX" -benchmem -benchtime=100ms -count=8 ) > base32.txt
+          # benchstat and bench_gate are host tools; dropping the 32-bit env
+          # avoids cross-compiling benchstat just to run it.
+          unset GOOS GOARCH
+          go run golang.org/x/perf/cmd/benchstat@latest base32.txt new32.txt | tee benchstat32.txt
+          { echo '### 32-bit benchmark comparison (baseline → HEAD, linux/386)'; echo ''; echo '```'; cat benchstat32.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/bench_gate.py base32.txt new32.txt --threshold "$BENCH_THRESHOLD"
+
+      - name: Capture CPU profiles per transport on linux/386
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p profiles32
+          export CGO_ENABLED=0 GOOS=linux GOARCH=386
+          declare -A BENCHS=(
+            [h1]='BenchmarkXHTTPTunnel_TCP_h1$'
+            [h2]='BenchmarkXHTTPTunnel_TCP_h2$'
+            [h3]='BenchmarkXHTTPTunnel_TCP_h3$'
+            [cdn]='BenchmarkXHTTPTunnel_ThroughCDN_72KB$'
+          )
+          for label in h1 h2 h3 cdn; do
+            go test ./tunnel/ -run '^$' -bench "${BENCHS[$label]}" -benchmem \
+              -benchtime=3s -count=1 \
+              -cpuprofile "profiles32/cpu-${label}.out"
+          done
+          # pprof -top reads the profile text directly and never executes the
+          # binary, so it works on a foreign-architecture profile. SVG rendering
+          # needs graphviz and is skipped here on purpose.
+          {
+            echo '### 32-bit CPU top (flat), linux/386'
+            echo ''
+            for label in h1 h2 h3 cdn; do
+              echo "<details><summary>${label}</summary>"
+              echo ''
+              echo '```'
+              go tool pprof -top -nodecount=12 "profiles32/cpu-${label}.out" 2>/dev/null || true
+              echo '```'
+              echo '</details>'
+              echo ''
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload 32-bit benchmark and profile data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 32bit-bench-${{ github.sha }}
+          path: |
+            base32.txt
+            new32.txt
+            benchstat32.txt
+            profiles32/
+          if-no-files-found: warn
+          retention-days: 14
+
   static-analysis:
     name: Static analysis
     runs-on: ubuntu-latest
