@@ -622,7 +622,14 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		defer virtualConn.Close()
 		defer logger.Debug("💀 client HTTP data pump stopped", zap.String("session", sessionID))
 
-		var ackedByServer uint64
+		// atomic.Uint64, never a bare uint64: the worker goroutines read it and
+		// this pump updates it from the response path, and the CAS below runs
+		// outside windowMu (which guards dispatchSeq, not this). The wrapper
+		// carries the compiler's align64 marker, so it stays 8-byte aligned
+		// wherever it lands — on a 32-bit target (386/arm) a bare uint64 reached
+		// through the free atomic functions traps the moment its offset is not a
+		// multiple of 8.
+		var ackedByServer atomic.Uint64
 		var dispatchSeq uint64
 		var windowMu sync.Mutex
 		var triggerRetry int32
@@ -679,7 +686,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 				for !virtualConn.isClosed() {
 					scaleUp()
 					windowMu.Lock()
-					currentAck := atomic.LoadUint64(&ackedByServer)
+					currentAck := ackedByServer.Load()
 					if dispatchSeq < currentAck {
 						dispatchSeq = currentAck
 					}
@@ -849,7 +856,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						}
 						logger.Debug("⚠️ [Pump] HTTP poll failed, will retry", zap.String("session", sessionID), zap.Error(err))
 						windowMu.Lock()
-						dispatchSeq = atomic.LoadUint64(&ackedByServer)
+						dispatchSeq = ackedByServer.Load()
 						windowMu.Unlock()
 						atomic.StoreInt32(&triggerRetry, 1)
 						if atomic.AddInt32(&consecutiveErrors, 1) > 20 {
@@ -876,8 +883,8 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							return
 						}
 						for {
-							old := atomic.LoadUint64(&ackedByServer)
-							if sAck <= old || atomic.CompareAndSwapUint64(&ackedByServer, old, sAck) {
+							old := ackedByServer.Load()
+							if sAck <= old || ackedByServer.CompareAndSwap(old, sAck) {
 								break
 							}
 						}
@@ -905,7 +912,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						// upload bytes are silently skipped forever. Replaying from the
 						// peer's ACK is safe: the server drops duplicate sequence data.
 						windowMu.Lock()
-						dispatchSeq = atomic.LoadUint64(&ackedByServer)
+						dispatchSeq = ackedByServer.Load()
 						windowMu.Unlock()
 						atomic.StoreInt32(&triggerRetry, 1)
 
@@ -993,7 +1000,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							handle.cancel()
 						}
 						windowMu.Lock()
-						dispatchSeq = atomic.LoadUint64(&ackedByServer)
+						dispatchSeq = ackedByServer.Load()
 						windowMu.Unlock()
 						atomic.StoreInt32(&triggerRetry, 1)
 						if !sleepCtx(pumpCtx, 300*time.Millisecond) {
@@ -1049,7 +1056,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						logger.Warn("⚠️ [Pump] failed to read downlink body or it ended unexpectedly, triggering a safe retransmit", zap.Error(errBody))
 
 						windowMu.Lock()
-						dispatchSeq = atomic.LoadUint64(&ackedByServer)
+						dispatchSeq = ackedByServer.Load()
 						windowMu.Unlock()
 						atomic.StoreInt32(&triggerRetry, 1)
 						if !sleepCtx(pumpCtx, 300*time.Millisecond) {

@@ -163,7 +163,12 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 		defer announce(errProbeAborted)
 		defer virtualConn.Close()
 
-		var ackedByServer uint64
+		// atomic.Uint64, never a bare uint64: this pump writes it while
+		// streamUplinkWriter reads it concurrently. The wrapper carries the
+		// compiler's align64 marker, so it stays 8-byte aligned wherever it lands.
+		// A bare uint64 reached through the free atomic functions traps on a 32-bit
+		// target (386/arm) the moment its offset is not a multiple of 8.
+		var ackedByServer atomic.Uint64
 		var lastDown uint64 // highest downSeq delivered to the reassembly buffer
 		var established bool
 		failures := 0
@@ -294,7 +299,7 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 // reconnect read ended with an immediate EOF. Fresh sockets for the rare
 // reconnect path sidestep the contamination without touching steady-state
 // pooling.
-func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Client, virtualConn *meekVirtualConn, ackedByServer *uint64, lastDown *uint64, established *bool, roundStart time.Time) (serverClosed bool, err error) {
+func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Client, virtualConn *meekVirtualConn, ackedByServer *atomic.Uint64, lastDown *uint64, established *bool, roundStart time.Time) (serverClosed bool, err error) {
 	roundCtx, cancelRound := context.WithCancel(pumpCtx)
 	defer cancelRound()
 
@@ -518,8 +523,8 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 			return false, err
 		}
 	}
-	if ack := first.ack; ack > atomic.LoadUint64(ackedByServer) {
-		atomic.StoreUint64(ackedByServer, ack)
+	if ack := first.ack; ack > ackedByServer.Load() {
+		ackedByServer.Store(ack)
 	}
 	// Negotiated. Cache and announce only after the first frame has passed
 	// sequence and acknowledgement validation; otherwise a malformed peer can
@@ -560,8 +565,8 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 			finish()
 			return false, fmt.Errorf("tunnel: invalid peer acknowledgement")
 		}
-		if ack := f.ack; ack > atomic.LoadUint64(ackedByServer) {
-			atomic.StoreUint64(ackedByServer, ack)
+		if ack := f.ack; ack > ackedByServer.Load() {
+			ackedByServer.Store(ack)
 		}
 		if f.closed || bytes.Equal(f.data, closeMarkerPayload) {
 			// Server ended the session: tunnel EOF for the local reader.
@@ -595,16 +600,16 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 // streamUplinkWriter streams reliable-buffer chunks into the POST body pipe,
 // keeping the uplink ack (for the server's downlink buffer) flowing even when
 // the uplink itself is idle.
-func (a streamDialArgs) streamUplinkWriter(ctx context.Context, virtualConn *meekVirtualConn, pw *io.PipeWriter, ackedByServer *uint64) error {
+func (a streamDialArgs) streamUplinkWriter(ctx context.Context, virtualConn *meekVirtualConn, pw *io.PipeWriter, ackedByServer *atomic.Uint64) error {
 	// The dispatch cursor belongs to this HTTP round. On reconnect a fresh
 	// writer starts at the cumulative peer ACK and re-sends anything that was
 	// handed to the failed round but never acknowledged.
-	dispatchSeq := atomic.LoadUint64(ackedByServer)
+	dispatchSeq := ackedByServer.Load()
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		currentAck := atomic.LoadUint64(ackedByServer)
+		currentAck := ackedByServer.Load()
 		if dispatchSeq < currentAck {
 			dispatchSeq = currentAck
 		}

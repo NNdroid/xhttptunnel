@@ -25,9 +25,13 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestPackBrutalParams(t *testing.T) {
-	const rate = 0x0102030405060708
-	const group = 0x1122334455667788
-	const gain = 20
+	// Typed, never untyped: an untyped constant this wide defaults to int and
+	// overflows on a 32-bit target, which fails the whole test package to
+	// compile on linux/386 and linux/arm. A typed constant is boxed into the
+	// variadic args without a width conversion.
+	const rate uint64 = 0x0102030405060708
+	const group uint64 = 0x1122334455667788
+	const gain uint32 = 20
 
 	// {u64 rate; u32 cwnd_gain; u64 group_id} __packed is 8 + 4 + 8 = 20 bytes.
 	// There is no alignment padding after the u32; an unpacked layout would be

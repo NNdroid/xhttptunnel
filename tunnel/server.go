@@ -47,13 +47,11 @@ const (
 )
 
 type XHTTPListener struct {
-	// RequestCount MUST stay the first field. On 32-bit targets (386/arm) a
-	// plain uint64 accessed with atomic.AddUint64 traps with "unaligned 64-bit
-	// atomic operation" unless it sits on an 8-byte boundary. The Go memory
-	// model guarantees the first word of an allocated struct is 8-byte aligned,
-	// so keeping it first makes the atomic op safe without changing the public
-	// uint64 type. Do not reorder fields above it.
-	RequestCount uint64
+	// RequestCount is an atomic.Uint64 rather than a plain uint64 so it carries
+	// the compiler's align64 marker: it is 8-byte aligned wherever it sits in
+	// this struct, so the atomic increment cannot trap on a 32-bit target
+	// (386/arm) and no field-ordering invariant is needed to keep it that way.
+	RequestCount atomic.Uint64
 
 	connCh        chan *XHTTPConn
 	ln            net.Listener
@@ -440,7 +438,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			nginxError(w, http.StatusNotFound)
 			return
 		}
-		atomic.AddUint64(&xl.RequestCount, 1)
+		xl.RequestCount.Add(1)
 		st.stats.requests.Add(1)
 		// Advertise this server's protocol generation and, when configured,
 		// refuse clients that announced an older one than the operator allows.
