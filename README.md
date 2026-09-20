@@ -198,14 +198,29 @@ with or without existing brackets.
 **nginx header requirements.** nginx has no `proxy_pass_header` directive.
 Request headers are governed by `proxy_pass_request_header`, which is `on` by
 default, and response headers by `proxy_hide_header`, which hides nothing by
-default. So every protocol header the tunnel uses flows through with no
-configuration at all — `X-Session-ID`, `X-Seq`, `X-Ack`, `X-Target`,
-`X-Network`, `X-Retry`, `X-Stream-Resume`, `X-Downstream`, `X-Session-Created`,
-`X-Downstream-Accepted`, `X-Stream-Uplink-Sync`, `X-Auth-Token`, `User-Agent`,
-`Accept-Encoding`, `Content-Type`.
+default. So the tunnel's protocol headers flow through with no configuration at
+all:
 
-Four headers are the exception, because nginx's *default* for each is wrong for
-this tunnel, so all four must be set explicitly:
+- *Request* — `X-Auth-Token`, `X-HTTP-Tunnel-Nonce`, `X-HTTP-Tunnel-MAC`,
+  `X-XHTTP-Proto`, `X-Target`, `X-Network`, `X-Session-ID`, `X-Seq`, `X-Ack`,
+  `X-Retry`, `X-Downstream`, `X-Stream-Resume`, plus the camouflage headers
+  `User-Agent`, `Accept`, `Accept-Encoding`, `Cache-Control`, `Pragma`,
+  `Content-Type`.
+- *Response* — `X-Seq`, `X-Ack`, `X-Session-ID`, `X-Downstream-Accepted`,
+  `X-Stream-Uplink-Sync`, `X-Session-Created`, `X-Target`, plus
+  `Cache-Control`, `Pragma`, `Expires`, `X-Accel-Buffering`.
+
+`X-HTTP-Tunnel-Nonce` and `X-HTTP-Tunnel-MAC` are the v2 credentials. A request
+that advertises `X-XHTTP-Proto: 2` commits to the signature and the bare-token
+path is closed to it, so it is refused outright rather than downgraded; a
+nonce that is missing, malformed, or already seen inside the 120-second
+replay window fails validation. If either header is lost in transit the client
+simply cannot connect and nothing in the logs points at nginx, so `gen-nginx`
+declares both explicitly alongside `X-Auth-Token` — the one place where the
+redundancy with `proxy_pass_request_header on` is worth the lines.
+
+Four headers are still the exception that must be set explicitly, because
+nginx's *default* for each is wrong for this tunnel:
 
 | Header | Value | Why the default breaks it |
 | :--- | :--- | :--- |

@@ -1283,6 +1283,11 @@ func locationBlock(path, upstreamName, scheme string, bodyKB int, tokenHeader st
 	b.WriteString(pad + "proxy_set_header X-Real-IP $remote_addr;\n")
 	b.WriteString(pad + "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
 	fmt.Fprintf(&b, "%sproxy_set_header %s $http_%s;\n", pad, tokenHeader, httpArg(tokenHeader))
+	// Declared explicitly rather than left to the default pass-through: a
+	// missing nonce or MAC fails authentication with no error pointing at nginx,
+	// so this is the one case where the redundancy pays for the two lines.
+	b.WriteString(pad + "proxy_set_header X-HTTP-Tunnel-Nonce $http_x_http_tunnel_nonce;\n")
+	b.WriteString(pad + "proxy_set_header X-HTTP-Tunnel-MAC $http_x_http_tunnel_mac;\n")
 	b.WriteString(pad + "# trust_proxy_headers must be on server-side for these to be trusted.\n\n")
 	b.WriteString(pad + "proxy_connect_timeout 10s;\n")
 	b.WriteString(pad + "proxy_read_timeout 86400s;\n")

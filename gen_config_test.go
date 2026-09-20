@@ -723,6 +723,10 @@ func TestNginxDefaultSnippet(t *testing.T) {
 	mustContain("proxy_set_header X-Real-IP $remote_addr;")
 	mustContain("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
 	mustContain("proxy_set_header X-Auth-Token $http_x_auth_token;")
+	// Both are authentication headers; a request missing the MAC is refused
+	// outright, so neither can be left to implicit pass-through.
+	mustContain("proxy_set_header X-HTTP-Tunnel-Nonce $http_x_http_tunnel_nonce;")
+	mustContain("proxy_set_header X-HTTP-Tunnel-MAC $http_x_http_tunnel_mac;")
 	mustContain("proxy_next_upstream off;")
 	mustContain("proxy_connect_timeout 10s;")
 	mustContain("proxy_read_timeout 86400s;")
