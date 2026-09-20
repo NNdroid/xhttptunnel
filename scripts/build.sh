@@ -7,6 +7,11 @@ mkdir -p "${BIN_DIR}"
 
 APP_NAME="xhttptunnel"
 
+# This repository is module-based. Do not inherit a user-level
+# `go env -w GO111MODULE=off`, which otherwise makes Git Bash fall back to
+# GOPATH mode even though go.mod is present.
+export GO111MODULE=on
+
 # Release versions use v1.0.yyyyMMdd.<commit count>-<short commit hash>.
 # CI passes the tag explicitly; local builds derive the same shape from the
 # current UTC date, the commit count, and HEAD. Override without editing this
@@ -99,8 +104,11 @@ for PLATFORM in "${PLATFORMS[@]}"; do
   fi
   
   echo "--> Compiling ${GOOS}/${GOARCH}..."
-  CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
-    go build -trimpath -ldflags "${LDFLAGS}" -o "${OUTPUT}" "${PROJECT_ROOT}"
+  (
+    cd "${PROJECT_ROOT}"
+    CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
+      go build -trimpath -ldflags "${LDFLAGS}" -o "${OUTPUT}" .
+  )
 done
 
 echo "=== Build Complete! Artifacts in ${BIN_DIR} ==="
