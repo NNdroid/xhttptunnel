@@ -195,6 +195,43 @@ biggest throughput hit on this path. `-scheme auto` picks `https` for a
 non-loopback backend or port 443, otherwise `http`; IPv6 backends are bracketed
 with or without existing brackets.
 
+**nginx header requirements.** nginx has no `proxy_pass_header` directive.
+Request headers are governed by `proxy_pass_request_header`, which is `on` by
+default, and response headers by `proxy_hide_header`, which hides nothing by
+default. So every protocol header the tunnel uses flows through with no
+configuration at all — `X-Session-ID`, `X-Seq`, `X-Ack`, `X-Target`,
+`X-Network`, `X-Retry`, `X-Stream-Resume`, `X-Downstream`, `X-Session-Created`,
+`X-Downstream-Accepted`, `X-Stream-Uplink-Sync`, `X-Auth-Token`, `User-Agent`,
+`Accept-Encoding`, `Content-Type`.
+
+Four headers are the exception, because nginx's *default* for each is wrong for
+this tunnel, so all four must be set explicitly:
+
+| Header | Value | Why the default breaks it |
+| :--- | :--- | :--- |
+| `Host` | `$host` | nginx defaults to `$proxy_host`, the upstream address, which breaks SNI and virtual-host routing at the origin. |
+| `Connection` | `""` | with `proxy_http_version 1.1` this makes nginx reuse the upstream keepalive pool. Left alone nginx sends `Connection: close` and opens a fresh socket per poll — the single biggest throughput hit on this path. |
+| `X-Forwarded-For` | `$proxy_add_x_forwarded_for` | the client can send this itself; nginx does not set it by default, so `trust_proxy_headers` would trust whatever the client invented. |
+| `X-Real-IP` | `$remote_addr` | same reason. |
+
+Three more things to leave alone: do not enable `gzip` in this `location` (the
+tunnel body is opaque bytes and compressing it corrupts the protocol, which is
+why the client sends `Accept-Encoding: identity`), do not re-enable
+`proxy_buffering` or `proxy_request_buffering`, and keep
+`client_max_body_size` at or above `chunk_size_kb` plus the headroom.
+
+The origin also sends `X-Accel-Buffering: no` on every response. nginx reads
+that header and disables response buffering for the request, which is a second
+line of defence behind `proxy_buffering off` in case someone edits the
+`location` and forgets. `Cache-Control` carries `no-store, no-cache,
+must-revalidate, max-age=0` on both request and response, plus `no-transform`
+on responses; `Pragma: no-cache` is sent on both and `Expires: 0` on responses
+only. A plain reverse proxy therefore needs no per-header work either. A CDN in
+front is different: none of those headers stops one that is configured to cache
+unconditionally, so if a CDN sits between the client and the origin it must be
+told not to cache.
+
+
 ### 6. Service Management
 ```bash
 systemctl start xhttptunnel    # Start service
