@@ -359,9 +359,8 @@ func (c *cdnTestServer) trace() string {
 }
 
 // readFullBefore gives this concurrent end-to-end test a real deadline.
-// XHTTPConn intentionally implements SetDeadline as a no-op because its
-// underlying byte stream is virtual, so net.Conn deadlines cannot protect the
-// test from an accidentally stalled polling loop.
+// This also covers generic io.Reader fixtures that do not expose net.Conn
+// deadlines, and gives the test a bound independent of transport teardown.
 func readFullBefore(r io.Reader, length int, timeout time.Duration) ([]byte, error) {
 	result := make(chan error, 1)
 	data := make([]byte, length)

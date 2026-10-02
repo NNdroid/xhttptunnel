@@ -94,6 +94,7 @@ func TestGenConfigServerDefaults(t *testing.T) {
 		"_description", "_fields", "mode", "listen", "path", "target", "psk", "selfsign",
 		"selfsign_cn", "cert", "key", "fallback", "allowed_targets", "max_sessions",
 		"max_sessions_per_ip", "health_path", "min_proto_version", "chunk_size_kb",
+		"window_size_mb", "buffer_budget_mb",
 		"trust_proxy_headers", "brutal", "dump", "log_level",
 	}
 	m := jsonKeys(t, data)
@@ -137,6 +138,27 @@ func TestGenConfigServerDefaults(t *testing.T) {
 	}
 	if other := mustBuild(t, mustSpec(t, "-mode", "server")); other.PSK == cfg.PSK {
 		t.Error("two default server configs generated the same PSK")
+	}
+}
+
+func TestGenConfigWindowAndBufferBudget(t *testing.T) {
+	s := mustSpec(t, "-mode", "server", "-window-size-mb", "16", "-buffer-budget-mb", "512")
+	cfg := mustBuild(t, s)
+	if err := checkConfig(cfg, s.PSKExplicit).err(); err != nil {
+		t.Fatal(err)
+	}
+	var decoded FileConfig
+	if err := json.Unmarshal(mustRender(t, cfg, true), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.WindowSizeMB != 16 || decoded.BufferBudgetMB != 512 {
+		t.Fatalf("buffer settings lost during rendering: %d / %d", decoded.WindowSizeMB, decoded.BufferBudgetMB)
+	}
+	for _, values := range [][2]int{{-1, 0}, {65, 0}, {16, 1}, {16, 16}, {16, 65537}} {
+		cfg.WindowSizeMB, cfg.BufferBudgetMB = values[0], values[1]
+		if err := checkConfig(cfg, s.PSKExplicit).err(); err == nil {
+			t.Fatalf("generator accepted invalid limits %v", values)
+		}
 	}
 }
 

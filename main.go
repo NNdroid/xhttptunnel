@@ -99,7 +99,9 @@ type FileConfig struct {
 	// ChunkSizeKB caps the upstream payload carried by one poll request. The
 	// default (256) leaves headroom under the 1MB body limit that nginx and
 	// many CDN/WAF tiers enforce. Must be raised on BOTH ends together.
-	ChunkSizeKB int `json:"chunk_size_kb"`
+	ChunkSizeKB    int `json:"chunk_size_kb"`
+	WindowSizeMB   int `json:"window_size_mb"`
+	BufferBudgetMB int `json:"buffer_budget_mb"`
 	// IdleTimeout (client) drops a local connection after this many seconds
 	// without traffic. Default 900. Idle SSH sessions need keepalives below it.
 	IdleTimeout int `json:"idle_timeout"`
@@ -520,18 +522,19 @@ func resolveConfig(args []string) (*FileConfig, string) {
 // the blocking local forwarder. It exits the process on startup failure.
 func startClient(ctx context.Context, cfg *FileConfig) {
 	c, err := tunnel.NewClient(tunnel.ClientConfig{
-		ServerURL:   cfg.ServerURL,
-		PSK:         cfg.PSK,
-		SNI:         cfg.SNI,
-		Host:        cfg.Host,
-		ALPN:        cfg.ALPN,
-		Fingerprint: cfg.Fingerprint,
-		Target:      cfg.Target,
-		MaxConns:    cfg.MaxConns,
-		IdleTimeout: time.Duration(cfg.IdleTimeout) * time.Second,
-		StreamMode:  cfg.StreamMode,
-		Dump:        cfg.Dump,
-		Brutal:      cfg.Brutal,
+		ServerURL:    cfg.ServerURL,
+		PSK:          cfg.PSK,
+		SNI:          cfg.SNI,
+		Host:         cfg.Host,
+		ALPN:         cfg.ALPN,
+		Fingerprint:  cfg.Fingerprint,
+		Target:       cfg.Target,
+		MaxConns:     cfg.MaxConns,
+		IdleTimeout:  time.Duration(cfg.IdleTimeout) * time.Second,
+		StreamMode:   cfg.StreamMode,
+		WindowSizeMB: cfg.WindowSizeMB,
+		Dump:         cfg.Dump,
+		Brutal:       cfg.Brutal,
 	})
 	if err != nil {
 		logger.Fatal("❌ client failed to start", zap.Error(err))
@@ -555,6 +558,8 @@ func startServer(ctx context.Context, cfg *FileConfig) {
 		AllowedTargets:    cfg.AllowedTargets,
 		TrustProxyHeaders: cfg.TrustProxyHeaders,
 		MaxSessions:       cfg.MaxSessions,
+		WindowSizeMB:      cfg.WindowSizeMB,
+		BufferBudgetMB:    cfg.BufferBudgetMB,
 		MaxSessionsPerIP:  cfg.MaxSessionsPerIP,
 		HealthPath:        cfg.HealthPath,
 		MinProtoVersion:   cfg.MinProtoVersion,

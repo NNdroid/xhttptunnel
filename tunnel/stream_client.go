@@ -3,9 +3,11 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"strconv"
@@ -48,7 +50,8 @@ const (
 	// achievable rate).
 	ackCoalesceBytes = 128 * 1024
 	// reconnectBackoffCap bounds the reconnect backoff between stream rounds.
-	reconnectBackoffCap = 30 * time.Second
+	reconnectBackoffCap    = 30 * time.Second
+	reconnectHealthyWindow = 30 * time.Second
 )
 
 // errStreamUnavailable reports that the streaming downlink could not be
@@ -150,6 +153,11 @@ type streamDialArgs struct {
 func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 	logger := a.logger
 	virtualConn := newMeekVirtualConn(a.sessionID, a.localAddr, a.remoteAddr, logger)
+	window, err := windowBytes(a.cfg.WindowSizeMB)
+	if err != nil {
+		return nil, err
+	}
+	virtualConn.writeBuf = newReliableBuffer(window)
 	pumpCtx, pumpCancel := context.WithCancel(a.ctx)
 	pumpDone := make(chan struct{})
 	ready := make(chan error, 1)
@@ -175,6 +183,8 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 
 		for !virtualConn.isClosed() && !virtualConn.closePending() {
 			t0 := time.Now()
+			var roundReady time.Time
+			a.onReady = func() { roundReady = time.Now(); announce(nil) }
 			serverClosed, err := a.runStreamRound(pumpCtx, a.client, virtualConn, &ackedByServer, &lastDown, &established, t0)
 			announce(err)
 			elapsed := time.Since(t0)
@@ -211,7 +221,7 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 				a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "server session recreated", Detail: err.Error()})
 				return
 			}
-			if errors.Is(err, errStreamUnavailable) {
+			if errors.Is(err, errStreamUnavailable) && !established {
 				// Path/origin cannot stream: remember and let DialXHTTP fall
 				// back to polling. A forced StreamMode="stream" keeps the
 				// decision local to this session (no cache write happens for
@@ -222,6 +232,9 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 				return
 			}
 			if err != nil {
+				if !roundReady.IsZero() && time.Since(roundReady) >= reconnectHealthyWindow {
+					failures = 0
+				}
 				failures++
 				logger.Warn("⚠️ [Stream] downlink stream broke, preparing to reconnect and resume",
 					zap.String("session", a.sessionID),
@@ -234,13 +247,7 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 				// change (Wi-Fi↔cellular, interface flap) must recover on its
 				// own, and 2 rapid failures during an outage would otherwise
 				// kill a perfectly resumable tunnel.
-				backoff := time.Duration(failures) * 300 * time.Millisecond
-				if backoff > reconnectBackoffCap {
-					backoff = reconnectBackoffCap
-				}
-				select {
-				case <-time.After(backoff):
-				case <-pumpCtx.Done():
+				if !sleepCtx(pumpCtx, streamReconnectBackoff(failures)) {
 					a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "local close"})
 					return
 				}
@@ -288,6 +295,20 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 		<-pumpDone
 		return nil, a.ctx.Err()
 	}
+}
+
+// Equal jitter spreads retries over half to all of an exponentially growing
+// interval. The total wait, including jitter, never exceeds the cap.
+func streamReconnectBackoff(failures int) time.Duration {
+	base := 300 * time.Millisecond
+	for i := 1; i < failures && base < reconnectBackoffCap; i++ {
+		base *= 2
+	}
+	if base > reconnectBackoffCap {
+		base = reconnectBackoffCap
+	}
+	half := base / 2
+	return half + time.Duration(mrand.Int63n(int64(base-half)+1))
 }
 
 // runStreamRound establishes one streaming GET and drives it to completion.
@@ -525,6 +546,7 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	}
 	if ack := first.ack; ack > ackedByServer.Load() {
 		ackedByServer.Store(ack)
+		virtualConn.writeBuf.acknowledge(ack)
 	}
 	// Negotiated. Cache and announce only after the first frame has passed
 	// sequence and acknowledgement validation; otherwise a malformed peer can
@@ -542,14 +564,10 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	watchdog := time.AfterFunc(streamWatchdogTimeout, cancelRound)
 	defer watchdog.Stop()
 
-	// lastAckSent tracks how much downlink progress has been reported to the
-	// server via ack-only frames on the uplink pipe (io.Pipe serialises
-	// concurrent writers, so the reader can ack here safely).
-	var lastAckSent uint64
-
+	var readScratch []byte
 	// Downlink reader (this goroutine): frames into the reassembly buffer.
 	for {
-		f, rerr := readStreamFrame(resp.Body)
+		f, rerr := readStreamFrameInto(resp.Body, &readScratch)
 		if rerr != nil {
 			// Drain the uplink goroutines before reporting.
 			finish()
@@ -567,6 +585,7 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		}
 		if ack := f.ack; ack > ackedByServer.Load() {
 			ackedByServer.Store(ack)
+			virtualConn.writeBuf.acknowledge(ack)
 		}
 		if f.closed || bytes.Equal(f.data, closeMarkerPayload) {
 			// Server ended the session: tunnel EOF for the local reader.
@@ -580,19 +599,8 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 				finish()
 				return false, err
 			}
-			// Promptly report downlink progress so the server keeps freeing
-			// its write buffer during pure downloads — its ack otherwise
-			// rides only the idle uplink keepalive (25s), which throttles a
-			// download into 4MB bursts.
-			if pending := *lastDown - lastAckSent; pending >= ackCoalesceBytes {
-				if frame, err := streamFrameBytes(0, *lastDown, nil); err == nil {
-					if _, err := pw.Write(frame); err != nil {
-						finish()
-						return false, err
-					}
-					lastAckSent = *lastDown
-				}
-			}
+			// Receive progress wakes the sole uplink writer. The reader never
+			// blocks on writing an ACK into a slow upload pipe.
 		}
 	}
 }
@@ -605,6 +613,9 @@ func (a streamDialArgs) streamUplinkWriter(ctx context.Context, virtualConn *mee
 	// writer starts at the cumulative peer ACK and re-sends anything that was
 	// handed to the failed round but never acknowledged.
 	dispatchSeq := ackedByServer.Load()
+	var lastAckSent uint64
+	lastSent := time.Now().Add(-streamUplinkKeepalive)
+	var sendScratch []byte
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -613,9 +624,12 @@ func (a streamDialArgs) streamUplinkWriter(ctx context.Context, virtualConn *mee
 		if dispatchSeq < currentAck {
 			dispatchSeq = currentAck
 		}
-		upData, currentSeq, bufPtr := virtualConn.writeBuf.GetSlice(currentAck, dispatchSeq, a.uploadChunk)
-		if len(upData) == 0 {
-			safelyPutSendBuf(bufPtr)
+		ack := virtualConn.consumedUpSeq()
+		frame, currentSeq, err := virtualConn.writeBuf.getStreamFrame(currentAck, dispatchSeq, ack, a.uploadChunk, sendScratch)
+		if err != nil {
+			return err
+		}
+		if len(frame) == 0 {
 			// Nothing left to ship: end the body so the server's uplink
 			// reader sees EOF and tears the session down. This is what keeps
 			// Close() fast — idling out the 25s window here would stall every
@@ -635,26 +649,35 @@ func (a streamDialArgs) streamUplinkWriter(ctx context.Context, virtualConn *mee
 				pw.Close()
 				return nil
 			}
+			elapsed := time.Since(lastSent)
+			pending := ack - lastAckSent
+			if pending < ackCoalesceBytes && elapsed < streamUplinkKeepalive && (pending == 0 || elapsed < streamAckInterval) {
+				delay := streamUplinkKeepalive - elapsed
+				if pending > 0 {
+					delay = streamAckInterval - elapsed
+				}
+				streamWait(ctx, virtualConn, delay)
+				continue
+			}
 			// Ack-only keepalive: the server frees its downlink buffer from
 			// these, so they must flow even with an idle uplink.
-			frame, err := streamFrameBytes(dispatchSeq, virtualConn.consumedUpSeq(), nil)
-			if err == nil {
-				if _, werr := pw.Write(frame); werr != nil {
-					return werr
-				}
+			frame, err := streamFrameBytesInto(sendScratch, dispatchSeq, ack, nil)
+			if err != nil {
+				return err
 			}
-			virtualConn.writeBuf.waitDispatchable(ctx, streamUplinkKeepalive, dispatchSeq)
+			if _, err := pw.Write(frame); err != nil {
+				return err
+			}
+			lastAckSent, lastSent = ack, time.Now()
+			sendScratch = frame
 			continue
 		}
-		dispatchSeq = currentSeq + uint64(len(upData))
-		frame, err := streamFrameBytes(currentSeq, virtualConn.consumedUpSeq(), upData)
-		safelyPutSendBuf(bufPtr)
-		if err != nil {
-			return err
-		}
+		dispatchSeq = currentSeq + uint64(binary.BigEndian.Uint32(frame[16:20]))
 		if _, err := pw.Write(frame); err != nil {
 			return err
 		}
+		lastAckSent, lastSent = ack, time.Now()
+		sendScratch = frame
 	}
 }
 

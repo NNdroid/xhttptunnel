@@ -78,7 +78,11 @@ func (c *meekVirtualConn) noteDownPeerAck(ack uint64) {
 	}
 	for {
 		old := c.downPeerAck.Load()
-		if ack <= old || c.downPeerAck.CompareAndSwap(old, ack) {
+		if ack <= old {
+			return
+		}
+		if c.downPeerAck.CompareAndSwap(old, ack) {
+			c.writeBuf.acknowledge(ack)
 			return
 		}
 	}
@@ -273,23 +277,25 @@ func checkServerProto(h http.Header) error {
 }
 
 // TunnelStats is the monotonic snapshot reported by Server.Stats and the
-// optional health endpoint. Counters never reset; ActiveSessions is the live
-// registry size.
+// optional health endpoint. Counters never reset; ActiveSessions and buffer
+// reservations are live gauges.
 type TunnelStats struct {
-	ActiveSessions   int    `json:"active_sessions"`
-	SessionsTotal    uint64 `json:"sessions_total"`
-	SessionsRejected uint64 `json:"sessions_rejected"`
-	SessionsKicked   uint64 `json:"sessions_kicked"`
-	SessionsReaped   uint64 `json:"sessions_reaped"`
-	RequestsTotal    uint64 `json:"requests_total"`
-	ProtoVersion     int    `json:"proto_version"`
+	ActiveSessions      int    `json:"active_sessions"`
+	SessionsTotal       uint64 `json:"sessions_total"`
+	SessionsRejected    uint64 `json:"sessions_rejected"`
+	SessionsKicked      uint64 `json:"sessions_kicked"`
+	SessionsReaped      uint64 `json:"sessions_reaped"`
+	RequestsTotal       uint64 `json:"requests_total"`
+	ProtoVersion        int    `json:"proto_version"`
+	BufferReservedBytes int64  `json:"buffer_reserved_bytes"`
+	BufferBudgetBytes   int64  `json:"buffer_budget_bytes"`
 }
 
 func (st *serverState) snapshot() TunnelStats {
 	st.sessionsMu.RLock()
 	active := len(st.sessions)
 	st.sessionsMu.RUnlock()
-	return TunnelStats{
+	stats := TunnelStats{
 		ActiveSessions:   active,
 		SessionsTotal:    st.stats.sessionsTotal.Load(),
 		SessionsRejected: st.stats.sessionsReject.Load(),
@@ -298,6 +304,11 @@ func (st *serverState) snapshot() TunnelStats {
 		RequestsTotal:    st.stats.requests.Load(),
 		ProtoVersion:     tunnelProtoVersion,
 	}
+	if st.bufferBudget != nil {
+		stats.BufferReservedBytes = st.bufferBudget.used.Load()
+		stats.BufferBudgetBytes = st.bufferBudget.limit
+	}
+	return stats
 }
 
 // serverState holds the mutable policy and the session registry of one
@@ -305,9 +316,11 @@ func (st *serverState) snapshot() TunnelStats {
 // the low-level ListenXHTTP keeps using defaultServerState (its historical
 // process-global behaviour), while Server gives every instance its own state.
 type serverState struct {
-	sessionsMu  sync.RWMutex
-	sessions    map[string]*meekVirtualConn
-	maxSessions int
+	windowSize   int
+	bufferBudget *bufferBudget
+	sessionsMu   sync.RWMutex
+	sessions     map[string]*meekVirtualConn
+	maxSessions  int
 	// maxPerIP bounds sessions from one client address (0 = unlimited). The
 	// global cap alone lets a single PSK holder — or one compromised machine —
 	// starve everyone else out of the registry.

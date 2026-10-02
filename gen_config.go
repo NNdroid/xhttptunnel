@@ -72,6 +72,8 @@ type genSpec struct {
 	HealthPath       string
 	MinProtoVersion  int
 	ChunkSizeKB      int
+	WindowSizeMB     int
+	BufferBudgetMB   int
 	MaxConns         int
 	IdleTimeout      int
 	// "loopback", "all", or a comma-separated list of host:port / :port /
@@ -221,6 +223,8 @@ func (s *genSpec) build() (*FileConfig, error) {
 		HealthPath:        s.HealthPath,
 		MinProtoVersion:   s.MinProtoVersion,
 		ChunkSizeKB:       s.ChunkSizeKB,
+		WindowSizeMB:      s.WindowSizeMB,
+		BufferBudgetMB:    s.BufferBudgetMB,
 		MaxConns:          s.MaxConns,
 		IdleTimeout:       s.IdleTimeout,
 		TrustProxyHeaders: s.TrustProxy,
@@ -430,6 +434,9 @@ func checkConfig(cfg *FileConfig, explicitPSK bool) *configCheck {
 	}
 	if cfg.ChunkSizeKB != 0 && (cfg.ChunkSizeKB < 16 || cfg.ChunkSizeKB > 900) {
 		c.fail("chunk_size_kb %d must be 0 or 16-900; the engine clamps to that range, so raising the ceiling means raising it on BOTH ends", cfg.ChunkSizeKB)
+	}
+	if err := tunnel.ValidateBufferLimits(cfg.WindowSizeMB, cfg.BufferBudgetMB); err != nil {
+		c.fail("%s", err)
 	}
 	// Shared with the runtime, so the generator can never emit a file the
 	// binary refuses. Validate also normalises cwnd_gain and bw_interval, so
@@ -664,6 +671,8 @@ func renderServerConfig(cfg *FileConfig, withDocs bool) ([]byte, error) {
 		jsonLine{key: "fallback", val: cfg.Fallback},
 		jsonLine{key: "allowed_targets", val: cfg.AllowedTargets},
 		jsonLine{key: "max_sessions", val: cfg.MaxSessions},
+		jsonLine{key: "window_size_mb", val: cfg.WindowSizeMB},
+		jsonLine{key: "buffer_budget_mb", val: cfg.BufferBudgetMB},
 		jsonLine{key: "max_sessions_per_ip", val: cfg.MaxSessionsPerIP},
 		jsonLine{key: "health_path", val: cfg.HealthPath},
 		jsonLine{key: "min_proto_version", val: cfg.MinProtoVersion},
@@ -694,6 +703,7 @@ func renderClientConfig(cfg *FileConfig, withDocs bool) ([]byte, error) {
 		jsonLine{key: "host", val: cfg.Host},
 		jsonLine{key: "alpn", val: cfg.ALPN},
 		jsonLine{key: "stream_mode", val: cfg.StreamMode},
+		jsonLine{key: "window_size_mb", val: cfg.WindowSizeMB},
 		jsonLine{key: "fingerprint", val: cfg.Fingerprint},
 		jsonLine{key: "cert", val: cfg.Cert},
 		jsonLine{key: "key", val: cfg.Key},
@@ -727,10 +737,12 @@ func serverFieldDocs() []stringDoc {
 		{"key", "Optional path to custom TLS private key file"},
 		{"fallback", "Decoy URL to transparently proxy unauthorized requests to (e.g. https://www.bing.com). Empty returns an nginx-style 404."},
 		{"allowed_targets", "Restrict which targets clients may request. Each entry may be prefixed with 'tcp://' or 'udp://' to restrict the protocol, and is otherwise one of: 'host:port' (exact), ':port' (any host on that port), 'host:' (any port on that host), '[host]' (an IPv6 literal on any port) or '*' (anything). An unbracketed IPv6 literal is rejected because its colons are ambiguous, so write '[::1]:22' or '[::1]' instead. So 'tcp://192.168.1.10:' admits only TCP to that host, 'udp://:53' only UDP DNS, and a bare '127.0.0.1:' admits either protocol. Checked at session creation, so a custom Handler only ever sees allowlisted targets. Empty = allow all, including non-loopback hosts."},
+		{"buffer_budget_mb", "Server admission budget for active tunnel buffers in MiB (0 = disabled). Reserves the send window, receive capacity and scratch; excludes HTTP/TLS/QUIC and total process RSS."},
 		{"max_sessions", "Maximum concurrent tunnel sessions allowed on server (0 = default 2000)"},
 		{"max_sessions_per_ip", "Cap concurrent sessions from a single client address (0 = unlimited). Bounds one PSK holder's blast radius; counts the TCP peer address unless trust_proxy_headers is on."},
 		{"health_path", "When set (e.g. /healthz), expose an unauthenticated JSON stats endpoint on the tunnel listener. Empty = disabled. Keep off on a public listener."},
 		{"min_proto_version", "Reject (HTTP 426) clients advertising an X-XHTTP-Proto below this. 0 (default) accepts all clients, including legacy header-less ones. Set 2 to force the signed-nonce scheme: a client advertising v2 is admitted only by signature, which closes the bare-token fallback."},
+		{"window_size_mb", "Reliable send window per session in MiB (0 = 4; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
 		{"chunk_size_kb", "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must be raised on BOTH ends together."},
 		{"trust_proxy_headers", "Honour CF-Connecting-IP / X-Forwarded-For / X-Real-IP for client-address logging. Those headers are spoofable; enable only behind a trusted proxy that strips them."},
 		{"brutal", "TCP Brutal (Linux kernel module only; inert on other platforms). Caps the send rate of this server's TCP tunnel sockets in bytes/s. The HTTP/3 socket is never affected. Nested object: enabled (default false; off means setsockopt is never called), rate (bytes/s; 0 is illegal unless bw_exchange supplies one), cwnd_gain (tenths, so 20 = 2.0x; 0 = default 20, max 100), group_id (0 = per-connection only), group_from_remote (derive the group from the peer's address instead of group_id; a static group_id on a server pools every client into one aggregate ceiling), bw_exchange (accept the _BrutalBwExchange protocol), bw_advertise (bytes/s this server can ingest; the peer applies it as its own send rate), bw_interval (seconds between exchange attempts, default 60). Exchange requests are authenticated but do not count against max_sessions. A socket failure never breaks a tunnel: the connection continues uncapped and the failure is logged once."},
@@ -753,6 +765,7 @@ func clientFieldDocs() []stringDoc {
 		{"fingerprint", "SHA256 certificate pin of the server certificate (required for self-signed TLS; empty uses the system CA roots plus SNI hostname verification, which is appropriate for ordinary CDN HTTPS)"},
 		{"cert", "Optional path to the server's TLS certificate. Client mode does not read it; it is used only by the gen-uri command to derive the fingerprint pin above."},
 		{"key", "Optional path to the server's TLS private key. Not used by the client at all."},
+		{"window_size_mb", "Reliable send window per session in MiB (0 = 4; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
 		{"chunk_size_kb", "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must match the server value; raise on BOTH ends together."},
 		{"idle_timeout", "Drop a local connection after this many seconds without traffic (default 900). Idle SSH sessions need a keepalive below it."},
 		{"max_conns", "Maximum concurrent client connections allowed (0 = default 2000)"},
@@ -836,6 +849,8 @@ func bindGenConfigFlags(cmd *flag.FlagSet, s *genSpec) {
 	cmd.StringVar(&s.HealthPath, "health-path", "", "Unauthenticated stats path on the tunnel listener; empty disables it")
 	cmd.IntVar(&s.MinProtoVersion, "min-proto-version", 0, "Reject clients advertising an older X-XHTTP-Proto (0 = accept all)")
 	cmd.IntVar(&s.ChunkSizeKB, "chunk-size-kb", 0, "Upstream payload per poll request, 16-900 (0 = 256)")
+	cmd.IntVar(&s.WindowSizeMB, "window-size-mb", 0, "Reliable send window per session in MiB, 1-64 (0 = 4)")
+	cmd.IntVar(&s.BufferBudgetMB, "buffer-budget-mb", 0, "Server admission budget for tunnel buffers in MiB (0 = disabled)")
 	cmd.IntVar(&s.MaxConns, "max-conns", 0, "Client max concurrent connections (0 = 512)")
 	cmd.IntVar(&s.IdleTimeout, "idle-timeout", 0, "Client seconds of silence before dropping a connection (0 = 900)")
 	cmd.StringVar(&s.AllowedTargets, "allowed-targets", "", "loopback (default), all, or a comma-separated list of host:port / :port / host: / [host] / *, each optionally prefixed tcp:// or udp:// to restrict the protocol")

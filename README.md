@@ -277,6 +277,8 @@ journalctl -u xhttptunnel -f   # View live logs
 | `host` | `string` | server host | HTTP `Host` header disguise (client). |
 | `alpn` | `string` | `"auto"` | Transport selection: `h3`, `h2`, `h1`, or `auto` (probe HTTP/3, fall back). |
 | `stream_mode` | `string` | `"auto"` | Client downlink transport: `auto` (negotiate), `poll` (legacy long-poll), or `stream` (force streaming downlink). |
+| `window_size_mb` | `int` | `0` | Reliable send window per session in MiB: `0` preserves 4 MiB; explicit sizes are 1–64. Available on client and server; the peers do not need matching windows. |
+| `buffer_budget_mb` | `int` | `0` | Server admission budget in MiB for active tunnel buffers. `0` preserves the existing session-count limit. A nonzero value reserves each send window, conservative receive capacity and frame scratch before admitting a session; insufficient capacity returns HTTP 503. Excludes HTTP/TLS/QUIC buffers, stacks and total process RSS. |
 | `fingerprint` | `string` | `""` | SHA-256 certificate pin, required for self-signed TLS. Empty uses the system CA roots plus SNI hostname verification, which is appropriate for ordinary CDN HTTPS. `gen-uri` reads this field when building a share URI, or derives it from `cert` when the field is empty. |
 | `log_level` | `string` | `"info"` | Logging output level: `debug`, `info`, `warn`, `error`. |
 | `dump` | `bool` | `false` | Hex-dump tunnelled traffic to stdout (debugging only). |
@@ -292,6 +294,33 @@ journalctl -u xhttptunnel -f   # View live logs
 | `brutal` | object | `{enabled: false}` | Cap the send rate of the tunnel's **TCP** sockets with [TCP Brutal](https://github.com/beef92/tcp-brutal) (a Linux kernel module; inert on other platforms). See [TCP Brutal & bandwidth exchange](#tcp-brutal--bandwidth-exchange). |
 
 For a direct TLS deployment, `:8443` (or `tcp+udp://:8443`) starts HTTPS and HTTP/3 on the same port. Use `tcp://127.0.0.1:8443` for a cleartext CDN origin; without a certificate/key the server intentionally does not bind UDP or advertise HTTP/3.
+
+Size the send window from the bandwidth-delay product, with headroom for ACK
+delivery: a 1 Gbit/s path at 100 ms RTT has about 12 MB in flight, so 16 MiB is
+a reasonable starting point for measurement. Increasing the window reserves
+more memory per active session; it does not increase the bounded receive or
+out-of-order queues. For example, use `window_size_mb: 16` and a server
+`buffer_budget_mb: 512`, then measure sustained uploads, downloads and
+concurrent sessions on the actual path. The admission budget uses conservative
+reservations even for idle sessions, and is released when the session closes.
+`gen-config` exposes these as `-window-size-mb` and `-buffer-budget-mb`.
+`Server.Stats()` and the health snapshot expose `buffer_reserved_bytes` and
+`buffer_budget_bytes` when a budget is configured.
+
+Streaming ACKs are coalesced by bytes (128 KiB) and time (10 ms), independently
+of keepalives. The GET headers are flushed first; the initial hello follows
+admission of the companion POST, so successful Dial proves both directions
+were admitted. Active stream I/O deadlines are refreshed rather than inheriting
+the HTTP server's absolute request timeout. Reconnects use exponential backoff
+with jitter capped at 30 seconds and reset their failure count after 30 seconds
+of healthy streaming. A server restart that loses session state still requires
+a new application connection; transport resume preserves an existing session.
+
+`XHTTPConn.SetDeadline`, `SetReadDeadline` and `SetWriteDeadline` apply to
+application I/O, including already blocked operations. Clear a deadline with
+`time.Time{}` to resume; timeout errors match `os.ErrDeadlineExceeded`. Partial
+frame parsing survives a read timeout, and frames that fit the send window are
+enqueued atomically so a write timeout cannot leave a partial wire frame.
 
 ---
 

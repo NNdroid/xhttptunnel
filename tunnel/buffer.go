@@ -3,9 +3,11 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -96,20 +98,24 @@ func safelyPutSendBuf(bufPtr *[]byte) {
 // ==========================================
 
 type reliableBuffer struct {
-	mu         sync.Mutex
-	cond       *sync.Cond
-	buf        []byte // pre-allocated fixed-size array, never grows
-	head       int    // write cursor
-	tail       int    // read/cleanup cursor
-	count      int    // current number of valid bytes in the buffer
-	baseOffset uint64 // absolute network sequence number (Seq) that tail maps to
-	maxSize    int
-	closed     bool
+	mu            sync.Mutex
+	cond          *sync.Cond
+	buf           []byte // pre-allocated fixed-size array, never grows
+	head          int    // write cursor
+	tail          int    // read/cleanup cursor
+	count         int    // current number of valid bytes in the buffer
+	baseOffset    uint64 // absolute network sequence number (Seq) that tail maps to
+	maxSize       int
+	closed        bool
+	changed       chan struct{} // coalesced notifications for stream writers
+	writeDeadline time.Time
+	writeTimer    *time.Timer
 }
 
 func newReliableBuffer(maxSize int) *reliableBuffer {
 	rb := &reliableBuffer{
 		maxSize: maxSize,
+		changed: make(chan struct{}, 1),
 	}
 	rb.cond = sync.NewCond(&rb.mu)
 	return rb
@@ -122,6 +128,12 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
+	if rb.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if deadlineExpired(rb.writeDeadline) {
+		return 0, os.ErrDeadlineExceeded
+	}
 	// Most sessions spend their lifetime waiting on a long poll. Allocate the
 	// backing ring only for sessions that actually upload data; eagerly
 	// reserving this multi-megabyte buffer for every admitted session makes a
@@ -132,14 +144,31 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 
 	written := 0
 	pLen := len(p)
+	// Frames that fit in the window are enqueued atomically. A deadline
+	// midway through a frame would otherwise leave its peer parser awaiting
+	// a suffix that the application's next Write cannot reconstruct.
+	if pLen <= rb.maxSize {
+		for rb.maxSize-rb.count < pLen && !rb.closed && !deadlineExpired(rb.writeDeadline) {
+			rb.cond.Wait()
+		}
+		if rb.closed {
+			return 0, io.ErrClosedPipe
+		}
+		if deadlineExpired(rb.writeDeadline) {
+			return 0, os.ErrDeadlineExceeded
+		}
+	}
 
 	// If the data exceeds the available space, write in blocking batches (backpressure)
 	for written < pLen {
-		for rb.count >= rb.maxSize && !rb.closed {
+		for rb.count >= rb.maxSize && !rb.closed && !deadlineExpired(rb.writeDeadline) {
 			rb.cond.Wait()
 		}
 		if rb.closed {
 			return written, io.ErrClosedPipe
+		}
+		if deadlineExpired(rb.writeDeadline) {
+			return written, os.ErrDeadlineExceeded
 		}
 
 		avail := rb.maxSize - rb.count
@@ -160,6 +189,9 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 
 		rb.count += toWrite
 		written += toWrite
+		// Publish each batch before waiting for space. A Write larger than
+		// the window must let the dispatcher drain its first batch.
+		rb.signalLocked()
 	}
 
 	if written > 0 {
@@ -174,7 +206,49 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 func (rb *reliableBuffer) GetSlice(remoteAck uint64, dispatchSeq uint64, maxLen int) ([]byte, uint64, *[]byte) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
+	seq, length, start := rb.sliceRangeLocked(remoteAck, dispatchSeq, maxLen)
+	if length == 0 {
+		return nil, seq, nil
+	}
+	ptr := sendBuf.Get().(*[]byte)
+	if cap(*ptr) < length {
+		*ptr = make([]byte, length)
+	}
+	res := (*ptr)[:length]
+	rb.copyRangeLocked(res, start)
+	if !rb.pendingBeyond(seq + uint64(length)) {
+		rb.cond.Broadcast()
+	}
+	return res, seq, ptr
+}
 
+func (rb *reliableBuffer) copyRangeLocked(dst []byte, start int) {
+	n := copy(dst, rb.buf[start:])
+	if n < len(dst) {
+		copy(dst[n:], rb.buf[:len(dst)-n])
+	}
+}
+
+// getStreamFrame copies from the reliable ring straight into the wire frame,
+// avoiding the intermediate pooled payload and its second bulk copy.
+func (rb *reliableBuffer) getStreamFrame(remoteAck, dispatchSeq, ack uint64, maxLen int, scratch []byte) ([]byte, uint64, error) {
+	rb.mu.Lock()
+	seq, length, start := rb.sliceRangeLocked(remoteAck, dispatchSeq, maxLen)
+	if length == 0 {
+		rb.mu.Unlock()
+		return nil, seq, nil
+	}
+	pad := padLenFor(length)
+	frame := streamFrameStorage(scratch, seq, ack, length, pad)
+	rb.copyRangeLocked(frame[22+pad:], start)
+	if !rb.pendingBeyond(seq + uint64(length)) {
+		rb.cond.Broadcast()
+	}
+	rb.mu.Unlock()
+	_, err := rand.Read(frame[22 : 22+pad])
+	return frame, seq, err
+}
+func (rb *reliableBuffer) sliceRangeLocked(remoteAck uint64, dispatchSeq uint64, maxLen int) (uint64, int, int) {
 	// Discard data the peer has already acknowledged (advance the tail cursor)
 	freed := false
 	if remoteAck > rb.baseOffset && remoteAck-rb.baseOffset <= uint64(rb.count) {
@@ -197,7 +271,7 @@ func (rb *reliableBuffer) GetSlice(remoteAck uint64, dispatchSeq uint64, maxLen 
 
 	delta := dispatchSeq - rb.baseOffset
 	if delta >= uint64(rb.count) || maxLen <= 0 {
-		return nil, dispatchSeq, nil
+		return dispatchSeq, 0, 0
 	}
 	offsetInBuf := int(delta)
 
@@ -207,35 +281,7 @@ func (rb *reliableBuffer) GetSlice(remoteAck uint64, dispatchSeq uint64, maxLen 
 		length = maxLen
 	}
 
-	bufPtr := sendBuf.Get().(*[]byte)
-	if cap(*bufPtr) < length {
-		// Swap in a bigger backing array but keep the pooled *[]byte
-		// container. Replacing the pointer outright drops the pooled object
-		// on the floor, so the pool slowly drains and every request pays a
-		// fresh allocation again. The grown container still passes the
-		// capacity check in safelyPutSendBuf, so it comes back on release.
-		*bufPtr = make([]byte, length)
-	}
-	res := (*bufPtr)[:length]
-
-	startIdx := (rb.tail + offsetInBuf) % rb.maxSize
-	firstPart := rb.maxSize - startIdx
-
-	if length <= firstPart {
-		copy(res, rb.buf[startIdx:startIdx+length])
-	} else {
-		copy(res[:firstPart], rb.buf[startIdx:startIdx+firstPart])
-		copy(res[firstPart:], rb.buf[0:length-firstPart])
-	}
-
-	// This hand-out moves the dispatch cursor, which the freed branch above
-	// does not cover. Wake a waitDrained sleeper only when the queue actually
-	// emptied, so the common streaming case pays nothing.
-	if length > 0 && !rb.pendingBeyond(dispatchSeq+uint64(length)) {
-		rb.cond.Broadcast()
-	}
-
-	return res, dispatchSeq, bufPtr
+	return dispatchSeq, length, (rb.tail + offsetInBuf) % rb.maxSize
 }
 
 func (rb *reliableBuffer) Len() int {
@@ -275,8 +321,30 @@ func (rb *reliableBuffer) undispatched(dispatchSeq uint64) int {
 // can miss the signal.
 func (rb *reliableBuffer) broadcast() {
 	rb.mu.Lock()
-	rb.cond.Broadcast()
+	rb.signalLocked()
 	rb.mu.Unlock()
+}
+
+func (rb *reliableBuffer) signalLocked() {
+	rb.cond.Broadcast()
+	select {
+	case rb.changed <- struct{}{}:
+	default:
+	}
+}
+
+// acknowledge releases capacity immediately, even while the dispatcher is
+// asleep. ACK progress must not depend on another application write or tick.
+func (rb *reliableBuffer) acknowledge(ack uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if ack > rb.baseOffset && ack-rb.baseOffset <= uint64(rb.count) {
+		skip := int(ack - rb.baseOffset)
+		rb.tail = (rb.tail + skip) % rb.maxSize
+		rb.count -= skip
+		rb.baseOffset = ack
+		rb.signalLocked()
+	}
 }
 
 // wait parks the caller until something broadcasts (typically new data being
@@ -346,9 +414,10 @@ func (rb *reliableBuffer) waitDrained(timeout time.Duration, dispatchSeq uint64)
 	if !rb.pendingBeyond(dispatchSeq) || rb.closed {
 		return
 	}
-	timer := time.AfterFunc(timeout, func() { rb.broadcast() })
+	deadline := time.Now().Add(timeout)
+	timer := time.AfterFunc(time.Until(deadline), func() { rb.broadcast() })
 	defer timer.Stop()
-	for rb.pendingBeyond(dispatchSeq) && !rb.closed {
+	for rb.pendingBeyond(dispatchSeq) && !rb.closed && time.Now().Before(deadline) {
 		rb.cond.Wait()
 	}
 }
@@ -357,7 +426,29 @@ func (rb *reliableBuffer) Close() {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	rb.closed = true
-	rb.cond.Broadcast()
+	if rb.writeTimer != nil {
+		rb.writeTimer.Stop()
+	}
+	rb.signalLocked()
+}
+
+func deadlineExpired(t time.Time) bool { return !t.IsZero() && !time.Now().Before(t) }
+
+func (rb *reliableBuffer) setWriteDeadline(t time.Time) error {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if rb.closed {
+		return net.ErrClosed
+	}
+	rb.writeDeadline = t
+	if rb.writeTimer != nil {
+		rb.writeTimer.Stop()
+	}
+	if !t.IsZero() {
+		rb.writeTimer = time.AfterFunc(time.Until(t), rb.broadcast)
+	}
+	rb.signalLocked()
+	return nil
 }
 
 // ==========================================
@@ -377,6 +468,8 @@ type meekVirtualConn struct {
 	// while completely idle. Read releases the array when the buffer has been
 	// drained and quiet for readBufIdleGrace. Guarded by readCond.L.
 	readBufBusyAt time.Time
+	readDeadline  time.Time // guarded by readCond.L
+	readTimer     *time.Timer
 	nextReadSeq   uint64            // next Seq we expect to receive
 	oooBuf        map[uint64][]byte // out-of-order cache
 	oooBytes      int               // total bytes held by oooBuf
@@ -397,6 +490,7 @@ type meekVirtualConn struct {
 	kicked         atomic.Bool // set by Kick: the downlink must NOT send a close marker, so the client re-establishes
 	closedCh       chan struct{}
 	closedOnce     sync.Once
+	receiveChanged chan struct{} // receive/ACK progress, independent of send data
 	// lastActive must stay an atomic.Int64, never a plain int64: on 32-bit
 	// targets (386/arm) a plain int64 deep inside this struct lands on a
 	// 4-byte boundary, and atomic.LoadInt64/StoreInt64 on it traps with
@@ -420,7 +514,9 @@ type meekVirtualConn struct {
 
 	// closeErr records why the session died, for XHTTPConn.Err(). Written
 	// once before the close signal fires; read-only afterwards.
-	closeErr atomic.Pointer[closeErrValue]
+	closeErr    atomic.Pointer[closeErrValue]
+	budget      *bufferBudget
+	reservation int64
 }
 
 // closeErrValue boxes an error so it can live in an atomic.Pointer.
@@ -475,15 +571,16 @@ func (c *meekVirtualConn) downWriterActive() bool {
 
 func newMeekVirtualConn(sessionID string, local, remote net.Addr, lg *zap.Logger) *meekVirtualConn {
 	c := &meekVirtualConn{
-		sessionID:   sessionID,
-		local:       local,
-		remote:      remote,
-		logField:    lg,
-		closedCh:    make(chan struct{}),
-		streamReady: make(chan struct{}),
-		readCond:    sync.NewCond(&sync.Mutex{}),
-		writeBuf:    newReliableBuffer(4 * 1024 * 1024), // 4MB max buffer
-		oooBuf:      make(map[uint64][]byte),
+		sessionID:      sessionID,
+		local:          local,
+		remote:         remote,
+		logField:       lg,
+		closedCh:       make(chan struct{}),
+		streamReady:    make(chan struct{}),
+		receiveChanged: make(chan struct{}, 1),
+		readCond:       sync.NewCond(&sync.Mutex{}),
+		writeBuf:       newReliableBuffer(defaultWindowBytes),
+		oooBuf:         make(map[uint64][]byte),
 	}
 	c.lastActive.Store(time.Now().Unix())
 	return c
@@ -509,7 +606,10 @@ func (c *meekVirtualConn) log() *zap.Logger {
 func (c *meekVirtualConn) Read(p []byte) (int, error) {
 	c.readCond.L.Lock()
 	defer c.readCond.L.Unlock()
-	for c.readBuf.Len() == 0 && !c.isClosed() {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for c.readBuf.Len() == 0 && !c.isClosed() && !deadlineExpired(c.readDeadline) {
 		// About to park with nothing to hand over: give back a peak-sized
 		// reassembly array if the session has been quiet for a while. The
 		// grace period keeps a bursty-but-active session from trading its
@@ -522,11 +622,18 @@ func (c *meekVirtualConn) Read(p []byte) (int, error) {
 	if c.isClosed() && c.readBuf.Len() == 0 {
 		return 0, io.EOF
 	}
+	if deadlineExpired(c.readDeadline) {
+		return 0, os.ErrDeadlineExceeded
+	}
 	n, err := c.readBuf.Read(p)
 	// Wake any producer parked on backpressure in PutReadData.
 	if n > 0 {
+		before := c.nextReadSeq
 		c.drainContiguous()
 		c.readCond.Broadcast()
+		if c.nextReadSeq != before {
+			c.notifyReceive()
+		}
 	}
 	return n, err
 }
@@ -606,7 +713,14 @@ func (c *meekVirtualConn) PutReadData(seq uint64, data []byte) uint64 {
 // the peer can retransmit from the returned cumulative acknowledgement.
 func (c *meekVirtualConn) PutReadDataContext(ctx context.Context, seq uint64, data []byte) (uint64, error) {
 	c.readCond.L.Lock()
-	defer c.readCond.L.Unlock()
+	before := c.nextReadSeq
+	defer func() {
+		progress := c.nextReadSeq != before
+		c.readCond.L.Unlock()
+		if progress {
+			c.notifyReceive()
+		}
+	}()
 	if uint64(len(data)) > ^uint64(0)-seq || len(data) > maxReassemblyBytes {
 		return c.nextReadSeq, fmt.Errorf("invalid receive sequence or payload size")
 	}
@@ -681,6 +795,13 @@ func (c *meekVirtualConn) PutReadDataContext(ctx context.Context, seq uint64, da
 			})
 		}
 		c.readCond.Wait()
+	}
+}
+
+func (c *meekVirtualConn) notifyReceive() {
+	select {
+	case c.receiveChanged <- struct{}{}:
+	default:
 	}
 }
 
@@ -775,7 +896,13 @@ func (c *meekVirtualConn) Close() error {
 	if !c.closedFlag.CompareAndSwap(false, true) {
 		return nil
 	}
+	if c.budget != nil {
+		c.budget.used.Add(-c.reservation)
+	}
 	c.readCond.L.Lock()
+	if c.readTimer != nil {
+		c.readTimer.Stop()
+	}
 	c.oooBuf = nil
 	c.oooBytes = 0
 	c.oooMinSeq = 0
@@ -789,8 +916,41 @@ func (c *meekVirtualConn) Close() error {
 	return nil
 }
 
-func (c *meekVirtualConn) LocalAddr() net.Addr                { return c.local }
-func (c *meekVirtualConn) RemoteAddr() net.Addr               { return c.remote }
-func (c *meekVirtualConn) SetDeadline(t time.Time) error      { return nil }
-func (c *meekVirtualConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *meekVirtualConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *meekVirtualConn) LocalAddr() net.Addr  { return c.local }
+func (c *meekVirtualConn) RemoteAddr() net.Addr { return c.remote }
+func (c *meekVirtualConn) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
+}
+func (c *meekVirtualConn) SetReadDeadline(t time.Time) error {
+	c.readCond.L.Lock()
+	defer c.readCond.L.Unlock()
+	if c.isClosed() {
+		return net.ErrClosed
+	}
+	c.readDeadline = t
+	if c.readTimer != nil {
+		c.readTimer.Stop()
+	}
+	if !t.IsZero() {
+		c.readTimer = time.AfterFunc(time.Until(t), func() {
+			c.readCond.L.Lock()
+			c.readCond.Broadcast()
+			c.readCond.L.Unlock()
+		})
+	}
+	c.readCond.Broadcast()
+	return nil
+}
+func (c *meekVirtualConn) SetWriteDeadline(t time.Time) error { return c.writeBuf.setWriteDeadline(t) }
+
+func (c *meekVirtualConn) readDeadlineError() error {
+	c.readCond.L.Lock()
+	defer c.readCond.L.Unlock()
+	if deadlineExpired(c.readDeadline) {
+		return os.ErrDeadlineExceeded
+	}
+	return nil
+}
