@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand"
@@ -102,15 +103,23 @@ type XHTTPConn struct {
 	network    string
 	// vc is the underlying session, when this conn wraps one (nil in tests
 	// that build the conn from raw pipes). It backs Done() and Err().
-	vc         *meekVirtualConn
-	mu         sync.Mutex
-	readBuf    []byte
-	frameBuf   []byte
-	hdrBuf     []byte
-	payloadBuf []byte
-	padScratch []byte
-	closeCh    chan struct{}
-	closedFlag int32
+	vc               *meekVirtualConn
+	mu               sync.Mutex
+	readMu           sync.Mutex
+	readPending      []byte
+	readScratch      []byte
+	headerRead       int
+	headerParsed     bool
+	paddingRemaining int
+	payloadRemaining int
+	nextPayload      int
+	peerClosed       bool
+	frameBuf         []byte
+	hdrBuf           []byte
+	payloadBuf       []byte
+	padScratch       []byte
+	closeCh          chan struct{}
+	closedFlag       int32
 }
 
 func newXHTTPConn(r io.Reader, w io.Writer, closer func() error, local, remote net.Addr, vc *meekVirtualConn) *XHTTPConn {
@@ -213,13 +222,25 @@ func (c *XHTTPConn) writeSingleFrame(chunk []byte) error {
 // the peer's stream) followed by the standard 6-byte padded frame. One buffer
 // means one Write per chunk on the wire.
 func streamFrameBytes(seq, ack uint64, payload []byte) ([]byte, error) {
-	padLenInt := padLenFor(len(payload))
-	total := 16 + 6 + padLenInt + len(payload)
-	buf := make([]byte, total)
+	return streamFrameBytesInto(nil, seq, ack, payload)
+}
+
+func streamFrameStorage(scratch []byte, seq, ack uint64, length, pad int) []byte {
+	total := 22 + pad + length
+	if cap(scratch) < total {
+		scratch = make([]byte, total)
+	}
+	buf := scratch[:total]
 	binary.BigEndian.PutUint64(buf[0:8], seq)
 	binary.BigEndian.PutUint64(buf[8:16], ack)
-	binary.BigEndian.PutUint32(buf[16:20], uint32(len(payload)))
-	binary.BigEndian.PutUint16(buf[20:22], uint16(padLenInt))
+	binary.BigEndian.PutUint32(buf[16:20], uint32(length))
+	binary.BigEndian.PutUint16(buf[20:22], uint16(pad))
+	return buf
+}
+
+func streamFrameBytesInto(scratch []byte, seq, ack uint64, payload []byte) ([]byte, error) {
+	padLenInt := padLenFor(len(payload))
+	buf := streamFrameStorage(scratch, seq, ack, len(payload), padLenInt)
 	if padLenInt > 0 {
 		if _, err := rand.Read(buf[22 : 22+padLenInt]); err != nil {
 			return nil, err
@@ -248,6 +269,13 @@ type streamFrame struct {
 // readStreamFrame parses one stream-mode chunk from r. Header guards mirror
 // XHTTPConn.Read's defense in depth.
 func readStreamFrame(r io.Reader) (streamFrame, error) {
+	var scratch []byte
+	return readStreamFrameInto(r, &scratch)
+}
+
+// The payload is borrowed until the next call. PutReadData copies accepted
+// data into its bounded reassembly storage before that call occurs.
+func readStreamFrameInto(r io.Reader, scratch *[]byte) (streamFrame, error) {
 	var meta [22]byte
 	if _, err := io.ReadFull(r, meta[:]); err != nil {
 		return streamFrame{}, err
@@ -273,7 +301,10 @@ func readStreamFrame(r io.Reader) (streamFrame, error) {
 	if f.closed || payloadLen == 0 {
 		return f, nil
 	}
-	f.data = make([]byte, payloadLen)
+	if cap(*scratch) < int(payloadLen) {
+		*scratch = make([]byte, payloadLen)
+	}
+	f.data = (*scratch)[:payloadLen]
 	if _, err := io.ReadFull(r, f.data); err != nil {
 		return f, err
 	}
@@ -308,60 +339,92 @@ func (c *XHTTPConn) Write(p []byte) (int, error) {
 }
 
 func (c *XHTTPConn) Read(p []byte) (int, error) {
-	if len(c.readBuf) > 0 {
-		n := copy(p, c.readBuf)
-		c.readBuf = c.readBuf[n:]
-		return n, nil
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.vc != nil {
+		if err := c.vc.readDeadlineError(); err != nil {
+			return 0, err
+		}
 	}
 	for {
-		if _, err := io.ReadFull(c.r, c.hdrBuf); err != nil {
-			return 0, err
+		if len(c.readPending) > 0 {
+			n := copy(p, c.readPending)
+			c.readPending = c.readPending[n:]
+			return n, nil
 		}
-		rawPayloadLen := binary.BigEndian.Uint32(c.hdrBuf[0:4])
-		padLen := int(binary.BigEndian.Uint16(c.hdrBuf[4:6]))
-
-		// Defense in depth: cap per-frame padding and payload size to prevent malicious OOM
-		if padLen > 65535 || (rawPayloadLen != 0xFFFFFFFF && rawPayloadLen > uint32(currentMaxFrameSize()*4)) {
-			return 0, fmt.Errorf("corrupted frame header: payloadLen=%d, padLen=%d", rawPayloadLen, padLen)
-		}
-
-		if padLen > 0 {
-			if padLen > cap(c.payloadBuf) {
-				c.payloadBuf = make([]byte, padLen)
+		if c.payloadRemaining > 0 {
+			count := len(p)
+			if count > c.payloadRemaining {
+				count = c.payloadRemaining
 			}
-			if _, err := io.ReadFull(c.r, c.payloadBuf[:padLen]); err != nil {
+			// Preserve frame-sized batching while tracking partial progress:
+			// tiny transport reads otherwise multiply TCP writes and H2/H3
+			// flushes. A deadline returns its accepted prefix and can resume.
+			n, err := io.ReadFull(c.r, p[:count])
+			c.payloadRemaining -= n
+			if err == nil && c.payloadRemaining > 0 {
+				// Drain the rest of this frame before returning the prefix, as
+				// the original reader did. Reuse dedicated storage rather than
+				// allocating a leftover slice for every application Read.
+				if cap(c.readScratch) < c.payloadRemaining {
+					c.readScratch = make([]byte, c.payloadRemaining)
+				}
+				remaining, rerr := io.ReadFull(c.r, c.readScratch[:c.payloadRemaining])
+				c.payloadRemaining -= remaining
+				c.readPending = c.readScratch[:remaining]
+				err = rerr
+			}
+			return n, err
+		}
+		for c.headerRead < 6 {
+			n, err := c.r.Read(c.hdrBuf[c.headerRead:])
+			c.headerRead += n
+			if err != nil && c.headerRead < 6 {
 				return 0, err
 			}
+			if n == 0 && err == nil {
+				return 0, io.ErrNoProgress
+			}
 		}
-
-		if rawPayloadLen == uint32(0xFFFFFFFF) {
+		if !c.headerParsed {
+			raw := binary.BigEndian.Uint32(c.hdrBuf[:4])
+			c.paddingRemaining = int(binary.BigEndian.Uint16(c.hdrBuf[4:6]))
+			c.peerClosed = raw == ^uint32(0)
+			if !c.peerClosed && raw > uint32(currentMaxFrameSize()*4) {
+				return 0, fmt.Errorf("corrupted frame header: payloadLen=%d", raw)
+			}
+			if !c.peerClosed {
+				c.nextPayload = int(raw)
+			}
+			c.headerParsed = true
+		}
+		for c.paddingRemaining > 0 {
+			if len(c.payloadBuf) == 0 {
+				c.payloadBuf = make([]byte, 1024)
+			}
+			count := c.paddingRemaining
+			if count > len(c.payloadBuf) {
+				count = len(c.payloadBuf)
+			}
+			n, err := c.r.Read(c.payloadBuf[:count])
+			c.paddingRemaining -= n
+			if err != nil && c.paddingRemaining > 0 {
+				return 0, err
+			}
+			if n == 0 && err == nil {
+				return 0, io.ErrNoProgress
+			}
+		}
+		if c.peerClosed {
 			return 0, io.EOF
 		}
-		if rawPayloadLen == 0 {
-			continue
-		}
-
-		payloadLen := int(rawPayloadLen)
-		readIntoP := payloadLen
-		if readIntoP > len(p) {
-			readIntoP = len(p)
-		}
-		if _, err := io.ReadFull(c.r, p[:readIntoP]); err != nil {
-			return 0, err
-		}
-
-		leftover := payloadLen - readIntoP
-		if leftover > 0 {
-			// The leftover bytes must be stored in a dedicated slice; never reuse
-			// c.payloadBuf here, otherwise reading the next frame's padding
-			// (line 253) would overwrite this unread payload data!
-			leftoverBuf := make([]byte, leftover)
-			if _, err := io.ReadFull(c.r, leftoverBuf); err != nil {
-				return readIntoP, err
-			}
-			c.readBuf = leftoverBuf
-		}
-		return readIntoP, nil
+		c.payloadRemaining = c.nextPayload
+		c.nextPayload = 0
+		c.headerRead = 0
+		c.headerParsed = false
 	}
 }
 
@@ -378,8 +441,23 @@ func (c *XHTTPConn) Close() error {
 func (c *XHTTPConn) TargetAddr() string { return c.targetAddr }
 func (c *XHTTPConn) Network() string    { return c.network }
 
-func (c *XHTTPConn) LocalAddr() net.Addr                { return c.local }
-func (c *XHTTPConn) RemoteAddr() net.Addr               { return c.remote }
-func (c *XHTTPConn) SetDeadline(t time.Time) error      { return nil }
-func (c *XHTTPConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *XHTTPConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *XHTTPConn) LocalAddr() net.Addr  { return c.local }
+func (c *XHTTPConn) RemoteAddr() net.Addr { return c.remote }
+func (c *XHTTPConn) SetDeadline(t time.Time) error {
+	if c.vc == nil {
+		return errors.ErrUnsupported
+	}
+	return c.vc.SetDeadline(t)
+}
+func (c *XHTTPConn) SetReadDeadline(t time.Time) error {
+	if c.vc == nil {
+		return errors.ErrUnsupported
+	}
+	return c.vc.SetReadDeadline(t)
+}
+func (c *XHTTPConn) SetWriteDeadline(t time.Time) error {
+	if c.vc == nil {
+		return errors.ErrUnsupported
+	}
+	return c.vc.SetWriteDeadline(t)
+}

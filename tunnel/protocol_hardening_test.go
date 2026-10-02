@@ -172,13 +172,19 @@ func TestMaxConnsSlotReleasedOnDeath(t *testing.T) {
 	defer cancel()
 
 	const secret = "harden-secret"
-	// A server that ends every session immediately: the client observes a
+	// A server that ends the session after Dial returns: the client observes a
 	// clean close marker ("peer closed"), a terminal death that fires Done.
+	endSession := make(chan struct{})
+	defer close(endSession)
 	srv, err := NewServer(ServerConfig{
 		Listen: "tcp://127.0.0.1:0",
 		Path:   "/stream",
 		PSK:    secret,
 		Handler: func(conn *XHTTPConn) {
+			select {
+			case <-endSession:
+			case <-ctx.Done():
+			}
 			conn.Close()
 		},
 	})
@@ -217,6 +223,7 @@ func TestMaxConnsSlotReleasedOnDeath(t *testing.T) {
 	if c.ActiveDials() != 1 {
 		t.Fatalf("ActiveDials = %d, want 1 after dial", c.ActiveDials())
 	}
+	endSession <- struct{}{}
 
 	deadline := time.Now().Add(5 * time.Second)
 	for c.ActiveDials() != 0 && time.Now().Before(deadline) {

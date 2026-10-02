@@ -945,6 +945,13 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 // least Listen and a PSK (an empty PSK runs the server in unauthenticated
 // open mode — never expose that publicly).
 type ServerConfig struct {
+	// WindowSizeMB sets the per-session reliable send window in MiB.
+	// 0 preserves the 4 MiB default; valid explicit sizes are 1-64.
+	WindowSizeMB int
+	// BufferBudgetMB caps reserved active tunnel buffer capacity per server.
+	// 0 preserves admission by MaxSessions alone. Excludes HTTP/TLS/QUIC,
+	// goroutine stacks and buffers retained by callers after session close.
+	BufferBudgetMB int
 	// Listen is the bind address with an optional scheme prefix: "tcp://:8443",
 	// "udp://:8443" or "tcp+udp://:8443" (default when no scheme is given).
 	// A udp:// socket serves HTTP/3 and therefore requires TLS (see CertFile).
@@ -1070,6 +1077,10 @@ type Server struct {
 // socket; call [Server.ListenAndServe] to start serving. Self-signed
 // certificate generation (ServerConfig.SelfSign) happens here.
 func NewServer(cfg ServerConfig) (*Server, error) {
+	if err := ValidateBufferLimits(cfg.WindowSizeMB, cfg.BufferBudgetMB); err != nil {
+		return nil, err
+	}
+	window, _ := windowBytes(cfg.WindowSizeMB)
 	if cfg.Path == "" {
 		cfg.Path = "/stream"
 	}
@@ -1098,6 +1109,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	state := newServerState(cfg.MaxSessions)
+	state.windowSize = window
+	if cfg.BufferBudgetMB > 0 {
+		state.bufferBudget = &bufferBudget{limit: int64(cfg.BufferBudgetMB) << 20}
+	}
 	state.customLog = cfg.Logger
 	state.events = newSessionEventHub(cfg.EventHandler)
 	state.setAllowedTargets(cfg.AllowedTargets)

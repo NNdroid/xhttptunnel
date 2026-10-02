@@ -1,8 +1,11 @@
 package tunnel
 
 import (
+	"context"
+	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -22,6 +25,45 @@ const streamContentType = "application/xhttp-stream"
 // downlink handler can miss a wakeup for kicked/closed sessions — kept short
 // so a lost cond broadcast costs a few seconds, never a full CDN idle window.
 const streamKeepaliveInterval = 5 * time.Second
+
+const streamAckInterval = 10 * time.Millisecond
+
+// H2 deadline changes are messages to its shared connection scheduler. Refresh
+// at most once per second so bulk frames do not flood that control queue.
+func refreshStreamDeadline(last *time.Time, set func(time.Time) error) {
+	now := time.Now()
+	if last.IsZero() || now.Sub(*last) >= time.Second {
+		_ = set(now.Add(streamWatchdogTimeout))
+		*last = now
+	}
+}
+
+type streamDeadlineReader struct {
+	r         io.Reader
+	rc        *http.ResponseController
+	refreshed time.Time
+}
+
+func (r *streamDeadlineReader) Read(p []byte) (int, error) {
+	// Refresh on body read progress, not just complete frames: a healthy
+	// low-bandwidth upload may take longer than the timeout to fill a frame.
+	refreshStreamDeadline(&r.refreshed, r.rc.SetReadDeadline)
+	return r.r.Read(p)
+}
+
+// streamWait combines data, ACK progress and cancellation without a polling
+// loop. Buffered notifications cover changes between the fetch and the wait.
+func streamWait(ctx context.Context, c *meekVirtualConn, delay time.Duration) {
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-c.writeBuf.changed:
+	case <-c.receiveChanged:
+	case <-c.closedSignal():
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
 
 // attachOrCreateSession is the single critical section shared by the poll and
 // stream paths: atomic lookup, allowlist enforcement, capacity check and
@@ -70,7 +112,20 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 			return nil, false, http.StatusServiceUnavailable
 		}
 	}
+	window := st.windowSize
+	if window == 0 {
+		window = defaultWindowBytes
+	}
+	reservation := bufferReservation(window)
+	if !st.bufferBudget.reserve(reservation) {
+		st.sessionsMu.Unlock()
+		st.stats.sessionsReject.Add(1)
+		st.events.emit(SessionLimitRejected{SessionID: sessionID, Remote: remoteAddr})
+		return nil, false, http.StatusServiceUnavailable
+	}
 	vConn = newMeekVirtualConn(sessionID, stringAddr(host), stringAddr(remoteAddr), st.lg())
+	vConn.writeBuf = newReliableBuffer(window)
+	vConn.budget, vConn.reservation = st.bufferBudget, reservation
 	st.sessions[sessionID] = vConn
 	if st.perIP != nil {
 		if ip := ipOnly(remoteAddr); ip != "" {
@@ -168,11 +223,27 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	w.WriteHeader(http.StatusOK)
 
 	rc := http.NewResponseController(w)
+	var deadlineRefreshed time.Time
+	// Global request deadlines are absolute and unsuitable for long streams.
+	// Use bounded, refreshed I/O deadlines instead, including mounted mode.
+	refreshStreamDeadline(&deadlineRefreshed, rc.SetWriteDeadline)
 	if err := rc.Flush(); err != nil {
 		// A path that cannot flush cannot stream; the client will not see the
 		// hello bytes inside its probe window and falls back to polling.
 		logger.Warn("⚠️ [Stream] response does not support Flush, streaming downlink unavailable", zap.String("session", sessionID), zap.Error(err))
 		return
+	}
+
+	if created {
+		select {
+		case <-vConn.streamReady:
+		case <-r.Context().Done():
+			return
+		case <-vConn.closedSignal():
+			return
+		case <-time.After(streamProbeMinWindow):
+			return
+		}
 	}
 
 	// Hello frame: zero payload, carries the current dispatch cursor so the
@@ -192,20 +263,8 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 		return
 	}
 
-	// The client starts its companion POST only after seeing the flushed GET
-	// headers. Do not send the hello frame until that POST has passed auth and
-	// per-session admission; this makes Dial success mean both directions are
-	// actually usable, without requiring full-duplex responses on the POST
-	// (which many CDNs buffer until its request body ends).
-	if created {
-		select {
-		case <-vConn.streamReady:
-		case <-r.Context().Done():
-			return
-		case <-time.After(streamProbeMinWindow):
-			return
-		}
-	}
+	// The hello above follows POST admission, without requiring an early
+	// response on that still-streaming POST (which many CDNs buffer).
 	if vConn.isClosed() {
 		if !vConn.kicked.Load() {
 			vConn.downWindowMu.Lock()
@@ -219,6 +278,11 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 		return
 	}
 
+	lastAckSent := vConn.consumedUpSeq()
+	lastSent := time.Now()
+	var sendScratch []byte
+	var unflushedBytes int
+	lastWasData := false
 	for {
 		if r.Context().Err() != nil {
 			return
@@ -247,27 +311,42 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 			return
 		}
 
+		ack := vConn.consumedUpSeq()
 		vConn.downWindowMu.Lock()
 		if !vConn.holdsDownWriter(ticket) {
 			vConn.downWindowMu.Unlock()
 			return
 		}
-		downData, myDownSeq, downBufPtr := vConn.writeBuf.GetSlice(vConn.downPeerAck.Load(), vConn.downDispatchSeq, currentMaxSendBufSize())
-		if len(downData) > 0 {
-			vConn.downDispatchSeq = myDownSeq + uint64(len(downData))
+		frame, myDownSeq, err := vConn.writeBuf.getStreamFrame(vConn.downPeerAck.Load(), vConn.downDispatchSeq, ack, currentMaxSendBufSize(), sendScratch)
+		if len(frame) > 0 {
+			vConn.downDispatchSeq = myDownSeq + uint64(binary.BigEndian.Uint32(frame[16:20]))
 		} else {
 			vConn.downDispatchSeq = myDownSeq
 		}
 		vConn.downWindowMu.Unlock()
+		if err != nil {
+			return
+		}
 
-		if len(downData) == 0 {
+		if len(frame) == 0 {
+			elapsed := time.Since(lastSent)
+			pending := ack - lastAckSent
+			if !lastWasData && pending < ackCoalesceBytes && elapsed < streamKeepaliveInterval && (pending == 0 || elapsed < streamAckInterval) {
+				delay := streamKeepaliveInterval - elapsed
+				if pending > 0 {
+					delay = streamAckInterval - elapsed
+				}
+				streamWait(r.Context(), vConn, delay)
+				continue
+			}
 			// Idle: keepalive frame resets intermediary read timeouts and the
 			// session's idle stamp, then park until data, client departure,
 			// or the next keepalive tick.
-			ka, err := streamFrameBytes(myDownSeq, vConn.consumedUpSeq(), nil)
+			ka, err := streamFrameBytesInto(sendScratch, myDownSeq, ack, nil)
 			if err != nil {
 				return
 			}
+			refreshStreamDeadline(&deadlineRefreshed, rc.SetWriteDeadline)
 			if _, err = w.Write(ka); err != nil {
 				return
 			}
@@ -278,25 +357,38 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 				return
 			}
 			vConn.updateActive()
-			vConn.writeBuf.waitDispatchable(r.Context(), streamKeepaliveInterval, myDownSeq)
+			lastAckSent, lastSent = ack, time.Now()
+			lastWasData = false
+			if r.ProtoMajor != 3 {
+				sendScratch = ka
+			}
 			continue
 		}
 
-		frame, err := streamFrameBytes(myDownSeq, vConn.consumedUpSeq(), downData)
-		// streamFrameBytes copies the payload out, so the pooled buffer can
-		// go back right away — this also satisfies HTTP/3's write-slice
-		// retention without the special-case copy the poll path needs.
-		safelyPutSendBuf(downBufPtr)
-		if err != nil {
-			return
-		}
+		refreshStreamDeadline(&deadlineRefreshed, rc.SetWriteDeadline)
 		if _, err := w.Write(frame); err != nil {
 			return
 		}
-		if err := rc.Flush(); err != nil {
-			return
+		unflushedBytes += len(frame)
+		endSeq := myDownSeq + uint64(binary.BigEndian.Uint32(frame[16:20]))
+		// Batch only data already queued: interactive traffic flushes as soon
+		// as the queue drains, while bulk traffic flushes at 128 KiB.
+		if unflushedBytes >= ackCoalesceBytes || vConn.writeBuf.undispatched(endSeq) == 0 {
+			if err := rc.Flush(); err != nil {
+				return
+			}
+			unflushedBytes = 0
 		}
 		vConn.updateActive()
+		lastAckSent, lastSent = ack, time.Now()
+		// Finish a data burst with prompt control progress. Deferring this
+		// trailing ACK regresses short H2 request/response workloads.
+		lastWasData = true
+		// Preserve independently owned frames for HTTP/3 writers that may
+		// retain a write slice. h1/h2 and io.Pipe finish consuming on Write.
+		if r.ProtoMajor != 3 {
+			sendScratch = frame
+		}
 	}
 }
 
@@ -306,11 +398,16 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 func serveStreamUplink(w http.ResponseWriter, r *http.Request, st *serverState, vConn *meekVirtualConn, sessionID string) {
 	logger := st.lg()
 	defer r.Body.Close()
+	rc := http.NewResponseController(w)
+	var readScratch []byte
+	reader := &streamDeadlineReader{r: r.Body, rc: rc}
 
 	for {
-		f, err := readStreamFrame(r.Body)
+		f, err := readStreamFrameInto(reader, &readScratch)
 		if err != nil {
-			if r.Context().Err() != nil || (r.Header.Get("X-Stream-Resume") == "1" && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF))) {
+			var netErr net.Error
+			timedOut := errors.As(err, &netErr) && netErr.Timeout()
+			if r.Context().Err() != nil || (r.Header.Get("X-Stream-Resume") == "1" && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || timedOut)) {
 				// A transport round ended, not the application session. Preserve
 				// acknowledged bytes for the replacement POST; explicit markers
 				// below still close normally. Legacy clients retain EOF semantics.

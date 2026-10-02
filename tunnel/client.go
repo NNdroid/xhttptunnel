@@ -546,6 +546,10 @@ func serverEndpoint(u *url.URL, path string) (isTLS bool, hostPort, reqURL strin
 }
 
 func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetAddr, network string) (net.Conn, error) {
+	window, err := windowBytes(cfg.WindowSizeMB)
+	if err != nil {
+		return nil, err
+	}
 	logger := cfg.lg()
 	isTLS, hostPort, reqURL := serverEndpoint(serverURL, cfg.Path)
 	// Deliberately NOT writing cfg.Path here. cfg is shared by every session
@@ -601,6 +605,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 
 	client := &http.Client{Transport: rt, Timeout: clientRequestTimeout}
 	virtualConn := newMeekVirtualConn(sessionID, localAddr, remoteAddr, logger)
+	virtualConn.writeBuf = newReliableBuffer(window)
 	uploadChunkSize := currentMaxSendBufSize()
 	if cfg.ChunkSizeKB != 0 {
 		uploadChunkSize = chunkSizeBytes(cfg.ChunkSizeKB)
@@ -1205,6 +1210,8 @@ func (c *idleRefresher) Write(p []byte) (int, error) {
 type QUICDialFunc func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error)
 
 type DialConfig struct {
+	// WindowSizeMB sets the reliable send window (0 = 4 MiB, explicit 1-64).
+	WindowSizeMB int
 	// Path is the Split-HTTP endpoint path on the server (e.g. "/stream").
 	Path string
 	// SNI overrides the TLS SNI (ClientConfig.SNI in the SDK path).
@@ -1286,6 +1293,9 @@ func (c *DialConfig) lg() *zap.Logger {
 // ClientConfig configures a [Client]. At minimum set ServerURL and PSK;
 // everything else has a sensible default.
 type ClientConfig struct {
+	// WindowSizeMB sets each session's reliable send window in MiB.
+	// 0 preserves the 4 MiB default; valid explicit sizes are 1-64.
+	WindowSizeMB int
 	// ServerURL is the xhttptunnel server endpoint, e.g.
 	// "https://cdn.example.com:8443/stream".
 	ServerURL string
@@ -1402,6 +1412,9 @@ type Client struct {
 // NewClient validates cfg and prepares the client. It does not open any
 // network connection; transports are established lazily on the first dial.
 func NewClient(cfg ClientConfig) (*Client, error) {
+	if _, err := windowBytes(cfg.WindowSizeMB); err != nil {
+		return nil, err
+	}
 	switch strings.ToLower(strings.TrimSpace(cfg.StreamMode)) {
 	case "", "auto", "poll", "stream":
 	default:
@@ -1458,6 +1471,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		log:         cfg.Logger,
 	}
 	c.dialCfg = &DialConfig{
+		WindowSizeMB:           cfg.WindowSizeMB,
 		Password:               cfg.PSK,
 		Path:                   serverURL.Path,
 		SNI:                    sni,
