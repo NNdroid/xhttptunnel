@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -100,6 +101,47 @@ func TestDeadlineWriteLeavesNoPartialFrame(t *testing.T) {
 			t.Fatalf("retry corrupted frame: %q", got)
 		}
 	})
+}
+
+func TestReliableBufferBlockedWriteStops(t *testing.T) {
+	for _, oversized := range []bool{false, true} {
+		for _, closeBuffer := range []bool{false, true} {
+			t.Run(fmt.Sprintf("oversized=%v/close=%v", oversized, closeBuffer), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					rb := newReliableBuffer(4)
+					defer rb.Close()
+					if _, err := rb.Write([]byte("seed")); err != nil {
+						t.Fatal(err)
+					}
+					payload := []byte("abc")
+					if oversized {
+						payload = []byte("abcdef")
+					}
+					result := make(chan error, 1)
+					go func() {
+						n, err := rb.Write(payload)
+						if n != 0 {
+							t.Errorf("blocked write accepted %d bytes", n)
+						}
+						result <- err
+					}()
+					synctest.Wait()
+					want := error(os.ErrDeadlineExceeded)
+					if closeBuffer {
+						want = io.ErrClosedPipe
+						rb.Close()
+					} else {
+						rb.setWriteDeadline(time.Now().Add(time.Second))
+						time.Sleep(time.Second)
+					}
+					synctest.Wait()
+					if err := <-result; !errors.Is(err, want) {
+						t.Fatalf("write error: %v, want %v", err, want)
+					}
+				})
+			})
+		}
+	}
 }
 
 func TestDeadlineChangedWhileBlocked(t *testing.T) {

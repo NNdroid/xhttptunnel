@@ -148,27 +148,37 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 	// midway through a frame would otherwise leave its peer parser awaiting
 	// a suffix that the application's next Write cannot reconstruct.
 	if pLen <= rb.maxSize {
-		for rb.maxSize-rb.count < pLen && !rb.closed && !deadlineExpired(rb.writeDeadline) {
+		for rb.maxSize-rb.count < pLen {
 			rb.cond.Wait()
-		}
-		if rb.closed {
-			return 0, io.ErrClosedPipe
-		}
-		if deadlineExpired(rb.writeDeadline) {
-			return 0, os.ErrDeadlineExceeded
+			if rb.closed {
+				return 0, io.ErrClosedPipe
+			}
+			if deadlineExpired(rb.writeDeadline) {
+				return 0, os.ErrDeadlineExceeded
+			}
 		}
 	}
 
 	// If the data exceeds the available space, write in blocking batches (backpressure)
 	for written < pLen {
-		for rb.count >= rb.maxSize && !rb.closed && !deadlineExpired(rb.writeDeadline) {
+		// The initial checks cover the first batch without a wait. Check again
+		// after every wake and before subsequent batches, where time can pass.
+		if written > 0 {
+			if rb.closed {
+				return written, io.ErrClosedPipe
+			}
+			if deadlineExpired(rb.writeDeadline) {
+				return written, os.ErrDeadlineExceeded
+			}
+		}
+		for rb.count >= rb.maxSize {
 			rb.cond.Wait()
-		}
-		if rb.closed {
-			return written, io.ErrClosedPipe
-		}
-		if deadlineExpired(rb.writeDeadline) {
-			return written, os.ErrDeadlineExceeded
+			if rb.closed {
+				return written, io.ErrClosedPipe
+			}
+			if deadlineExpired(rb.writeDeadline) {
+				return written, os.ErrDeadlineExceeded
+			}
 		}
 
 		avail := rb.maxSize - rb.count
@@ -180,7 +190,10 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 		firstPart := rb.maxSize - rb.head
 		if toWrite <= firstPart {
 			copy(rb.buf[rb.head:], p[written:written+toWrite])
-			rb.head = (rb.head + toWrite) % rb.maxSize
+			rb.head += toWrite
+			if rb.head == rb.maxSize {
+				rb.head = 0
+			}
 		} else {
 			copy(rb.buf[rb.head:], p[written:written+firstPart])
 			copy(rb.buf[0:], p[written+firstPart:written+toWrite])
@@ -192,10 +205,6 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 		// Publish each batch before waiting for space. A Write larger than
 		// the window must let the dispatcher drain its first batch.
 		rb.signalLocked()
-	}
-
-	if written > 0 {
-		rb.cond.Broadcast()
 	}
 
 	return written, nil
