@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"time"
 
@@ -280,7 +279,14 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 
 	lastAckSent := vConn.consumedUpSeq()
 	lastSent := time.Now()
+	// h1/h2 transports (and the io.Pipe downlink) consume a frame inside
+	// Write, so a single reused buffer is safe there. An HTTP/3 writer may
+	// retain a write slice past the Write return, so HTTP/3 rotates through a
+	// small pool and each slot is remembered after use; deep enough that a
+	// buffer is never reused while the previous write still holds it.
 	var sendScratch []byte
+	var h3Bufs [3][]byte
+	h3Slot := 0
 	var unflushedBytes int
 	lastWasData := false
 	for {
@@ -317,7 +323,19 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 			vConn.downWindowMu.Unlock()
 			return
 		}
-		frame, myDownSeq, err := vConn.writeBuf.getStreamFrame(vConn.downPeerAck.Load(), vConn.downDispatchSeq, ack, currentMaxSendBufSize(), sendScratch)
+		// For HTTP/3, take a rotation slot before building the frame: the
+		// buffer must outlive the Write call, and the slot is remembered
+		// below so the next cycle reuses it. h1/h2 keep the single buffer.
+		var scratch []byte
+		var h3Take int
+		if r.ProtoMajor == 3 {
+			h3Take = h3Slot
+			h3Slot = (h3Slot + 1) % len(h3Bufs)
+			scratch = h3Bufs[h3Take]
+		} else {
+			scratch = sendScratch
+		}
+		frame, myDownSeq, err := vConn.writeBuf.getStreamFrame(vConn.downPeerAck.Load(), vConn.downDispatchSeq, ack, currentMaxSendBufSize(), scratch)
 		if len(frame) > 0 {
 			vConn.downDispatchSeq = myDownSeq + uint64(binary.BigEndian.Uint32(frame[16:20]))
 		} else {
@@ -342,7 +360,7 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 			// Idle: keepalive frame resets intermediary read timeouts and the
 			// session's idle stamp, then park until data, client departure,
 			// or the next keepalive tick.
-			ka, err := streamFrameBytesInto(sendScratch, myDownSeq, ack, nil)
+			ka, err := streamFrameBytesInto(scratch, myDownSeq, ack, nil)
 			if err != nil {
 				return
 			}
@@ -359,7 +377,9 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 			vConn.updateActive()
 			lastAckSent, lastSent = ack, time.Now()
 			lastWasData = false
-			if r.ProtoMajor != 3 {
+			if r.ProtoMajor == 3 {
+				h3Bufs[h3Take] = ka
+			} else {
 				sendScratch = ka
 			}
 			continue
@@ -384,9 +404,13 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 		// Finish a data burst with prompt control progress. Deferring this
 		// trailing ACK regresses short H2 request/response workloads.
 		lastWasData = true
-		// Preserve independently owned frames for HTTP/3 writers that may
-		// retain a write slice. h1/h2 and io.Pipe finish consuming on Write.
-		if r.ProtoMajor != 3 {
+		// h1/h2 and the io.Pipe downlink consume the frame inside Write, so
+		// that one buffer is retained and reused for the next iteration. HTTP/3
+		// remembers the frame in its rotation slot: without this the slot would
+		// stay nil and every frame would allocate again.
+		if r.ProtoMajor == 3 {
+			h3Bufs[h3Take] = frame
+		} else {
 			sendScratch = frame
 		}
 	}
@@ -405,24 +429,32 @@ func serveStreamUplink(w http.ResponseWriter, r *http.Request, st *serverState, 
 	for {
 		f, err := readStreamFrameInto(reader, &readScratch)
 		if err != nil {
-			var netErr net.Error
-			timedOut := errors.As(err, &netErr) && netErr.Timeout()
-			if r.Context().Err() != nil || (r.Header.Get("X-Stream-Resume") == "1" && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || timedOut)) {
+			if errors.Is(err, errCorruptStreamFrame) {
+				// A protocol violation, not a transport hiccup. Closing is what
+				// stops a malformed frame from pinning a session open forever.
+				logger.Warn("⚠️ [Stream] corrupt uplink frame", zap.String("session", sessionID), zap.Error(err))
+				vConn.Close()
+				return
+			}
+			if r.Context().Err() != nil || r.Header.Get("X-Stream-Resume") == "1" {
 				// A transport round ended, not the application session. Preserve
-				// acknowledged bytes for the replacement POST; explicit markers
-				// below still close normally. Legacy clients retain EOF semantics.
+				// acknowledged bytes for the replacement POST; explicit close
+				// markers below still close normally. Legacy clients keep the
+				// older EOF-closes semantics, which is the only mode they
+				// understand.
 				return
 			}
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				// Client ended the uplink: normal tunnel close or connection
-				// loss. Either way the session cannot make progress — closing
-				// (not just requestClose) makes the downlink loop ship its
-				// close marker so the client's reader finishes promptly.
+				// Legacy client ended the uplink: normal tunnel close or a
+				// dropped connection. Either way the session cannot make
+				// progress — closing (not just requestClose) makes the downlink
+				// loop ship its close marker so the client's reader finishes
+				// promptly.
 				logger.Debug("📡 [Stream] uplink stream ended", zap.String("session", sessionID))
 				vConn.Close()
 				return
 			}
-			logger.Warn("⚠️ [Stream] failed to parse uplink frame", zap.String("session", sessionID), zap.Error(err))
+			logger.Warn("⚠️ [Stream] failed to read uplink frame", zap.String("session", sessionID), zap.Error(err))
 			vConn.Close()
 			return
 		}

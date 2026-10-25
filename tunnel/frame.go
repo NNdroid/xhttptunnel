@@ -18,6 +18,13 @@ var (
 	maxUDPFrameSize = 65535
 )
 
+// errCorruptStreamFrame marks a stream frame that was readable but failed a
+// protocol check (out-of-range padding or payload length). Transport errors
+// from the reader — EOF, timeout, a reset connection — never take this form,
+// so the uplink handler can tell a protocol violation, which must close the
+// session, from a dropped connection, which must preserve it.
+var errCorruptStreamFrame = errors.New("corrupted stream frame")
+
 func ReadUDPFrameInto(r io.Reader, buf []byte) (int, error) {
 	var lengthBuf [2]byte
 	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
@@ -287,11 +294,11 @@ func readStreamFrameInto(r io.Reader, scratch *[]byte) (streamFrame, error) {
 	}
 	padLen := int(binary.BigEndian.Uint16(meta[20:22]))
 	if padLen > 65535 {
-		return f, fmt.Errorf("corrupted stream frame: padLen=%d", padLen)
+		return f, fmt.Errorf("%w: padLen=%d", errCorruptStreamFrame, padLen)
 	}
 	payloadLen := binary.BigEndian.Uint32(meta[16:20])
 	if !f.closed && payloadLen > uint32(currentMaxFrameSize()*4) {
-		return f, fmt.Errorf("corrupted stream frame: payloadLen=%d", payloadLen)
+		return f, fmt.Errorf("%w: payloadLen=%d", errCorruptStreamFrame, payloadLen)
 	}
 	if padLen > 0 {
 		if _, err := io.CopyN(io.Discard, r, int64(padLen)); err != nil {

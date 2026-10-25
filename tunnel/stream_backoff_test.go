@@ -3,6 +3,8 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -162,4 +164,70 @@ func TestStreamSlowReadProgressRefreshesDeadline(t *testing.T) {
 			t.Fatal("active slow upload was interrupted by an absolute frame deadline")
 		}
 	})
+}
+
+// fakeUplinkReader returns one pre-built frame body and then a fixed error,
+// so each test controls exactly what readStreamFrameInto sees.
+type fakeUplinkReader struct {
+	data []byte
+	err  error
+}
+
+func (f *fakeUplinkReader) Read(p []byte) (int, error) {
+	if len(f.data) == 0 {
+		return 0, f.err
+	}
+	n := copy(p, f.data)
+	f.data = f.data[n:]
+	return n, nil
+}
+
+// TestStreamCorruptFrameClosesResumableSession proves that a protocol
+// violation on a resumable POST still closes the session. A transport error
+// is recoverable; a malformed frame is not, because an attacker could
+// otherwise pin a session open forever by never finishing a frame.
+func TestStreamCorruptFrameClosesResumableSession(t *testing.T) {
+	meta := make([]byte, 22)
+	binary.BigEndian.PutUint64(meta[0:8], 0)            // seq
+	binary.BigEndian.PutUint64(meta[8:16], 0)           // ack
+	binary.BigEndian.PutUint32(meta[16:20], 0xFFFFFFFE) // payloadLen: not a close marker, far above max
+	// padLen stays 0; the payload-length check is what fires.
+
+	vc := newMeekVirtualConn("corrupt-resume", nil, nil, nil)
+	defer vc.Close()
+	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(&fakeUplinkReader{data: meta}))
+	r.Header.Set("X-Stream-Resume", "1")
+	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "corrupt-resume")
+	if !vc.isClosed() {
+		t.Fatal("corrupt frame on a resumable POST did not close the session")
+	}
+}
+
+// TestStreamTransportErrorKeepsResumableSession proves that a generic
+// transport error — not EOF, not a timeout, not a parse failure — preserves
+// the application session for the replacement POST. This is the path that
+// h2/h3 exercise when GET and POST share one multiplexed connection: a single
+// hiccup must not destroy state that the client can resume.
+func TestStreamTransportErrorKeepsResumableSession(t *testing.T) {
+	vc := newMeekVirtualConn("transport-resume", nil, nil, nil)
+	defer vc.Close()
+	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(&fakeUplinkReader{err: errors.New("connection reset by peer")}))
+	r.Header.Set("X-Stream-Resume", "1")
+	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "transport-resume")
+	if vc.isClosed() {
+		t.Fatal("transport error destroyed resumable application state")
+	}
+}
+
+// TestStreamTransportErrorClosesLegacySession preserves the older contract
+// for clients that do not opt into resume: any read failure ends the session,
+// because those clients have no way to reconnect without losing state.
+func TestStreamTransportErrorClosesLegacySession(t *testing.T) {
+	vc := newMeekVirtualConn("transport-legacy", nil, nil, nil)
+	defer vc.Close()
+	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(&fakeUplinkReader{err: errors.New("connection reset by peer")}))
+	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "transport-legacy")
+	if !vc.isClosed() {
+		t.Fatal("transport error on a legacy POST did not close the session")
+	}
 }
