@@ -408,3 +408,56 @@ jobs:
           path: profiles/
           if-no-files-found: warn
           retention-days: 14
+
+  weak-network-benchmarks:
+    name: Weak-network benchmarks (delay / jitter / loss)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Informational only: weak-network conditions are inherently noisy
+    # (random jitter and loss), so results are never used to gate CI. The
+    # benchmarks are visible in the step summary and artifact for trend
+    # observation.
+    continue-on-error: true
+    env:
+      BENCH_REGEX: 'BenchmarkXHTTPTunnel_ThroughCDN_72KB_(Delay|Jitter|Loss).*$'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run weak-network benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./tunnel/ -run '^$' \
+            -bench "$BENCH_REGEX" -benchmem \
+            -benchtime=3s -count=1 | tee weak-network.txt
+
+      - name: Write results to step summary
+        shell: bash
+        if: always()
+        run: |
+          {
+            echo '### Weak-network benchmarks (informational)'
+            echo ''
+            echo '> Not gated. Weak-network conditions are noisy; use these'
+            echo '> results to observe trends, not to detect regressions.'
+            echo ''
+            echo '```'
+            cat weak-network.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weak-network-${{ github.sha }}
+          path: weak-network.txt
+          if-no-files-found: warn
+          retention-days: 14

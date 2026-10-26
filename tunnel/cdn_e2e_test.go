@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -213,6 +214,8 @@ type cdnTestServer struct {
 	seenResponseHeader []http.Header
 	seenResponseInfo   []string
 	delay              time.Duration
+	jitter             time.Duration // max random variance added to delay (0 = none)
+	lossRate           float64       // probability of returning 504 per request (0 = none)
 	delayedRequests    int
 
 	pollFaultsReady     chan struct{}
@@ -297,6 +300,10 @@ func (c *cdnTestServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if delay > 0 {
 		c.delayedRequests++
 	}
+	if c.jitter > 0 {
+		delay += time.Duration(mrand.Int63n(int64(c.jitter)))
+	}
+	loss := c.lossRate
 	c.mu.Unlock()
 	if delay > 0 {
 		timer := time.NewTimer(delay)
@@ -306,6 +313,10 @@ func (c *cdnTestServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
+	}
+	if loss > 0 && mrand.Float64() < loss {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
 	}
 	if injected != nil {
 		w.Header().Set("Cache-Control", "no-store")
