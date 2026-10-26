@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 // Echo traffic piggybacks ACKs and hides stalls in a one-way transfer.
@@ -244,3 +246,100 @@ func TestStreamOverridesAbsoluteHTTPTimeout(t *testing.T) {
 		}
 	}
 }
+
+// TestStreamProbeAdaptiveWindowSucceedsOnSlowHandshake guards the timer-reset
+// fix: the probe window should cover the hello wait, not the connection setup
+// that has already completed. Without the reset, a 3s handshake consumes most
+// of the 5s window, and a hello arriving 2s after the headers lands at 5s —
+// right at the deadline. With the reset, the window restarts at the headers,
+// giving the full 5s for the hello.
+func TestStreamProbeAdaptiveWindowSucceedsOnSlowHandshake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	hello, err := streamFrameBytes(0, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := streamTestTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost {
+			io.Copy(io.Discard, r.Body)
+			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(nil)), Request: r}, nil
+		}
+		time.Sleep(3 * time.Second) // simulate slow TCP+TLS+HTTP handshake
+		ch := make(chan struct{})
+		go func() { time.Sleep(2 * time.Second); close(ch) }()
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"X-Downstream-Accepted": {"1"}, "X-Stream-Uplink-Sync": {"1"}},
+			Body:       &delayedHelloBody{ctx: r.Context(), hello: hello, release: ch},
+			Request:    r,
+		}, nil
+	})
+
+	established := make(chan struct{})
+	hub := newEventHub(func(ev Event) {
+		if _, ok := ev.(TunnelEstablished); ok {
+			close(established)
+		}
+	})
+	defer hub.close()
+
+	result := make(chan error, 1)
+	go func() {
+		conn, err := dialXHTTPStream(streamDialArgs{
+			ctx: ctx, cfg: &DialConfig{StreamMode: "stream"},
+			rt: rt, client: &http.Client{Transport: rt},
+			reqURL: "http://fixture/stream", sessionID: "adaptive-probe",
+			key: "adaptive-probe", logger: zap.NewNop(), events: hub,
+		})
+		result <- err
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+
+	select {
+	case <-established:
+		// Probe succeeded despite the slow handshake.
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("probe failed with slow handshake: %v", err)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatal("probe did not establish within timeout")
+	}
+	cancel()
+}
+
+// delayedHelloBody releases its hello frame only after the release channel is
+// closed, simulating a server that takes time to process the companion POST
+// before sending the hello frame.
+type delayedHelloBody struct {
+	ctx      context.Context
+	hello    []byte
+	release  chan struct{}
+	released bool
+}
+
+func (b *delayedHelloBody) Read(p []byte) (int, error) {
+	if !b.released {
+		select {
+		case <-b.release:
+		case <-b.ctx.Done():
+			return 0, b.ctx.Err()
+		}
+		b.released = true
+	}
+	if len(b.hello) > 0 {
+		n := copy(p, b.hello)
+		b.hello = b.hello[n:]
+		return n, nil
+	}
+	select {
+	case <-b.ctx.Done():
+		return 0, b.ctx.Err()
+	}
+}
+
+func (b *delayedHelloBody) Close() error { return nil }

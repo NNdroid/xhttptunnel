@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"go.uber.org/zap"
@@ -234,13 +235,24 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	}
 
 	if created {
+		// The client's X-Stream-Probe-Window header tells the server how long
+		// it will wait for the hello frame. For a new session the server must
+		// admit the companion POST within that budget or the client falls back
+		// to polling; honour it so a reconnect probe with a widened window is
+		// not rejected by the server's own shorter timeout.
+		probeWindow := streamProbeMinWindow
+		if pwStr := r.Header.Get("X-Stream-Probe-Window"); pwStr != "" {
+			if pw, err := strconv.Atoi(pwStr); err == nil && pw > 0 && pw <= 60 {
+				probeWindow = time.Duration(pw) * time.Second
+			}
+		}
 		select {
 		case <-vConn.streamReady:
 		case <-r.Context().Done():
 			return
 		case <-vConn.closedSignal():
 			return
-		case <-time.After(streamProbeMinWindow):
+		case <-time.After(probeWindow):
 			return
 		}
 	}

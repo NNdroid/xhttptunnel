@@ -342,12 +342,16 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 			probeWindow = w
 		}
 	}
+	if probeWindow > 30*time.Second {
+		probeWindow = 30 * time.Second
+	}
 	deadline := roundStart.Add(probeWindow)
 	probeTimer := time.AfterFunc(time.Until(deadline), cancelRound)
 	defer probeTimer.Stop()
 
 	req, _ := http.NewRequestWithContext(roundCtx, http.MethodGet, a.reqURL, nil)
 	req.Header.Set("X-Downstream", "1")
+	req.Header.Set("X-Stream-Probe-Window", strconv.Itoa(int(probeWindow.Seconds())))
 	if *lastDown > 0 {
 		// Reconnect within the same server session: X-Ack identifies downlink
 		// bytes already delivered. Uplink resume is carried by each frame's
@@ -400,6 +404,16 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	if err := checkServerProto(resp.Header); err != nil {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return false, err
+	}
+
+	// Reset the probe timer: the window should cover the hello wait, not the
+	// connection setup that has already completed. Without this, a high-RTT
+	// handshake consumes most of the window and the hello — which the server
+	// sends only after POST admission — arrives after the deadline.
+	if roundCtx.Err() == nil {
+		probeTimer.Stop()
+		deadline = time.Now().Add(probeWindow)
+		probeTimer = time.AfterFunc(time.Until(deadline), cancelRound)
 	}
 
 	// Start the companion POST before waiting for the hello frame. A current
