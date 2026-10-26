@@ -505,7 +505,12 @@ type meekVirtualConn struct {
 	// 4-byte boundary, and atomic.LoadInt64/StoreInt64 on it traps with
 	// "unaligned 64-bit atomic operation". atomic.Int64 carries the
 	// compiler's align64 marker, so it is 8-byte aligned wherever placed.
-	lastActive      atomic.Int64
+	lastActive atomic.Int64
+	// upConsumed mirrors nextReadSeq for lock-free reads. It is updated
+	// (under readCond.L) whenever nextReadSeq advances, so the stream
+	// downlink dispatch loop can read it without contending with the
+	// uplink ingestion path.
+	upConsumed      atomic.Uint64
 	downDispatchSeq uint64     // server->client dispatch cursor
 	downWindowMu    sync.Mutex // guards concurrent access to the dispatch cursor
 	// downWriter is the exclusive owner of the downlink dispatch cursor. A
@@ -764,6 +769,7 @@ func (c *meekVirtualConn) PutReadDataContext(ctx context.Context, seq uint64, da
 			c.readBuf.Write(data)
 			c.readBufBusyAt = time.Now()
 			c.nextReadSeq += uint64(len(data))
+			c.upConsumed.Store(c.nextReadSeq)
 			c.drainContiguous()
 			c.readCond.Broadcast()
 			return c.nextReadSeq, nil
@@ -912,6 +918,7 @@ func (c *meekVirtualConn) drainContiguous() {
 		c.readBuf.Write(nextData)
 		c.readBufBusyAt = time.Now()
 		c.nextReadSeq += uint64(len(nextData))
+		c.upConsumed.Store(c.nextReadSeq)
 	}
 }
 

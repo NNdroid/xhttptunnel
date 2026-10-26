@@ -91,10 +91,12 @@ func (c *meekVirtualConn) noteDownPeerAck(ack uint64) {
 // consumedUpSeq reports how many uplink bytes the session has fully consumed
 // (the next expected uplink sequence). Stream-mode responses echo it in the
 // metadata ack so the client's write buffer can release acknowledged bytes.
+// The value is read from an atomic mirror updated under readCond.L, so the
+// stream downlink dispatch loop does not contend with the uplink ingestion
+// path. A slightly stale read is safe: the server handles duplicate
+// retransmissions, and the value only advances.
 func (c *meekVirtualConn) consumedUpSeq() uint64 {
-	c.readCond.L.Lock()
-	defer c.readCond.L.Unlock()
-	return c.nextReadSeq
+	return c.upConsumed.Load()
 }
 
 // sessionEventHub delivers typed session events on a dedicated goroutine,
