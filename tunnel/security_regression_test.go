@@ -219,7 +219,7 @@ func TestForcedStreamDialWaitsForUplinkAdmission(t *testing.T) {
 		}
 	})
 	defer hub.close()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), streamProbeMinWindow+2*time.Second)
 	defer cancel()
 	start := time.Now()
 	conn, err := DialXHTTP(ctx, serverURL, &DialConfig{
