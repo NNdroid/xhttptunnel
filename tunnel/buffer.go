@@ -769,7 +769,13 @@ func (c *meekVirtualConn) PutReadDataContext(ctx context.Context, seq uint64, da
 			return c.nextReadSeq, nil
 		case seq > c.nextReadSeq:
 			if existing, dup := c.oooBuf[seq]; dup {
-				if len(data) <= len(existing) {
+				if len(data) == len(existing) {
+					if !bytes.Equal(data, existing) {
+						c.oooBuf[seq] = bytes.Clone(data)
+					}
+					return c.nextReadSeq, nil
+				}
+				if len(data) < len(existing) {
 					return c.nextReadSeq, nil
 				}
 				growth := len(data) - len(existing)

@@ -544,7 +544,23 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		}
 		defer vConn.uploads.Add(-1)
 
-		cSeq, _ := strconv.ParseUint(r.Header.Get("X-Seq"), 10, 64)
+		cSeqStr := r.Header.Get("X-Seq")
+		cSeq := uint64(0)
+		if cSeqStr != "" {
+			var err error
+			cSeq, err = strconv.ParseUint(cSeqStr, 10, 64)
+			if err != nil {
+				nginxError(w, http.StatusBadRequest)
+				return
+			}
+		}
+		if cSeqStr == "" && vConn.consumedUpSeq() > 0 {
+			// X-Seq missing but the server already consumed uplink bytes:
+			// the header was stripped, and the alignment logic would
+			// misplace the body.
+			nginxError(w, http.StatusBadRequest)
+			return
+		}
 		cAck, _ := strconv.ParseUint(r.Header.Get("X-Ack"), 10, 64)
 		if !vConn.writeBuf.validAck(cAck) {
 			nginxError(w, http.StatusBadRequest)

@@ -293,9 +293,6 @@ func readStreamFrameInto(r io.Reader, scratch *[]byte) (streamFrame, error) {
 		closed: binary.BigEndian.Uint32(meta[16:20]) == 0xFFFFFFFF,
 	}
 	padLen := int(binary.BigEndian.Uint16(meta[20:22]))
-	if padLen > 65535 {
-		return f, fmt.Errorf("%w: padLen=%d", errCorruptStreamFrame, padLen)
-	}
 	payloadLen := binary.BigEndian.Uint32(meta[16:20])
 	if !f.closed && payloadLen > uint32(currentMaxFrameSize()*4) {
 		return f, fmt.Errorf("%w: payloadLen=%d", errCorruptStreamFrame, payloadLen)

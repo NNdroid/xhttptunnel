@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -85,6 +84,12 @@ var errProbeAborted = errors.New("tunnel: stream probe aborted by local close")
 // sequence space cannot be rebased without risking duplication or loss, so the
 // caller must establish a fresh application connection.
 var errServerSessionGone = errors.New("tunnel: server session was recreated")
+
+// errInvalidPeerAck reports that the server's acknowledgement does not match
+// the client's write cursor. Unlike transport blips the server is
+// persistently out of sync; reconnecting cannot recover, so the pump must
+// stop and let the caller observe a fatal closeErr.
+var errInvalidPeerAck = errors.New("tunnel: invalid peer acknowledgement")
 
 type streamModeEntry struct {
 	mode     string // "stream" or "poll"
@@ -234,6 +239,18 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 				if !strings.EqualFold(strings.TrimSpace(a.cfg.StreamMode), "stream") {
 					cacheStreamMode(a.key, "poll", 0)
 				}
+				return
+			}
+			if errors.Is(err, errInvalidPeerAck) {
+				virtualConn.setCloseErr(err)
+				if !established && !strings.EqualFold(strings.TrimSpace(a.cfg.StreamMode), "stream") {
+					cacheStreamMode(a.key, "poll", 0)
+				}
+				logger.Warn("❌ [Stream] invalid peer ack, not reconnecting",
+					zap.String("session", a.sessionID),
+					zap.Error(err),
+				)
+				a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "invalid peer ack", Detail: err.Error()})
 				return
 			}
 			if err != nil {
@@ -550,9 +567,9 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		return false, errServerSessionGone
 	}
 	if !virtualConn.writeBuf.validAck(first.ack) {
-		return false, fmt.Errorf("tunnel: invalid peer acknowledgement")
+		return false, errInvalidPeerAck
 	}
-	if first.closed || bytes.Equal(first.data, closeMarkerPayload) {
+	if first.closed {
 		// Server closed an empty session immediately: tunnel is over.
 		virtualConn.Close()
 		return true, nil
@@ -600,13 +617,13 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		watchdog.Reset(streamWatchdogTimeout)
 		if !virtualConn.writeBuf.validAck(f.ack) {
 			finish()
-			return false, fmt.Errorf("tunnel: invalid peer acknowledgement")
+			return false, errInvalidPeerAck
 		}
 		if ack := f.ack; ack > ackedByServer.Load() {
 			ackedByServer.Store(ack)
 			virtualConn.writeBuf.acknowledge(ack)
 		}
-		if f.closed || bytes.Equal(f.data, closeMarkerPayload) {
+		if f.closed {
 			// Server ended the session: tunnel EOF for the local reader.
 			virtualConn.Close()
 			finish()
