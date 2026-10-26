@@ -767,6 +767,23 @@ func (c *meekVirtualConn) PutReadDataContext(ctx context.Context, seq uint64, da
 			c.drainContiguous()
 			c.readCond.Broadcast()
 			return c.nextReadSeq, nil
+		case seq == c.nextReadSeq:
+			// readBuf is full; park the in-order chunk in OOO so the
+			// sender is not stalled while the reader drains. The ack
+			// stays at nextReadSeq (data not yet consumed), and
+			// drainContiguous — called by Read and by the next
+			// successful write — moves it to readBuf when capacity
+			// returns.
+			if len(c.oooBuf) < maxOutOfOrderChunks && c.oooBytes+len(data) <= maxOutOfOrderBytes {
+				dataCopy := bytes.Clone(data)
+				c.oooBuf[seq] = dataCopy
+				c.oooBytes += len(dataCopy)
+				if !c.oooMinValid || seq < c.oooMinSeq {
+					c.oooMinSeq = seq
+					c.oooMinValid = true
+				}
+				return c.nextReadSeq, nil
+			}
 		case seq > c.nextReadSeq:
 			if existing, dup := c.oooBuf[seq]; dup {
 				if len(data) == len(existing) {

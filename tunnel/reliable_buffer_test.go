@@ -207,8 +207,8 @@ func TestMeekVirtualConn_ConcurrentClosePutReadData(t *testing.T) {
 }
 
 // Test 7: reassembly-buffer backpressure. Once the in-order reassembly buffer
-// hits maxReassemblyBytes, a further contiguous chunk must block in
-// waitForReassemblyRoom until a reader drains room — not drop or overwrite.
+// hits maxReassemblyBytes, a further contiguous chunk is buffered in OOO
+// (not blocked) so the sender is not stalled while the reader drains.
 func TestMeekVirtualConn_ReassemblyBackpressure(t *testing.T) {
 	conn := newMeekVirtualConn("bp-reasm", stringAddr("127.0.0.1:1"), stringAddr("127.0.0.1:2"), nil)
 
@@ -222,33 +222,33 @@ func TestMeekVirtualConn_ReassemblyBackpressure(t *testing.T) {
 		t.Fatalf("reassembly buffer should be full, got %d", conn.readBuf.Len())
 	}
 
-	// A contiguous tail chunk must now park until the reader makes room.
+	// A contiguous tail chunk must now park in OOO until the reader makes room.
 	tail := make([]byte, 1)
-	blocked := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		close(blocked)
 		conn.PutReadData(uint64(maxReassemblyBytes), tail)
 		close(done)
 	}()
 
-	<-blocked
-	time.Sleep(100 * time.Millisecond)
 	select {
 	case <-done:
-		t.Fatal("producer did not block on a full reassembly buffer")
-	default:
+		// OOO buffering: the producer returned without blocking.
+	case <-time.After(time.Second):
+		t.Fatal("producer blocked unexpectedly on a full reassembly buffer")
 	}
 
-	// Drain one byte; the producer must wake and complete.
+	// The tail chunk is in OOO at nextReadSeq, not yet in readBuf.
+	if ack := conn.nextReadSeq; ack != uint64(maxReassemblyBytes) {
+		t.Fatalf("nextReadSeq advanced to %d, want %d (OOO data not yet consumed)", ack, maxReassemblyBytes)
+	}
+
+	// Drain one byte; drainContiguous must move the OOO tail into readBuf.
 	buf := make([]byte, 1)
 	if n, err := conn.Read(buf); n != 1 || err != nil {
 		t.Fatalf("Read returned %d/%v", n, err)
 	}
-	select {
-	case <-done:
-	case <-time.After(1 * time.Second):
-		t.Fatal("producer was not woken after a reader drained room")
+	if ack := conn.nextReadSeq; ack != uint64(maxReassemblyBytes)+1 {
+		t.Fatalf("nextReadSeq = %d, want %d", ack, uint64(maxReassemblyBytes)+1)
 	}
 
 	// The held-back tail byte must now be readable.

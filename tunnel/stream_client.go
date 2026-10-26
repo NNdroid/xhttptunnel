@@ -33,8 +33,9 @@ const (
 	streamProbeMinWindow = 5 * time.Second
 	// streamWatchdogTimeout is the no-frame stall threshold for an
 	// established stream; the server keepalives every 5s so a healthy path
-	// never trips it.
-	streamWatchdogTimeout = 75 * time.Second
+	// never trips it. 30s = 6× keepalive, leaving headroom for a slow
+	// RTT while bounding silent-drop recovery well under the previous 75s.
+	streamWatchdogTimeout = 30 * time.Second
 	// streamUplinkKeepalive is how often an idle uplink writes an ack-only
 	// frame so the server's downlink buffer keeps freeing.
 	streamUplinkKeepalive = 25 * time.Second
