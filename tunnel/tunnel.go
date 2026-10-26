@@ -316,11 +316,12 @@ func (st *serverState) snapshot() TunnelStats {
 // the low-level ListenXHTTP keeps using defaultServerState (its historical
 // process-global behaviour), while Server gives every instance its own state.
 type serverState struct {
-	windowSize   int
-	bufferBudget *bufferBudget
-	sessionsMu   sync.RWMutex
-	sessions     map[string]*meekVirtualConn
-	maxSessions  int
+	windowSize      int
+	longPollTimeout time.Duration
+	bufferBudget    *bufferBudget
+	sessionsMu      sync.RWMutex
+	sessions        map[string]*meekVirtualConn
+	maxSessions     int
 	// maxPerIP bounds sessions from one client address (0 = unlimited). The
 	// global cap alone lets a single PSK holder — or one compromised machine —
 	// starve everyone else out of the registry.

@@ -73,7 +73,7 @@ const (
 	// advertisement cannot be applied. 1 TB/s.
 	bwWireMax uint64 = 1_000_000_000_000
 
-	bwIntervalDefault = 60
+	bwIntervalDefault = 15
 	bwIntervalMin     = 1
 )
 

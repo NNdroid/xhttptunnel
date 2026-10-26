@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 )
 
-const defaultWindowBytes = 4 << 20
+const defaultWindowBytes = 8 << 20
 
 func windowBytes(mb int) (int, error) {
 	if mb == 0 {

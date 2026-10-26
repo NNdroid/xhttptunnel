@@ -29,11 +29,13 @@ func benchTunnelThroughCDNWeakNetwork(b *testing.B, delay, jitter time.Duration,
 	serveAcceptedTCPEcho(b, ctx, origin)
 
 	cdn := newCDNTestServer(b, "http://"+origin.Addr().String(), nil)
+	cdn.mu.Lock()
 	if delay > 0 {
 		cdn.delay = delay
 	}
 	cdn.jitter = jitter
 	cdn.lossRate = lossRate
+	cdn.mu.Unlock()
 	defer cdn.Close()
 	cdnURL, err := url.Parse(cdn.server.URL + "/stream")
 	if err != nil {

@@ -315,7 +315,7 @@ func (c *cdnTestServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if loss > 0 && mrand.Float64() < loss {
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
 		return
 	}
 	if injected != nil {

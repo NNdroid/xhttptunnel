@@ -53,7 +53,7 @@ const (
 	// frees its write buffer from these acks — without prompt acks a pure
 	// download stalls in 4MB bursts every keepalive tick (~1/10 of the
 	// achievable rate).
-	ackCoalesceBytes = 128 * 1024
+	ackCoalesceBytes = 32 * 1024
 	// reconnectBackoffCap bounds the reconnect backoff between stream rounds.
 	reconnectBackoffCap    = 30 * time.Second
 	reconnectHealthyWindow = 30 * time.Second

@@ -639,7 +639,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 				fetchDownData()
 			} else {
 				if !fetchDownData() && !vConn.isClosed() {
-					vConn.writeBuf.waitLongPoll(r.Context(), longPollTimeout)
+					vConn.writeBuf.waitLongPoll(r.Context(), st.longPollTimeout)
 					fetchDownData()
 				}
 			}
@@ -1001,6 +1001,14 @@ type ServerConfig struct {
 	// MaxSessions caps concurrent tunnel sessions. 0 selects the default
 	// (2000).
 	MaxSessions int
+	// LongPollTimeout sets how long an empty poll request parks on the server
+	// waiting for downlink data. It must stay below the CDN/nginx idle timeout
+	// (Cloudflare 524 fires at 100s, nginx proxy_read_timeout defaults to 60s)
+	// while being long enough to amortise request overhead. 0 (default) uses
+	// the package default of 5s. The client's close-flush grace is derived
+	// from the default constant, so values above 5s may cause Close() to
+	// return before the server releases the parked poll.
+	LongPollTimeout time.Duration
 	// MaxSessionsPerIP caps concurrent sessions from a single client address,
 	// bounding one PSK holder's blast radius against the shared registry. 0
 	// (default) disables the per-IP limit; the global MaxSessions still applies.
@@ -1110,6 +1118,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	state := newServerState(cfg.MaxSessions)
 	state.windowSize = window
+	if cfg.LongPollTimeout > 0 {
+		state.longPollTimeout = cfg.LongPollTimeout
+	} else {
+		state.longPollTimeout = longPollTimeout
+	}
 	if cfg.BufferBudgetMB > 0 {
 		state.bufferBudget = &bufferBudget{limit: int64(cfg.BufferBudgetMB) << 20}
 	}
