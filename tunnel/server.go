@@ -255,6 +255,7 @@ var tunnelRequestHeaders = []string{
 	"X-Retry",
 	"X-Downstream",
 	"X-Stream-Resume",
+	"X-Stream-Probe-Window",
 }
 
 // scrubTunnelRequest strips protocol state before a request leaves the origin
@@ -320,11 +321,12 @@ func (st *serverState) authorizeByMAC(r *http.Request, expected, mac string) boo
 	if !validAuthNonce(nonce) {
 		return false
 	}
-	// The session id and target are bound into the signature so a valid
-	// request cannot be replayed against a different session or aimed at a
-	// different address. They are read from the headers, not from local state,
-	// so the value verified here is exactly the value the dispatcher uses.
-	msg := authMessage(nonce, r.Header.Get("X-Session-ID"), r.Header.Get("X-Target"))
+	// The session id, network and target are bound into the signature so a
+	// valid request cannot be replayed against a different session, aimed at
+	// a different address, or switched to a different transport protocol.
+	// They are read from the headers, not from local state, so the value
+	// verified here is exactly the value the dispatcher uses.
+	msg := authMessage(nonce, r.Header.Get("X-Session-ID"), r.Header.Get("X-Network"), r.Header.Get("X-Target"))
 	for _, tok := range splitTokens(expected) {
 		if tok == "" {
 			continue

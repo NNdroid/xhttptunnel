@@ -782,7 +782,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					// replay impossible, so a failure here is fatal rather than
 					// retryable — retrying would just keep drawing the same
 					// broken entropy source and mint predictable nonces.
-					if authErr := setAuthHeaders(req, cfg.Password, sessionID, targetAddr); authErr != nil {
+					if authErr := setAuthHeaders(req, cfg.Password, sessionID, network, targetAddr); authErr != nil {
 						logger.Error("❌ [Pump] could not draw a nonce, closing the tunnel",
 							zap.String("session", sessionID),
 							zap.Error(authErr),
@@ -1708,7 +1708,7 @@ func (c *Client) doBwExchange(ctx context.Context) bool {
 	// The existing signed-nonce auth covers the special target with no change:
 	// the signature binds the target string, and TargetBwExchange is exactly
 	// what the server will read back out of X-Target.
-	if err := setAuthHeaders(req, cfg.Password, sessionID, TargetBwExchange); err != nil {
+	if err := setAuthHeaders(req, cfg.Password, sessionID, "tcp", TargetBwExchange); err != nil {
 		logger.Error("❌ [BW] could not draw a nonce for the bandwidth exchange", zap.Error(err))
 		return false
 	}

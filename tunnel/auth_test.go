@@ -19,7 +19,7 @@ const authTestPSK = "auth-test-secret"
 // ---------------------------------------------------------------------------
 
 func TestAuthMACRoundTrip(t *testing.T) {
-	msg := authMessage("nonce-1", "session-A", "127.0.0.1:8080")
+	msg := authMessage("nonce-1", "session-A", "tcp", "127.0.0.1:8080")
 	got := authMAC("k1", msg)
 	if got == "" {
 		t.Fatal("authMAC returned an empty digest")
@@ -33,7 +33,7 @@ func TestAuthMACRoundTrip(t *testing.T) {
 }
 
 func TestAuthMACMatchesRejectsWrongKeyAndTamper(t *testing.T) {
-	msg := authMessage("n", "s", "t")
+	msg := authMessage("n", "s", "tcp", "t")
 	good := authMAC("key-A", msg)
 
 	if authMACMatches("key-B", msg, good) {
@@ -48,7 +48,7 @@ func TestAuthMACMatchesRejectsWrongKeyAndTamper(t *testing.T) {
 }
 
 func TestAuthMACMatchesRejectsMalformed(t *testing.T) {
-	msg := authMessage("n", "s", "t")
+	msg := authMessage("n", "s", "tcp", "t")
 	good := authMAC("k", msg)
 
 	for _, want := range []string{
@@ -69,23 +69,25 @@ func TestAuthMACMatchesRejectsMalformed(t *testing.T) {
 }
 
 // TestAuthMessageFieldSeparation pins the NUL-delimited canonical form: the
-// concatenation of the three fields must never collide with a different
+// concatenation of the four fields must never collide with a different
 // fielding. A whitespace separator would collide, since spaces are legal
-// inside a session id and a target.
+// inside a session id, a network, and a target.
 func TestAuthMessageFieldSeparation(t *testing.T) {
 	cases := []struct {
 		name string
-		a    [3]string
-		b    [3]string
+		a    [4]string
+		b    [4]string
 	}{
-		{"session absorbed into nonce", [3]string{"ab", "c", "d"}, [3]string{"abc", "", "d"}},
-		{"target absorbed into session", [3]string{"a", "bc", "d"}, [3]string{"a", "b", "cd"}},
-		{"trailing empty vs folded", [3]string{"a", "b", ""}, [3]string{"a", "", "b"}},
-		{"space inside a field", [3]string{"a b", "c", "d"}, [3]string{"a", "b c", "d"}},
+		{"session absorbed into nonce", [4]string{"ab", "c", "tcp", "d"}, [4]string{"abc", "", "tcp", "d"}},
+		{"network absorbed into session", [4]string{"a", "bc", "tcp", "d"}, [4]string{"a", "b", "ctcp", "d"}},
+		{"target absorbed into network", [4]string{"a", "b", "ctcp", "d"}, [4]string{"a", "b", "tcp", "cd"}},
+		{"trailing empty vs folded", [4]string{"a", "b", "tcp", ""}, [4]string{"a", "b", "", "tcp"}},
+		{"space inside a field", [4]string{"a b", "c", "tcp", "d"}, [4]string{"a", "b c", "tcp", "d"}},
+		{"space inside network", [4]string{"a", "b", "t cp", "d"}, [4]string{"a", "b", "t", "cpd"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := authMessage(tc.a[0], tc.a[1], tc.a[2]); bytes.Equal(got, authMessage(tc.b[0], tc.b[1], tc.b[2])) {
+			if got := authMessage(tc.a[0], tc.a[1], tc.a[2], tc.a[3]); bytes.Equal(got, authMessage(tc.b[0], tc.b[1], tc.b[2], tc.b[3])) {
 				t.Errorf("authMessage collided: %v and %v render identically", tc.a, tc.b)
 			}
 		})
@@ -93,7 +95,7 @@ func TestAuthMessageFieldSeparation(t *testing.T) {
 
 	// The domain prefix is what stops this MAC from being valid as the digest
 	// of some other application that reuses the same PSK as a general key.
-	if got := authMessage("n", "s", "t"); len(got) < len(authDomain)+3 {
+	if got := authMessage("n", "s", "tcp", "t"); len(got) < len(authDomain)+4 {
 		t.Errorf("authMessage = %q, domain prefix appears to be missing", got)
 	}
 }
@@ -243,7 +245,7 @@ func TestSetAuthHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := setAuthHeaders(req, "psk", "session-A", "127.0.0.1:8080"); err != nil {
+	if err := setAuthHeaders(req, "psk", "session-A", "tcp", "127.0.0.1:8080"); err != nil {
 		t.Fatalf("setAuthHeaders: %v", err)
 	}
 	nonce := req.Header.Get(AuthNonceHeader)
@@ -254,15 +256,16 @@ func TestSetAuthHeaders(t *testing.T) {
 	if !validHex(mac, sha256.Size) {
 		t.Fatalf("MAC header = %q, want %d hex chars", mac, sha256.Size*2)
 	}
-	// The MAC must be verifiable against the same session id and target that
-	// the request itself carries. That is the binding the server checks.
-	if !authMACMatches("psk", authMessage(nonce, "session-A", "127.0.0.1:8080"), mac) {
-		t.Fatal("the MAC does not cover the request's own session and target")
+	// The MAC must be verifiable against the same session id, network and
+	// target that the request itself carries. That is the binding the server
+	// checks.
+	if !authMACMatches("psk", authMessage(nonce, "session-A", "tcp", "127.0.0.1:8080"), mac) {
+		t.Fatal("the MAC does not cover the request's own session, network and target")
 	}
 
 	// Two requests from the same PSK must carry different nonces.
 	req2, _ := http.NewRequest(http.MethodGet, "http://example/", nil)
-	if err := setAuthHeaders(req2, "psk", "session-A", "127.0.0.1:8080"); err != nil {
+	if err := setAuthHeaders(req2, "psk", "session-A", "tcp", "127.0.0.1:8080"); err != nil {
 		t.Fatalf("setAuthHeaders: %v", err)
 	}
 	if req2.Header.Get(AuthNonceHeader) == nonce {
@@ -272,7 +275,7 @@ func TestSetAuthHeaders(t *testing.T) {
 
 func TestSetAuthHeadersEmptyPassword(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "http://example/", nil)
-	if err := setAuthHeaders(req, "", "session-A", "127.0.0.1:8080"); err != nil {
+	if err := setAuthHeaders(req, "", "session-A", "tcp", "127.0.0.1:8080"); err != nil {
 		t.Fatalf("setAuthHeaders with an empty password: %v", err)
 	}
 	if req.Header.Get(AuthNonceHeader) != "" || req.Header.Get(AuthMACHeader) != "" {
@@ -311,21 +314,22 @@ func authTestServer(t *testing.T, ctx context.Context, cfg ServerConfig) *url.UR
 	return &url.URL{Scheme: "http", Host: srv.Addr().String(), Path: "/t"}
 }
 
-// authHeaders builds a signed v2 request against the fixed session and target.
-// signingKey lets a case mint a digest under the wrong PSK.
+// authHeaders builds a signed v2 request against the fixed session, network
+// and target. signingKey lets a case mint a digest under the wrong PSK.
 func authHeaders(t *testing.T, signingKey string) map[string]string {
 	t.Helper()
-	const session, target = "auth-test-sid", "127.0.0.1:7"
+	const session, network, target = "auth-test-sid", "tcp", "127.0.0.1:7"
 	nonce, err := newAuthNonce()
 	if err != nil {
 		t.Fatalf("newAuthNonce: %v", err)
 	}
 	return map[string]string{
 		"X-Session-ID":  session,
+		"X-Network":     network,
 		"X-Target":      target,
 		ProtoHeader:     strconv.Itoa(offeredProtoVersion),
 		AuthNonceHeader: nonce,
-		AuthMACHeader:   authMAC(signingKey, authMessage(nonce, session, target)),
+		AuthMACHeader:   authMAC(signingKey, authMessage(nonce, session, network, target)),
 	}
 }
 

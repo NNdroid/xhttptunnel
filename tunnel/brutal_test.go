@@ -634,10 +634,11 @@ func bwSignedHeaders(t *testing.T, key, target, advertised string) map[string]st
 	}
 	h := map[string]string{
 		"X-Session-ID":  session,
+		"X-Network":     "tcp",
 		"X-Target":      target,
 		ProtoHeader:     strconv.Itoa(offeredProtoVersion),
 		AuthNonceHeader: nonce,
-		AuthMACHeader:   authMAC(key, authMessage(nonce, session, target)),
+		AuthMACHeader:   authMAC(key, authMessage(nonce, session, "tcp", target)),
 	}
 	if advertised != "" {
 		h[BwHeader] = advertised

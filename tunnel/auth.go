@@ -97,14 +97,16 @@ func (w *nonceWindow) sweepLocked(now time.Time) {
 // authMessage renders the signed payload. Fields are NUL-delimited rather than
 // whitespace-delimited because a space is legal inside a session id and a
 // target, so whitespace cannot be a separator. NUL is not: HTTP/1.1 forbids
-// control characters in header values, so the three fields can never bleed
+// control characters in header values, so the four fields can never bleed
 // into one another and nonce "abc" plus session "def" cannot read as "abcdef".
-func authMessage(nonce, sessionID, target string) []byte {
-	msg := make([]byte, 0, len(authDomain)+len(nonce)+len(sessionID)+len(target)+2)
+func authMessage(nonce, sessionID, network, target string) []byte {
+	msg := make([]byte, 0, len(authDomain)+len(nonce)+len(sessionID)+len(network)+len(target)+3)
 	msg = append(msg, authDomain...)
 	msg = append(msg, nonce...)
 	msg = append(msg, 0)
 	msg = append(msg, sessionID...)
+	msg = append(msg, 0)
+	msg = append(msg, network...)
 	msg = append(msg, 0)
 	msg = append(msg, target...)
 	return msg
@@ -154,14 +156,15 @@ func newAuthNonce() (string, error) {
 }
 
 // setAuthHeaders authenticates one request with a fresh nonce. Only the HMAC
-// crosses the wire — the PSK stays client-side. The session id and target are
-// bound into the signed message as well, so a captured request cannot be
-// replayed after a reconnect with a new session, nor retargeted at another
-// address the same client is allowed to reach.
+// crosses the wire — the PSK stays client-side. The session id, network and
+// target are bound into the signed message as well, so a captured request
+// cannot be replayed after a reconnect with a new session, nor retargeted at
+// another address the same client is allowed to reach, nor switched to a
+// different transport protocol.
 //
 // An empty password leaves the request unauthenticated: an open tunnel has no
 // credential scheme to sign, and the server must be refusing auth too.
-func setAuthHeaders(req *http.Request, password, sessionID, targetAddr string) error {
+func setAuthHeaders(req *http.Request, password, sessionID, network, targetAddr string) error {
 	if password == "" {
 		return nil
 	}
@@ -170,6 +173,6 @@ func setAuthHeaders(req *http.Request, password, sessionID, targetAddr string) e
 		return err
 	}
 	req.Header.Set(AuthNonceHeader, nonce)
-	req.Header.Set(AuthMACHeader, authMAC(password, authMessage(nonce, sessionID, targetAddr)))
+	req.Header.Set(AuthMACHeader, authMAC(password, authMessage(nonce, sessionID, network, targetAddr)))
 	return nil
 }

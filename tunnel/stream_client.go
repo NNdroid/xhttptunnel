@@ -748,7 +748,7 @@ func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, n
 	req.Header.Set("User-Agent", clientUserAgent)
 	// Signed credentials: the PSK itself never goes on the wire, so a captured
 	// request leaks nothing, and the per-request nonce makes replay a no-op.
-	if err := setAuthHeaders(req, cfg.Password, sessionID, targetAddr); err != nil {
+	if err := setAuthHeaders(req, cfg.Password, sessionID, network, targetAddr); err != nil {
 		return fmt.Errorf("tunnel: could not generate a nonce: %w", err)
 	}
 	req.Header.Set("X-Target", targetAddr)
