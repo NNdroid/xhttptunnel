@@ -203,11 +203,11 @@ all:
 
 - *Request* — `X-Auth-Token`, `X-HTTP-Tunnel-Nonce`, `X-HTTP-Tunnel-MAC`,
   `X-XHTTP-Proto`, `X-Target`, `X-Network`, `X-Session-ID`, `X-Seq`, `X-Ack`,
-  `X-Retry`, `X-Downstream`, `X-Stream-Resume`, plus the camouflage headers
-  `User-Agent`, `Accept`, `Accept-Encoding`, `Cache-Control`, `Pragma`,
-  `Content-Type`.
-- *Response* — `X-Seq`, `X-Ack`, `X-Session-ID`, `X-Downstream-Accepted`,
-  `X-Stream-Uplink-Sync`, `X-Session-Created`, `X-Target`, plus
+  `X-Retry`, `X-Downstream`, `X-Stream-Resume`, `X-Stream-Probe-Window`, plus
+  the camouflage headers `User-Agent`, `Accept`, `Accept-Encoding`,
+  `Cache-Control`, `Pragma`, `Content-Type`.
+- *Response* — `X-XHTTP-Proto`, `X-Seq`, `X-Ack`, `X-Session-ID`,
+  `X-Downstream-Accepted`, `X-Stream-Uplink-Sync`, `X-Session-Created`, plus
   `Cache-Control`, `Pragma`, `Expires`, `X-Accel-Buffering`.
 
 `X-HTTP-Tunnel-Nonce` and `X-HTTP-Tunnel-MAC` are the v2 credentials. A request
@@ -307,7 +307,7 @@ reservations even for idle sessions, and is released when the session closes.
 `Server.Stats()` and the health snapshot expose `buffer_reserved_bytes` and
 `buffer_budget_bytes` when a budget is configured.
 
-Streaming ACKs are coalesced by bytes (128 KiB) and time (10 ms), independently
+Streaming ACKs are coalesced by bytes (32 KiB) and time (10 ms), independently
 of keepalives. The GET headers are flushed first; the initial hello follows
 admission of the companion POST, so successful Dial proves both directions
 were admitted. Active stream I/O deadlines are refreshed rather than inheriting
@@ -496,10 +496,10 @@ TTL 5 min):
    answers without `X-Downstream-Accepted` and the client keeps polling.
 2. **Bidirectional readiness + path probe** — after the companion POST passes
    authentication and the per-session admission limit, the server flushes a
-   hello frame. If it arrives within `max(2s, 3× measured TTFB)`, both
-   directions are usable and the path does not buffer responses.
+   hello frame. If it arrives within `max(5s, 3× measured TTFB)` (capped at
+   30 s), both directions are usable and the path does not buffer responses.
 3. **Watchdog** — an established stream must see a frame (data or keepalive,
-   emitted every 5 s) within 75 s; two consecutive breaks downgrade the
+   emitted every 5 s) within 30 s; two consecutive breaks downgrade the
    endpoint to poll mode.
 
 Set `StreamMode: "poll"` to force the legacy mode. `"stream"` requires the
@@ -623,11 +623,13 @@ release.
   advertised version is lower (including header-less legacy clients) get
   HTTP 426. Bumping the generation is a single constant in the SDK.
 - **Signed credentials.** The PSK never crosses the wire. Each request carries
-  a fresh nonce plus its HMAC-SHA256 over the nonce, the session id and the
-  target. A captured request therefore leaks nothing and cannot be replayed or
-  retargeted: the nonce is consumed in a 120 s replay window keyed per server,
-  and the session id and target are bound into the signature, so a signature
-  cannot be lifted onto another session or aimed at a different address. Legacy
+  a fresh nonce plus its HMAC-SHA256 over the nonce, the session id, the
+  network and the target. A captured request therefore leaks nothing and
+  cannot be replayed or retargeted: the nonce is consumed in a 120 s replay
+  window keyed per server, and the session id, network and target are bound
+  into the signature, so a signature cannot be lifted onto another session,
+  aimed at a different address, or switched to a different transport protocol.
+  Legacy
   clients that still send the bare token (`Proxy-Authorization` /
   `X-Auth-Token`) are accepted during the migration window — upgrade servers
   first, then clients — and a client that advertises protocol version 2 is
