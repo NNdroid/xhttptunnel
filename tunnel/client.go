@@ -970,6 +970,16 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							logger.Warn("⚠️ [Pump] hit CDN/WAF rate limit (429 Too Many Requests), backing off...",
 								zap.String("session", sessionID),
 							)
+							// A 429 is an edge-generated response that consumed none of
+							// the upload bytes, so rewind to the sequence of the request
+							// that was rejected, not to the peer ACK. The ACK can lag
+							// behind when a sibling worker's POST is still in flight,
+							// and rewinding to it would replay an earlier POST and
+							// leave this one's bytes un-resent. The server drops
+							// duplicate sequence data, so replaying this POST is safe.
+							windowMu.Lock()
+							dispatchSeq = currentSeq
+							windowMu.Unlock()
 							bytesBufPool.Put(downBuf)
 							if !sleepCtx(pumpCtx, 1*time.Second) {
 								break
