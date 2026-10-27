@@ -40,25 +40,42 @@ const (
 
 // shareEnvelope mirrors the JSON envelope produced by ShareCryptoUtils.encrypt:
 //
-//	{ "v": 1, "g": 0|1, "s": base64(salt), "i": base64(iv), "c": base64(ciphertext) }
+//	{ "v": 1, "g": 0|1, "it": 10000, "s": base64(salt), "i": base64(iv), "c": base64(ciphertext) }
 //
 // where "c" is AES-256-GCM ciphertext (auth tag appended) of the (optionally gzip'd) profile JSON.
+//
+// "it" records the PBKDF2 iteration count. ShareCryptoUtils omits-then-defaults
+// it to legacy 10000 for QR payloads but raises it to 200000 for cloud backups,
+// so a reader that hard-codes 10000 can never open a backup. Absent means 10000.
 type shareEnvelope struct {
-	V int    `json:"v"`
-	G int    `json:"g"`
-	S string `json:"s"`
-	I string `json:"i"`
-	C string `json:"c"`
+	V  int    `json:"v"`
+	G  int    `json:"g"`
+	It int    `json:"it,omitempty"`
+	S  string `json:"s"`
+	I  string `json:"i"`
+	C  string `json:"c"`
 }
+
+// Iteration bounds, identical to ShareCryptoUtils.ITERATIONS_MIN/MAX: an
+// envelope is attacker-controlled input, and an unbounded "it" would let a
+// crafted payload keep PBKDF2 running for minutes.
+const (
+	shareIterationsMin = 1000
+	shareIterationsMax = 2_000_000
+)
 
 // GenerateRandomPIN returns a random 6-digit PIN string, identical to ShareCryptoUtils.generateRandomPIN.
 // Numeric only, so UTF-8 and Java's char[] (ISO-8859-1) encodings are byte-identical during PBKDF2.
-func GenerateRandomPIN() string {
+//
+// It reports an error instead of substituting a fixed PIN when the system CSPRNG
+// fails: a silent "000000" would turn a broken entropy source into a share link
+// anyone can open.
+func GenerateRandomPIN() (string, error) {
 	n, err := rand.Int(rand.Reader, big.NewInt(1000000))
 	if err != nil {
-		return "000000"
+		return "", fmt.Errorf("generate share PIN: %w", err)
 	}
-	return fmt.Sprintf("%06d", n.Int64())
+	return fmt.Sprintf("%06d", n.Int64()), nil
 }
 
 func gzipData(b []byte) ([]byte, error) {
@@ -89,7 +106,9 @@ func gunzipData(b []byte) ([]byte, error) {
 func encryptStunURI(plainText []byte, pin string) (uri, usedPin string, err error) {
 	usedPin = pin
 	if usedPin == "" {
-		usedPin = GenerateRandomPIN()
+		if usedPin, err = GenerateRandomPIN(); err != nil {
+			return "", "", err
+		}
 	}
 
 	// Optional gzip: only enable when it actually shrinks the plaintext (mirrors Android logic,
@@ -123,10 +142,11 @@ func encryptStunURI(plainText []byte, pin string) (uri, usedPin string, err erro
 	ciphertext := gcm.Seal(nil, iv, raw, nil)
 
 	env := shareEnvelope{
-		V: 1,
-		S: base64.StdEncoding.EncodeToString(salt),
-		I: base64.StdEncoding.EncodeToString(iv),
-		C: base64.StdEncoding.EncodeToString(ciphertext),
+		V:  1,
+		It: shareIterations,
+		S:  base64.StdEncoding.EncodeToString(salt),
+		I:  base64.StdEncoding.EncodeToString(iv),
+		C:  base64.StdEncoding.EncodeToString(ciphertext),
 	}
 	if len(raw) < len(plainText) { // gzip was applied
 		env.G = 1
@@ -177,7 +197,21 @@ func decryptStunURI(payload, pin string) (string, error) {
 		return "", err
 	}
 
-	key := pbkdf2.Key([]byte(pin), salt, shareIterations, shareKeyLen, sha256.New)
+	// An absent "it" is the legacy envelope: ShareCryptoUtils then derives with
+	// 10000 iterations. Bounds mirror the app so a crafted payload cannot pin a
+	// core for minutes.
+	iterations := env.It
+	if iterations == 0 {
+		iterations = shareIterations
+	}
+	if iterations < shareIterationsMin {
+		iterations = shareIterationsMin
+	}
+	if iterations > shareIterationsMax {
+		iterations = shareIterationsMax
+	}
+
+	key := pbkdf2.Key([]byte(pin), salt, iterations, shareKeyLen, sha256.New)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err

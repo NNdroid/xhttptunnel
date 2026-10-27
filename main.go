@@ -213,7 +213,7 @@ func runGenURI(args []string) {
 	sni := fs.String("sni", "", "SNI disguise")
 	fingerprint := fs.String("fingerprint", "", "Server certificate SHA-256 pin")
 	remark := fs.String("name", "", "Node remark name")
-	insecure := fs.Bool("insecure", true, "Skip TLS verify")
+	insecure := fs.Bool("insecure", false, "Advertise insecure=1 in the plaintext URI (ignored when a certificate pin is set)")
 	pin := fs.String("pin", "", "Share PIN (6 digits). Empty = auto-generate a random PIN")
 	_ = fs.Parse(args)
 
@@ -229,11 +229,24 @@ func runGenURI(args []string) {
 					*host = u.Hostname()
 					if u.Port() != "" {
 						*port = u.Port()
+					} else if strings.EqualFold(u.Scheme, "http") {
+						// A CDN-fronted URL usually spells no port at all; inheriting
+						// the listen port instead would advertise something the node
+						// never dials.
+						*port = "80"
+					} else if u.Scheme != "" {
+						*port = "443"
 					}
 				}
 			}
-			if *port == "" && fileCfg.Listen != "" {
-				if _, p, err := net.SplitHostPort(fileCfg.Listen); err == nil {
+			// A server config only knows its listen address, which may carry a
+			// tcp://, udp:// or tcp+udp:// prefix that net.SplitHostPort rejects
+			// outright ("too many colons"). The prefix was never stripped, so the
+			// port stayed empty and the URI silently advertised the 8443 default.
+			// A client config's listen is the local forwarder port, not the public
+			// one, so it is only consulted when there is no server URL.
+			if *port == "" && fileCfg.ServerURL == "" && fileCfg.Listen != "" {
+				if _, p, err := net.SplitHostPort(stripAddrScheme(fileCfg.Listen)); err == nil {
 					*port = p
 				}
 			}
@@ -299,8 +312,21 @@ func runGenURI(args []string) {
 	}
 
 	uri := tunnel.GenerateXHTTPTunnelURI(*host, *port, *path, *target, *psk, *sni, *fingerprint, *remark, *pin, *insecure)
-	fmt.Printf("=== 📱 xhttptunnel Sharing URI (encrypted stun://) ===\n\n%s\n", uri)
+	fmt.Printf("=== 📱 xhttptunnel Share Node ===\n")
 	tunnel.PrintTerminalQR(uri)
+}
+
+// stripAddrScheme removes a leading "<scheme>://" from an address, leaving the
+// bare "host:port" that net.SplitHostPort expects. Server listen addresses
+// accept tcp://, udp:// and tcp+udp:// prefixes (gen-config and install.sh both
+// emit them), and SplitHostPort rejects every one of them with "too many
+// colons". Without this the port was silently dropped and the share URI fell
+// back to the built-in default.
+func stripAddrScheme(addr string) string {
+	if _, rest, found := strings.Cut(addr, "://"); found {
+		return rest
+	}
+	return addr
 }
 
 // applyClientDefaults fills the structural defaults shared by the `client`

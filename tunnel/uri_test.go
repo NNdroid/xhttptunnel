@@ -36,7 +36,8 @@ func captureStdout(fn func() string) (string, string, error) {
 // "tcp://" prefix in sshAddr produces a node that imports cleanly but never
 // connects, so the QR looks correct while being unusable; a missing SNI breaks
 // the client's TLS handshake to the origin right after the scan; and the
-// certificate pin must reach the importer too, otherwise the node trusts
+// certificate pin must reach the importer under the names it actually reads
+// (verifyCertFingerprint / serverCertFingerprint), otherwise the node trusts
 // whatever certificate it is offered.
 func TestShareURIProfileShape(t *testing.T) {
 	_, uri, err := captureStdout(func() string {
@@ -64,8 +65,26 @@ func TestShareURIProfileShape(t *testing.T) {
 	if prof.ProxyAddr != "1.2.3.4:9443" {
 		t.Errorf("proxyAddr = %q, want 1.2.3.4:9443", prof.ProxyAddr)
 	}
-	if prof.Fingerprint != "AA:BB:CC:DD" {
-		t.Errorf("fingerprint = %q, want the pin handed to the generator", prof.Fingerprint)
+	// The pin has to land in the two fields ShareCryptoUtils' consumer reads.
+	// A JSON key called "fingerprint" is not part of the profile schema and was
+	// dropped by the importer, leaving a self-signed node unverifiable.
+	if !prof.VerifyCertFingerprint {
+		t.Error("verifyCertFingerprint = false, so the importer ignores the pin")
+	}
+	if prof.ServerCertFingerprint != "AA:BB:CC:DD" {
+		t.Errorf("serverCertFingerprint = %q, want the pin handed to the generator", prof.ServerCertFingerprint)
+	}
+	if strings.Contains(plain, `"fingerprint"`) {
+		t.Error("the profile still carries an unknown \"fingerprint\" key the importer drops")
+	}
+	if !prof.TunnelTLSEnabled {
+		t.Error("tunnelTlsEnabled = false: the node would speak plain HTTP to a TLS listener")
+	}
+	if prof.ALPN != "auto" {
+		t.Errorf("alpn = %q, want auto so an h3-only server stays reachable", prof.ALPN)
+	}
+	if !prof.EnableCustomPath || prof.CustomPath != "/custom" {
+		t.Errorf("custom path = %q (enabled %v), want /custom enabled", prof.CustomPath, prof.EnableCustomPath)
 	}
 
 	// The plaintext protocol URI printed alongside carries the same pin, so a
@@ -76,6 +95,49 @@ func TestShareURIProfileShape(t *testing.T) {
 	})
 	if !strings.Contains(out, "fp=AA%3ABB%3ACC%3ADD") {
 		t.Error("the plaintext xhttp:// URI does not carry the fp pin")
+	}
+	// A pin replaces CA verification, so "insecure" would describe the opposite
+	// of what the node does.
+	if strings.Contains(out, "insecure=1") {
+		t.Error("a pinned share URI must not also advertise insecure=1")
+	}
+	if !strings.Contains(out, "PIN-encrypted") {
+		t.Error("the encrypted share link is not labelled as encrypted")
+	}
+}
+
+// TestShareURIIPv6 makes sure an IPv6 origin is bracketed: "2001:db8::10:9443"
+// is not an address any dialer can parse, and it used to be exactly what an
+// IPv6 server produced in proxyAddr and in the plaintext URI.
+func TestShareURIIPv6(t *testing.T) {
+	out, uri, err := captureStdout(func() string {
+		return GenerateXHTTPTunnelURI("2001:db8::10", "9443", "/stream",
+			"127.0.0.1:22", "psk", "sni.example", "", "Node", "123456", false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := decryptStunURI(uri, "123456")
+	if err != nil {
+		t.Fatalf("decrypt share URI: %v", err)
+	}
+	var prof StunProfile
+	if err := json.Unmarshal([]byte(plain), &prof); err != nil {
+		t.Fatalf("unmarshal profile: %v", err)
+	}
+	if prof.ProxyAddr != "[2001:db8::10]:9443" {
+		t.Errorf("proxyAddr = %q, want [2001:db8::10]:9443", prof.ProxyAddr)
+	}
+	if !strings.Contains(out, "xhttp://[2001:db8::10]:9443/stream") {
+		t.Errorf("the plaintext URI is not a parsable IPv6 URL:\n%s", out)
+	}
+	// An already-bracketed flag value must not end up double-bracketed.
+	if got := shareServerAddr("[::1]", "22"); got != "[::1]:22" {
+		t.Errorf("shareServerAddr([::1], 22) = %q, want [::1]:22", got)
+	}
+	// Unspecified listen addresses stay a placeholder the operator edits.
+	if got := shareServerAddr("::", "8443"); got != "YOUR_SERVER_IP:8443" {
+		t.Errorf("shareServerAddr(::, 8443) = %q, want YOUR_SERVER_IP:8443", got)
 	}
 }
 
@@ -98,8 +160,11 @@ func TestShareURIWithoutPin(t *testing.T) {
 	if err := json.Unmarshal([]byte(plain), &prof); err != nil {
 		t.Fatalf("unmarshal profile: %v", err)
 	}
-	if prof.Fingerprint != "" {
-		t.Errorf("fingerprint = %q, want empty", prof.Fingerprint)
+	if prof.ServerCertFingerprint != "" {
+		t.Errorf("serverCertFingerprint = %q, want empty", prof.ServerCertFingerprint)
+	}
+	if prof.VerifyCertFingerprint {
+		t.Error("verifyCertFingerprint is set without a fingerprint to compare against")
 	}
 	if strings.Contains(out, "fp=") {
 		t.Error("an unpinned share URI must not advertise an fp parameter")

@@ -460,3 +460,79 @@ func TestGenURIFromServerConfig(t *testing.T) {
 		}
 	}
 }
+
+// TestGenURIPortFromSchemePrefixedListen covers a listen address carrying a
+// protocol prefix, which both gen-config and install.sh emit. net.SplitHostPort
+// rejects "tcp+udp://:9443" with "too many colons", so the prefix used to cost
+// the port entirely and the shared URI fell back to the 8443 default: a node
+// that imports cleanly and dials a port nobody listens on.
+func TestGenURIPortFromSchemePrefixedListen(t *testing.T) {
+	for _, listen := range []string{":9443", "tcp://:9443", "udp://:9443", "tcp+udp://:9443", "0.0.0.0:9443"} {
+		cfgPath := filepath.Join(t.TempDir(), "config.server.json")
+		cfg := `{
+			"mode": "server",
+			"listen": "` + listen + `",
+			"path": "/stream",
+			"target": "tcp://127.0.0.1:22",
+			"psk": "shared-secret"
+		}`
+		if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		out := captureStdout(func() {
+			runGenURI([]string{"-c", cfgPath, "-host", "1.2.3.4"})
+		})
+		if !strings.Contains(out, "1.2.3.4:9443") {
+			t.Errorf("listen %q: the share URI lost the configured port:\n%s", listen, out)
+		}
+		if strings.Contains(out, "1.2.3.4:8443") {
+			t.Errorf("listen %q: the share URI fell back to the default port:\n%s", listen, out)
+		}
+	}
+}
+
+// TestGenURIPortFromClientConfig proves the public port never comes from a
+// client config's listen address, which is the local forwarder: a CDN URL
+// without an explicit port means 443, not :1080.
+func TestGenURIPortFromClientConfig(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.client.json")
+	cfg := `{
+		"mode": "client",
+		"listen": "127.0.0.1:1080",
+		"server": "https://cdn.example.com/stream",
+		"target": "127.0.0.1:22",
+		"psk": "shared-secret"
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	out := captureStdout(func() {
+		runGenURI([]string{"-c", cfgPath})
+	})
+	if !strings.Contains(out, "cdn.example.com:443") {
+		t.Errorf("the share URI should use the URL's scheme default port:\n%s", out)
+	}
+	if strings.Contains(out, "1080") {
+		t.Errorf("the share URI leaked the local forwarder port:\n%s", out)
+	}
+}
+
+// TestStripAddrScheme covers the prefix removal itself, including the forms
+// that are not network schemes.
+func TestStripAddrScheme(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{":9443", ":9443"},
+		{"tcp://:9443", ":9443"},
+		{"TCP://0.0.0.0:9443", "0.0.0.0:9443"},
+		{"udp://[::]:9443", "[::]:9443"},
+		{"tcp+udp://:9443", ":9443"},
+		{"127.0.0.1:1080", "127.0.0.1:1080"},
+		{"", ""},
+	} {
+		if got := stripAddrScheme(tc.in); got != tc.want {
+			t.Errorf("stripAddrScheme(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

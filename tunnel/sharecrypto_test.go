@@ -1,6 +1,9 @@
 package tunnel
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -79,6 +82,86 @@ func TestProvidedPinHonored(t *testing.T) {
 	}
 	if pin != "654321" {
 		t.Fatalf("provided PIN not honored: got %s", pin)
+	}
+}
+
+// sealEnvelope builds a share payload with a caller-chosen PBKDF2 iteration
+// count, optionally omitting the "it" field, so the reader's iteration handling
+// can be exercised without going through encryptStunURI.
+func sealEnvelope(t *testing.T, pin string, iterations int, plain string, includeIt bool) string {
+	t.Helper()
+	salt := bytes.Repeat([]byte{0x11}, shareSaltLen)
+	iv := bytes.Repeat([]byte{0x22}, shareIvLen)
+	key := pbkdf2.Key([]byte(pin), salt, iterations, shareKeyLen, sha256.New)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	env := shareEnvelope{
+		V: 1,
+		S: base64.StdEncoding.EncodeToString(salt),
+		I: base64.StdEncoding.EncodeToString(iv),
+		C: base64.StdEncoding.EncodeToString(gcm.Seal(nil, iv, []byte(plain), nil)),
+	}
+	if includeIt {
+		env.It = iterations
+	}
+	b, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	return "stun://" + base64.StdEncoding.EncodeToString(b)
+}
+
+// TestEnvelopeCarriesIterations pins the "it" field: ShareCryptoUtils defaults
+// an absent value to 10000 but writes 200000 for cloud backups, so a payload we
+// emit must state its count explicitly instead of relying on that default.
+func TestEnvelopeCarriesIterations(t *testing.T) {
+	uri, _, err := encryptStunURI([]byte(`{"name":"t"}`), "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(uri, "stun://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env map[string]any
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	it, ok := env["it"].(float64)
+	if !ok {
+		t.Fatal(`envelope has no "it" field`)
+	}
+	if int(it) != shareIterations {
+		t.Fatalf("it = %v, want %d", it, shareIterations)
+	}
+}
+
+// TestDecryptHonorsEnvelopeIterations covers both directions of the "it" field:
+// a legacy envelope without it still opens with 10000, a 200k envelope opens
+// only when the field is honoured, and a payload that *lies* about its count
+// fails instead of yielding garbage.
+func TestDecryptHonorsEnvelopeIterations(t *testing.T) {
+	const plain = `{"name":"backup-node"}`
+
+	legacy := sealEnvelope(t, "123456", shareIterations, plain, false)
+	if got, err := decryptStunURI(legacy, "123456"); err != nil || got != plain {
+		t.Fatalf("legacy envelope without it: got %q err %v", got, err)
+	}
+
+	backup := sealEnvelope(t, "123456", 200_000, plain, true)
+	if got, err := decryptStunURI(backup, "123456"); err != nil || got != plain {
+		t.Fatalf("it=200000 envelope: got %q err %v", got, err)
+	}
+
+	lying := sealEnvelope(t, "123456", 200_000, plain, false)
+	if _, err := decryptStunURI(lying, "123456"); err == nil {
+		t.Fatal("a payload whose it field does not match its KDF must not decrypt")
 	}
 }
 
