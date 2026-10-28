@@ -94,7 +94,7 @@ func TestGenConfigServerDefaults(t *testing.T) {
 		"_description", "_fields", "mode", "listen", "path", "target", "psk", "selfsign",
 		"selfsign_cn", "cert", "key", "fallback", "allowed_targets", "max_sessions",
 		"max_sessions_per_ip", "health_path", "min_proto_version", "chunk_size_kb",
-		"window_size_mb", "buffer_budget_mb",
+		"padding", "window_size_mb", "buffer_budget_mb",
 		"trust_proxy_headers", "brutal", "dump", "log_level",
 	}
 	m := jsonKeys(t, data)

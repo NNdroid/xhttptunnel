@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	mrand "math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -159,31 +158,31 @@ func (c *XHTTPConn) Err() error {
 	return nil
 }
 
+// WriteCloseFrame sends the end-of-session marker. It is padded by the same
+// rule as data frames: the marker is identified by its length field, not by its
+// size, and an unpadded six-byte write is the only object of that size on the
+// wire — an exact fingerprint of "a tunnel just closed". Readers drain the pad
+// before acting on the marker, so older peers accept it unchanged.
 func (c *XHTTPConn) WriteCloseFrame() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	frame := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00}
-	_, err := c.w.Write(frame)
-	return err
-}
 
-// padLenFor implements the per-chunk padding policy: empty chunks dress up as
-// small random keepalives, tiny chunks are padded into a common size band so
-// short payloads stop being length-linkable, and bulk chunks get light cover.
-func padLenFor(chunkSize int) int {
-	var padLenInt int
-	switch {
-	case chunkSize == 0:
-		padLenInt = 32 + mrand.Intn(128)
-	case chunkSize < 512:
-		padLenInt = (600 + mrand.Intn(600)) - chunkSize
-		if padLenInt < 0 {
-			padLenInt = mrand.Intn(256)
-		}
-	default:
-		padLenInt = 16 + mrand.Intn(112)
+	pad := padLenFor(0)
+	frameLen := 6 + pad
+	if frameLen > cap(c.frameBuf) {
+		c.frameBuf = make([]byte, frameLen)
+	} else {
+		c.frameBuf = c.frameBuf[:frameLen]
 	}
-	return padLenInt
+	binary.BigEndian.PutUint32(c.frameBuf[0:4], ^uint32(0))
+	binary.BigEndian.PutUint16(c.frameBuf[4:6], uint16(pad))
+	if pad > 0 {
+		if _, err := rand.Read(c.frameBuf[6:]); err != nil {
+			return err
+		}
+	}
+	_, err := c.w.Write(c.frameBuf)
+	return err
 }
 
 func (c *XHTTPConn) writeSingleFrame(chunk []byte) error {

@@ -99,9 +99,15 @@ type FileConfig struct {
 	// ChunkSizeKB caps the upstream payload carried by one poll request. The
 	// default (256) leaves headroom under the 1MB body limit that nginx and
 	// many CDN/WAF tiers enforce. Must be raised on BOTH ends together.
-	ChunkSizeKB    int `json:"chunk_size_kb"`
-	WindowSizeMB   int `json:"window_size_mb"`
-	BufferBudgetMB int `json:"buffer_budget_mb"`
+	ChunkSizeKB int `json:"chunk_size_kb"`
+	// Padding is the frame padding rule for outgoing traffic, e.g. "400-600"
+	// (payloads under 400 bytes are padded up into 400..600, longer ones are
+	// sent as they are), "off", or an ordered band list. Each side pads only
+	// what it sends, so the peer does not have to match; an invalid rule fails
+	// startup instead of silently falling back.
+	Padding        string `json:"padding"`
+	WindowSizeMB   int    `json:"window_size_mb"`
+	BufferBudgetMB int    `json:"buffer_budget_mb"`
 	// IdleTimeout (client) drops a local connection after this many seconds
 	// without traffic. Default 900. Idle SSH sessions need keepalives below it.
 	IdleTimeout int `json:"idle_timeout"`
@@ -435,7 +441,30 @@ func loadConfigFile(path string) (*FileConfig, error) {
 		return nil, err
 	}
 	applyEnvOverrides(&cfg)
+	if err := tunnel.ValidatePadding(cfg.Padding); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+// applyEngineTuning installs the process-wide wire knobs — the ones that shape
+// this process's own egress and therefore cannot be per-session. An invalid
+// padding rule is fatal: falling back to a default would leave the operator
+// believing a shape is in force that is not.
+//
+// The CLI installs padding imperatively rather than through
+// ServerConfig/ClientConfig.Padding because it runs exactly one endpoint per
+// process; those fields exist so an embedder that builds configs as structs
+// does not need a second, out-of-band call. Either route lands on the same
+// process-wide policy, and the rule in force is logged once, here.
+func applyEngineTuning(cfg *FileConfig) {
+	tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
+	if err := tunnel.SetPadding(cfg.Padding); err != nil {
+		logger.Fatal("❌ invalid padding rule", zap.String("padding", cfg.Padding), zap.Error(err))
+	}
+	logger.Info("🧦 [Padding] frame padding rule",
+		zap.String("rule", tunnel.PaddingSpec()),
+		zap.String("config", cfg.Padding))
 }
 
 func main() {
@@ -484,7 +513,7 @@ func main() {
 		cfg, cfgPath := resolveConfig(os.Args[2:])
 		initLogger(cfg.LogLevel)
 		defer logger.Sync()
-		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
+		applyEngineTuning(cfg)
 		if err := applyServerDefaults(cfg, cfgPath); err != nil {
 			logger.Fatal("❌ server failed to start", zap.Error(err))
 		}
@@ -500,7 +529,7 @@ func main() {
 		cfg, _ := resolveConfig(os.Args[2:])
 		initLogger(cfg.LogLevel)
 		defer logger.Sync()
-		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
+		applyEngineTuning(cfg)
 		applyClientDefaults(cfg)
 		if cfg.PSK == "" {
 			logger.Fatal("❌ PSK not configured; the client subcommand will not use a public default password. Set the server's PSK explicitly, or opt into unauthenticated mode via the config file")
@@ -613,8 +642,9 @@ func runFromConfig(path string) {
 	initLogger(cfg.LogLevel)
 	defer logger.Sync()
 
+	applyEngineTuning(cfg)
+
 	if strings.ToLower(cfg.Mode) == "client" {
-		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
 		applyClientDefaults(cfg)
 		if isPlaceholderPSK(cfg.PSK) {
 			logger.Fatal("❌ config file contains a public example PSK; set the password the server actually uses")
@@ -624,7 +654,6 @@ func runFromConfig(path string) {
 		}
 		startClient(ctx, cfg)
 	} else {
-		tunnel.SetChunkSizeKB(cfg.ChunkSizeKB)
 		if err := applyServerDefaults(cfg, path); err != nil {
 			logger.Fatal("❌ server failed to start", zap.Error(err))
 		}

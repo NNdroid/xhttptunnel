@@ -72,6 +72,7 @@ type genSpec struct {
 	HealthPath       string
 	MinProtoVersion  int
 	ChunkSizeKB      int
+	Padding          string
 	WindowSizeMB     int
 	BufferBudgetMB   int
 	MaxConns         int
@@ -223,6 +224,7 @@ func (s *genSpec) build() (*FileConfig, error) {
 		HealthPath:        s.HealthPath,
 		MinProtoVersion:   s.MinProtoVersion,
 		ChunkSizeKB:       s.ChunkSizeKB,
+		Padding:           s.Padding,
 		WindowSizeMB:      s.WindowSizeMB,
 		BufferBudgetMB:    s.BufferBudgetMB,
 		MaxConns:          s.MaxConns,
@@ -301,6 +303,11 @@ func (s *genSpec) build() (*FileConfig, error) {
 
 	if cfg.ChunkSizeKB == 0 {
 		cfg.ChunkSizeKB = 256
+	}
+	// Write the effective rule into the generated file instead of leaving the
+	// key empty: an operator editing the shape should see what is in force.
+	if strings.TrimSpace(cfg.Padding) == "" {
+		cfg.Padding = tunnel.DefaultPaddingSpec
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
@@ -434,6 +441,9 @@ func checkConfig(cfg *FileConfig, explicitPSK bool) *configCheck {
 	}
 	if cfg.ChunkSizeKB != 0 && (cfg.ChunkSizeKB < 16 || cfg.ChunkSizeKB > 900) {
 		c.fail("chunk_size_kb %d must be 0 or 16-900; the engine clamps to that range, so raising the ceiling means raising it on BOTH ends", cfg.ChunkSizeKB)
+	}
+	if err := tunnel.ValidatePadding(cfg.Padding); err != nil {
+		c.fail("%s", err)
 	}
 	if err := tunnel.ValidateBufferLimits(cfg.WindowSizeMB, cfg.BufferBudgetMB); err != nil {
 		c.fail("%s", err)
@@ -677,6 +687,7 @@ func renderServerConfig(cfg *FileConfig, withDocs bool) ([]byte, error) {
 		jsonLine{key: "health_path", val: cfg.HealthPath},
 		jsonLine{key: "min_proto_version", val: cfg.MinProtoVersion},
 		jsonLine{key: "chunk_size_kb", val: cfg.ChunkSizeKB},
+		jsonLine{key: "padding", val: cfg.Padding},
 		jsonLine{key: "trust_proxy_headers", val: cfg.TrustProxyHeaders},
 		jsonLine{key: "brutal", val: cfg.Brutal},
 		jsonLine{key: "dump", val: cfg.Dump},
@@ -708,6 +719,7 @@ func renderClientConfig(cfg *FileConfig, withDocs bool) ([]byte, error) {
 		jsonLine{key: "cert", val: cfg.Cert},
 		jsonLine{key: "key", val: cfg.Key},
 		jsonLine{key: "chunk_size_kb", val: cfg.ChunkSizeKB},
+		jsonLine{key: "padding", val: cfg.Padding},
 		jsonLine{key: "idle_timeout", val: cfg.IdleTimeout},
 		jsonLine{key: "max_conns", val: cfg.MaxConns},
 		jsonLine{key: "brutal", val: cfg.Brutal},
@@ -723,6 +735,10 @@ func renderConfig(cfg *FileConfig, withDocs bool) ([]byte, error) {
 	}
 	return renderServerConfig(cfg, withDocs)
 }
+
+// paddingFieldDoc is shared by both modes: the rule is local egress policy, so
+// its meaning does not depend on which end of the tunnel the file configures.
+const paddingFieldDoc = `Frame padding rule for outgoing traffic. "400-600" (default) pads anything shorter than 400 bytes up into 400..600 and sends longer payloads bare, so a keystroke and a 500-byte record leave the same size on the wire; the two ranges meet exactly at 400, which is what makes them indistinguishable. "MIN-MAX" uses MIN as the threshold; "BELOW:MIN-MAX" sets it explicitly, and a comma-separated list defines ordered bands so control frames can share the distribution (for example "1:120-200,400:400-600"). "off" disables padding. Each side pads only what it sends and the receiver strips whatever arrives, so the two ends need not match: a mismatch changes the traffic shape, never the bytes delivered. An invalid rule fails startup.`
 
 func serverFieldDocs() []stringDoc {
 	return []stringDoc{
@@ -744,6 +760,7 @@ func serverFieldDocs() []stringDoc {
 		{"min_proto_version", "Reject (HTTP 426) clients advertising an X-XHTTP-Proto below this. 0 (default) accepts all clients, including legacy header-less ones. Set 2 to force the signed-nonce scheme: a client advertising v2 is admitted only by signature, which closes the bare-token fallback."},
 		{"window_size_mb", "Reliable send window per session in MiB (0 = 4; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
 		{"chunk_size_kb", "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must be raised on BOTH ends together."},
+		{"padding", paddingFieldDoc},
 		{"trust_proxy_headers", "Honour CF-Connecting-IP / X-Forwarded-For / X-Real-IP for client-address logging. Those headers are spoofable; enable only behind a trusted proxy that strips them."},
 		{"brutal", "TCP Brutal (Linux kernel module only; inert on other platforms). Caps the send rate of this server's TCP tunnel sockets in bytes/s. The HTTP/3 socket is never affected. Nested object: enabled (default false; off means setsockopt is never called), rate (bytes/s; 0 is illegal unless bw_exchange supplies one), cwnd_gain (tenths, so 20 = 2.0x; 0 = default 20, max 100), group_id (0 = per-connection only), group_from_remote (derive the group from the peer's address instead of group_id; a static group_id on a server pools every client into one aggregate ceiling), bw_exchange (accept the _BrutalBwExchange protocol), bw_advertise (bytes/s this server can ingest; the peer applies it as its own send rate), bw_interval (seconds between exchange attempts, default 60). Exchange requests are authenticated but do not count against max_sessions. A socket failure never breaks a tunnel: the connection continues uncapped and the failure is logged once."},
 		{"dump", "Dump raw packet hex data in logs for low-level debugging"},
@@ -767,6 +784,7 @@ func clientFieldDocs() []stringDoc {
 		{"key", "Optional path to the server's TLS private key. Not used by the client at all."},
 		{"window_size_mb", "Reliable send window per session in MiB (0 = 4; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
 		{"chunk_size_kb", "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must match the server value; raise on BOTH ends together."},
+		{"padding", paddingFieldDoc},
 		{"idle_timeout", "Drop a local connection after this many seconds without traffic (default 900). Idle SSH sessions need a keepalive below it."},
 		{"max_conns", "Maximum concurrent client connections allowed (0 = default 2000)"},
 		{"brutal", "TCP Brutal (Linux kernel module only; inert on other platforms). Caps the send rate of this client's TCP tunnel sockets in bytes/s. HTTP/3 tunnels run over QUIC/UDP and are never capped. Nested object: enabled (default false; off means setsockopt is never called), rate (bytes/s ceiling; 0 is illegal unless bw_exchange supplies one), cwnd_gain (tenths, so 20 = 2.0x; 0 = default 20, max 100), group_id (0 = per-connection only), bw_exchange (enable the _BrutalBwExchange protocol), bw_advertise (bytes/s this client can ingest; the server applies it as its own send rate), bw_interval (seconds between exchange attempts, default 60). The rate is a ceiling: the exchange can only lower it. A socket failure never breaks a tunnel: the connection continues uncapped and the failure is logged once."},
@@ -849,6 +867,7 @@ func bindGenConfigFlags(cmd *flag.FlagSet, s *genSpec) {
 	cmd.StringVar(&s.HealthPath, "health-path", "", "Unauthenticated stats path on the tunnel listener; empty disables it")
 	cmd.IntVar(&s.MinProtoVersion, "min-proto-version", 0, "Reject clients advertising an older X-XHTTP-Proto (0 = accept all)")
 	cmd.IntVar(&s.ChunkSizeKB, "chunk-size-kb", 0, "Upstream payload per poll request, 16-900 (0 = 256)")
+	cmd.StringVar(&s.Padding, "padding", "", `Frame padding rule: "off", "MIN-MAX" or "BELOW:MIN-MAX" bands (default 400-600)`)
 	cmd.IntVar(&s.WindowSizeMB, "window-size-mb", 0, "Reliable send window per session in MiB, 1-64 (0 = 4)")
 	cmd.IntVar(&s.BufferBudgetMB, "buffer-budget-mb", 0, "Server admission budget for tunnel buffers in MiB (0 = disabled)")
 	cmd.IntVar(&s.MaxConns, "max-conns", 0, "Client max concurrent connections (0 = 512)")

@@ -15,6 +15,7 @@
     "key": "Optional path to the server's TLS private key. Not used by the client at all.",
     "window_size_mb": "Reliable send window per session in MiB (0 = 4; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT.",
     "chunk_size_kb": "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must match the server value; raise on BOTH ends together.",
+    "padding": "Frame padding rule for outgoing traffic. \"400-600\" (default) pads anything shorter than 400 bytes up into 400..600 and sends longer payloads bare, so a keystroke and a 500-byte record leave the same size on the wire; the two ranges meet exactly at 400, which is what makes them indistinguishable. \"MIN-MAX\" uses MIN as the threshold; \"BELOW:MIN-MAX\" sets it explicitly, and a comma-separated list defines ordered bands so control frames can share the distribution (for example \"1:120-200,400:400-600\"). \"off\" disables padding. Each side pads only what it sends and the receiver strips whatever arrives, so the two ends need not match: a mismatch changes the traffic shape, never the bytes delivered. An invalid rule fails startup.",
     "idle_timeout": "Drop a local connection after this many seconds without traffic (default 900). Idle SSH sessions need a keepalive below it.",
     "max_conns": "Maximum concurrent client connections allowed (0 = default 2000)",
     "brutal": "TCP Brutal (Linux kernel module only; inert on other platforms). Caps the send rate of this client's TCP tunnel sockets in bytes/s. HTTP/3 tunnels run over QUIC/UDP and are never capped. Nested object: enabled (default false; off means setsockopt is never called), rate (bytes/s ceiling; 0 is illegal unless bw_exchange supplies one), cwnd_gain (tenths, so 20 = 2.0x; 0 = default 20, max 100), group_id (0 = per-connection only), bw_exchange (enable the _BrutalBwExchange protocol), bw_advertise (bytes/s this client can ingest; the server applies it as its own send rate), bw_interval (seconds between exchange attempts, default 60). The rate is a ceiling: the exchange can only lower it. A socket failure never breaks a tunnel: the connection continues uncapped and the failure is logged once.",
@@ -35,6 +36,7 @@
   "key": "/etc/xhttptunnel/cert.key",
   "window_size_mb": 0,
   "chunk_size_kb": 256,
+  "padding": "400-600",
   "idle_timeout": 900,
   "max_conns": 512,
   "brutal": {

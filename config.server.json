@@ -19,6 +19,7 @@
     "min_proto_version": "Reject (HTTP 426) clients advertising an X-XHTTP-Proto below this. 0 (default) accepts all clients, including legacy header-less ones. Set 2 to force the signed-nonce scheme: a client advertising v2 is admitted only by signature, which closes the bare-token fallback.",
     "window_size_mb": "Reliable send window per session in MiB (0 = 4; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT.",
     "chunk_size_kb": "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must be raised on BOTH ends together.",
+    "padding": "Frame padding rule for outgoing traffic. \"400-600\" (default) pads anything shorter than 400 bytes up into 400..600 and sends longer payloads bare, so a keystroke and a 500-byte record leave the same size on the wire; the two ranges meet exactly at 400, which is what makes them indistinguishable. \"MIN-MAX\" uses MIN as the threshold; \"BELOW:MIN-MAX\" sets it explicitly, and a comma-separated list defines ordered bands so control frames can share the distribution (for example \"1:120-200,400:400-600\"). \"off\" disables padding. Each side pads only what it sends and the receiver strips whatever arrives, so the two ends need not match: a mismatch changes the traffic shape, never the bytes delivered. An invalid rule fails startup.",
     "trust_proxy_headers": "Honour CF-Connecting-IP / X-Forwarded-For / X-Real-IP for client-address logging. Those headers are spoofable; enable only behind a trusted proxy that strips them.",
     "brutal": "TCP Brutal (Linux kernel module only; inert on other platforms). Caps the send rate of this server's TCP tunnel sockets in bytes/s. The HTTP/3 socket is never affected. Nested object: enabled (default false; off means setsockopt is never called), rate (bytes/s; 0 is illegal unless bw_exchange supplies one), cwnd_gain (tenths, so 20 = 2.0x; 0 = default 20, max 100), group_id (0 = per-connection only), group_from_remote (derive the group from the peer's address instead of group_id; a static group_id on a server pools every client into one aggregate ceiling), bw_exchange (accept the _BrutalBwExchange protocol), bw_advertise (bytes/s this server can ingest; the peer applies it as its own send rate), bw_interval (seconds between exchange attempts, default 60). Exchange requests are authenticated but do not count against max_sessions. A socket failure never breaks a tunnel: the connection continues uncapped and the failure is logged once.",
     "dump": "Dump raw packet hex data in logs for low-level debugging",
@@ -47,6 +48,7 @@
   "min_proto_version": 0,
   "window_size_mb": 0,
   "chunk_size_kb": 256,
+  "padding": "400-600",
   "trust_proxy_headers": false,
   "brutal": {
     "enabled": false,

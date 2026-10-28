@@ -1045,6 +1045,14 @@ type ServerConfig struct {
 	// generation. 0 (default) accepts every client, including legacy ones that
 	// send no header.
 	MinProtoVersion int
+	// Padding sets the frame padding rule for traffic this process emits, in
+	// the syntax documented on SetPadding ("400-600", "1:120-200,400:400-600",
+	// "off"). Empty leaves the process policy alone. Padding is process-wide
+	// egress policy rather than a per-server setting: a server whose rule
+	// differs from one that another server or client already declared fails
+	// here instead of silently reshaping that instance's traffic. Invalid
+	// rules are rejected by NewServer.
+	Padding string
 	// HealthPath, when non-empty (e.g. "/healthz"), serves an unauthenticated
 	// JSON TunnelStats snapshot on GET at that path, independent of the tunnel
 	// path. Intended for localhost or an operator-only listener.
@@ -1117,6 +1125,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.Path = "/stream"
 	}
 	if err := cfg.Brutal.Validate("server"); err != nil {
+		return nil, err
+	}
+	if err := installDeclaredPadding("server", cfg.Padding); err != nil {
 		return nil, err
 	}
 

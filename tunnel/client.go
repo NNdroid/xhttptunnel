@@ -1369,6 +1369,14 @@ type ClientConfig struct {
 	// ChunkSizeKB caps each upstream HTTP request body for this client.
 	// Zero uses the package default configured by SetChunkSizeKB.
 	ChunkSizeKB int
+	// Padding sets the frame padding rule for traffic this process emits, in
+	// the syntax documented on SetPadding ("400-600", "1:120-200,400:400-600",
+	// "off"). Empty leaves the process policy alone. Padding is process-wide
+	// egress policy rather than a per-client setting: a client whose rule
+	// differs from one that another client or server already declared fails
+	// here instead of silently reshaping that instance's traffic. Invalid
+	// rules are rejected by NewClient.
+	Padding string
 	// Brutal configures TCP Brutal on the client's TCP tunnel sockets.
 	// Invalid combinations are rejected by NewClient. HTTP/3 sessions run over
 	// QUIC/UDP, which brutal does not cap, so the setting has no effect on
@@ -1439,6 +1447,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("tunnel: invalid StreamMode %q (want \"\", \"auto\", \"poll\" or \"stream\")", cfg.StreamMode)
 	}
 	if err := cfg.Brutal.Validate("client"); err != nil {
+		return nil, err
+	}
+	if err := installDeclaredPadding("client", cfg.Padding); err != nil {
 		return nil, err
 	}
 	if cfg.ServerURL == "" {

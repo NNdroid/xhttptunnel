@@ -286,6 +286,7 @@ journalctl -u xhttptunnel -f   # View live logs
 | `max_sessions_per_ip` | `int` | `0` | Server: cap concurrent sessions from one client address; `0` (engine default) = unlimited. The installer and sample configs ship 50. Bounds one PSK holder's blast radius against the shared registry. Counts the TCP peer address unless `trust_proxy_headers` is on. |
 | `max_conns` | `int` | `2000` | Client max concurrent local connections / sessions. `0` selects the engine default of 2000; the installer and the sample configs ship 512. |
 | `chunk_size_kb` | `int` | `256` | Upstream payload per poll request (clamped 16–900). Must match on both ends. |
+| `padding` | `string` | `"400-600"` | Frame padding rule for outgoing traffic. `MIN-MAX` pads payloads shorter than `MIN` up into `[MIN,MAX]` and sends longer ones bare; `BELOW:MIN-MAX` sets the threshold explicitly; a comma-separated list is an ordered band list; `off` disables padding. Local egress policy: the peer strips whatever pad arrives, so the ends need not match. Invalid rules fail startup. See [Frame padding](#frame-padding). |
 | `idle_timeout` | `int` | `900` | Client: drop a local connection after this many seconds of silence. |
 | `allowed_targets` | `[]string` | `[]` | Server: restrict client-requested targets. Each entry is `host:port`, `:port`, `host:`, `[host]` or `*` — an unbracketed IPv6 literal is rejected because its colons are ambiguous, so write `[::1]:22` or `[::1]` — optionally prefixed `tcp://` / `udp://` to admit only that protocol (`udp://:53` = UDP DNS on any host; `tcp://192.168.1.10:` = TCP on any port of that host; a scheme-less `127.0.0.1:` admits either; the prefix is a protocol gate only and is never part of the address that gets dialed). An entry that cannot be parsed matches nothing rather than widening the policy. Enforcement runs at session creation, so a custom `Handler` sees only allowlisted targets too. Empty = allow all. |
 | `trust_proxy_headers` | `bool` | `false` | Server: honour `CF-Connecting-IP`/`X-Forwarded-For`/`X-Real-IP` for client-address logging. Enable only behind a trusted proxy that strips them. |
@@ -539,6 +540,73 @@ transport-only interruption resumes the same server session; if the origin
 restarts, reaps, or kicks that session, the client closes the old application
 connection explicitly because its acknowledged sequence space cannot be
 safely rebased. The application can then open a fresh tunnel.
+
+### Frame padding
+
+Every frame header carries its own pad length, so padding is a local egress
+decision: each side pads what it sends and the receiver drops the pad before
+handing bytes to the application. The ends never negotiate it — a mismatch
+changes the traffic shape, never the payload.
+
+The default `400-600` reads: a payload shorter than 400 bytes is padded so that
+payload+pad lands uniformly at random in 400..600, and a payload of 400 bytes or
+more is sent as it is. Because the bare range starts exactly where the band does,
+both halves occupy the same window on the wire — a keystroke and a 500-byte
+record leave the same size, which is the point. The previous built-in shape
+(small payloads into 600..1200, bulk always plus 16..127) did not have that
+property, and it left the control frames a disjoint 38..165-byte cluster.
+
+The rule is a short ordered band list; the first matching band wins:
+
+| Rule | Meaning |
+| :--- | :--- |
+| `off` / `none` | No padding at all. |
+| `auto` / `default` / empty | The built-in `400-600`. |
+| `MIN-MAX` | Threshold is `MIN`: payloads below it land in `[MIN,MAX]`, longer ones are sent bare. |
+| `BELOW:MIN-MAX` | The same with an explicit threshold, e.g. `512:600-1199` for the old shape. |
+| `A,B,...` | Several bands, matched in increasing threshold order. |
+
+`1:120-200,400:400-600`, for instance, keeps empty keepalive and ack-only frames
+at 120..200 bytes and everything else under 400 in the main band, so the control
+channel is not the only traffic on the wire shorter than the band. Thresholds
+must increase, and a band's lower bound must be at least `threshold-1`
+(otherwise its longest payload already exceeds its own target and the pad would
+be negative); a spec that breaks either rule fails startup naming the band.
+
+Things worth knowing before changing it:
+
+- **The close marker is padded too.** It used to be a bare six-byte write — the
+  only object of that size on the wire, and therefore an exact signature for "a
+  tunnel just closed". It is identified by its length field, so padding it is
+  invisible to the reader and to older peers.
+- **Pad rides inside the reliable frame.** A 20-byte write consumes `MIN` bytes
+  of send window and receive reassembly, not 20. At the default that is 400..600
+  bytes per interactive write — roughly half the cost of the old shape, but still
+  a multiple of the payload.
+- **Padding stops at `MIN`.** Bulk transfer keeps exact frame sizes. Covering
+  those would cost a 20× overhead per record for a size an observer can already
+  estimate from the tunnel's throughput.
+- **Bands are capped at 90000 bytes**, the per-frame scratch headroom that the
+  send buffers and the admission budget are sized from.
+- The rule applies to every frame this process emits, both the inner payload
+  frame and the streaming envelope, so one setting covers both transports.
+
+`gen-config` exposes it as `-padding`. Embedders have two ways in, both landing
+on the same process-wide policy:
+
+- **Declaratively**, through `ClientConfig.Padding` or `ServerConfig.Padding`
+  (same syntax; empty leaves the current policy alone). An invalid rule is
+  rejected by `NewClient`/`NewServer` naming the field.
+- **Imperatively**, through `tunnel.SetPadding` at startup, with
+  `tunnel.PaddingSpec` reading back the normalised rule (`400:400-600`, `off`).
+  `SetPadding` is an explicit override and is not compared against declarations.
+
+If two configs in one process declare *different* rules, the second
+`NewClient`/`NewServer` fails instead of quietly reshaping the traffic of the
+instance that declared first — padding is a property of the process, not of a
+single client or server. The same rule spelled differently (`400-600` vs
+`400:400-600`, `none` vs `off`) compares equal, since the comparison uses the
+compiled band list.
 
 ### TCP Brutal & bandwidth exchange
 
