@@ -645,12 +645,9 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		var windowMu sync.Mutex
 		var triggerRetry int32
 		var emptyPollers int32
-		// peerPadsBody records that the server answered this session with the
-		// pad-body capability, which says it will drop a leading X-Pad before
-		// reading a request body. Until then every request goes out unpadded:
-		// an X-Pad a peer does not honour is padding fed straight into its
-		// receive ring as payload.
-		var peerPadsBody atomic.Bool
+		// Whether the transport pads is not a decision this goroutine keeps:
+		// it lives in virtualConn.padInTransport, which the frame layer also
+		// reads. See the two places below for why there is only one copy.
 
 		restartCount := 0
 
@@ -741,7 +738,17 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					if len(upData) > 0 {
 						method = http.MethodPost
 						body := upData
-						if peerPadsBody.Load() {
+						// The session's one answer to "does the transport
+						// pad?". The frame layer reads the same flag to decide
+						// whether to leave its pad field at zero, so the body's
+						// pad and the frames inside it cannot disagree — a
+						// second copy could briefly produce a body with neither
+						// pad, or a padded body full of padded frames.
+						//
+						// False is the conservative start: a body padded for a
+						// peer that does not read X-Pad lands in its receive
+						// ring as payload. The first echoing response flips it.
+						if virtualConn.padInTransport.Load() {
 							padded, pad, padErr := padPollBody(upData)
 							if padErr != nil {
 								// Padding is best-effort: a broken entropy source
@@ -832,8 +839,10 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					req.Header.Set("X-Seq", strconv.FormatUint(currentSeq, 10))
 					req.Header.Set("X-Ack", strconv.FormatUint(myAck, 10))
 					// Advertise that this side reads a padded poll body. The
-					// server echoes it once it agrees; only then does this side
-					// start prefixing its own bodies (peerPadsBody).
+					// server echoes it only when it received the announcement,
+					// so the answer is proof that the header survived the path
+					// in both directions; until it arrives this side sends
+					// bodies the frame layer padded.
 					req.Header.Set(CapsHeader, CapPadBody)
 					if upPad > 0 {
 						req.Header.Set(PadHeader, strconv.Itoa(upPad))
@@ -1066,6 +1075,11 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					// stop padding: the body's pad shapes the wire object, and
 					// two pads on one object would overshoot the band.
 					//
+					// One flag moves both halves in one step: the frame layer
+					// and the body padding above read padInTransport, so a body
+					// can never be built from frames whose pad state disagrees
+					// with its own.
+					//
 					// Stored per response rather than latched on the first
 					// echo: a session can outlive the node that answered it,
 					// and a fleet mid-upgrade mixes builds. A peer that stops
@@ -1074,12 +1088,13 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					// prefixing bodies with a pad that peer feeds to its
 					// reassembly as payload.
 					echoed := hasCapValue(resp.Header.Get(CapsHeader), CapPadBody)
-					if was := peerPadsBody.Swap(echoed); echoed && !was {
-						logger.Debug("🧩 [Pump] server reads a padded poll body; frame-level padding handed to the transport", zap.String("session", sessionID))
-					} else if !echoed && was {
-						logger.Debug("🧩 [Pump] server stopped advertising a padded poll body; padding back in the frame layer", zap.String("session", sessionID))
+					if was := virtualConn.padInTransport.Swap(echoed); echoed != was {
+						if echoed {
+							logger.Debug("🧩 [Pump] server reads a padded poll body; frame-level padding handed to the transport", zap.String("session", sessionID))
+						} else {
+							logger.Debug("🧩 [Pump] server stopped advertising a padded poll body; padding back in the frame layer", zap.String("session", sessionID))
+						}
 					}
-					virtualConn.padInTransport.Store(echoed)
 					downPad, padErr := parsePollPad(resp.Header.Get(PadHeader))
 					if padErr != nil {
 						io.Copy(io.Discard, resp.Body)

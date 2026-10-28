@@ -220,7 +220,15 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	// than the frame: with both ends agreed, a streamed frame carries exactly
 	// one pad and lands inside the band instead of 22 bytes above it. (The
 	// session already flipped padInTransport in the shared handler.)
-	h.Set(CapsHeader, CapPadBody)
+	//
+	// Conditional, like the poll response: the agreement is two-way, and a
+	// client whose announcement a middlebox stripped must not be told this side
+	// expects the pad. It costs only shape — the frame layer keeps padding,
+	// which an origin reads whatever its build — and it keeps the answer an
+	// honest report that the header survived the path in both directions.
+	if hasCapValue(r.Header.Get(CapsHeader), CapPadBody) {
+		h.Set(CapsHeader, CapPadBody)
+	}
 	if created {
 		h.Set("X-Session-Created", "1")
 	}

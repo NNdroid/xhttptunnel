@@ -34,6 +34,12 @@ type bodyRecorder struct {
 	// way a middlebox that does not understand it would. The bodies and their
 	// X-Pad pass through untouched.
 	stripCaps atomic.Bool
+	// stripRequestCaps does the same to requests, one direction only: the
+	// origin never learns the client can read a padded body, so it must not
+	// answer as if it had. The bodies pass through untouched, which is the
+	// dangerous half of the case — the capability can be lost while the bytes
+	// that depend on it are not.
+	stripRequestCaps atomic.Bool
 
 	mu     sync.Mutex
 	bodies []recordedBody
@@ -54,6 +60,10 @@ func newBodyRecorder(t *testing.T, originURL *url.URL) *bodyRecorder {
 		pad, _ := parsePollPad(r.Header.Get(PadHeader))
 		if len(sent) > 0 {
 			rec.record(recordedBody{method: r.Method, body: sent, pad: pad})
+		}
+
+		if rec.stripRequestCaps.Load() {
+			r.Header.Del(CapsHeader)
 		}
 
 		r.RequestURI = ""
@@ -384,5 +394,99 @@ func TestPollPaddingFollowsThePeerRatherThanLatching(t *testing.T) {
 	}
 	if fromFrame < 2 {
 		t.Fatalf("only %d of %d bodies went back to frame-level padding after the capability disappeared", fromFrame, requests)
+	}
+}
+
+// TestPollPaddingFailsClosedWhenTheRequestHeaderIsStripped pins the other half
+// of the negotiation: the capability has to survive the path before either side
+// acts on it.
+//
+// The proxy here drops the header from requests only. The origin therefore never
+// learns the client can read a padded body, and must not answer as if it had. If
+// it announced pad-body anyway, the client would take that answer as licence to
+// prefix its bodies with an X-Pad — on the strength of an answer to a request
+// the origin never saw. Data would still line up while the X-Pad itself survives,
+// and the moment a middlebox drops that too, the prefix is reassembled as
+// payload. Failing the handshake closed leaves both ends on the frame shape,
+// which no middlebox can turn into corruption.
+func TestPollPaddingFailsClosedWhenTheRequestHeaderIsStripped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	snapshotPadding(t)
+	if err := SetPadding("400-600"); err != nil {
+		t.Fatal(err)
+	}
+
+	echoAddr, closeEcho := startTCPEchoServer(t)
+	defer closeEcho()
+
+	origin, err := ListenXHTTP(ctx, "127.0.0.1:0", "/stream", "pad-secret", "", "", "")
+	if err != nil {
+		t.Fatalf("start origin: %v", err)
+	}
+	defer origin.Close()
+	serveAcceptedTCPEcho(t, ctx, origin)
+
+	originURL, err := url.Parse("http://" + origin.Addr().String() + "/stream")
+	if err != nil {
+		t.Fatalf("parse origin URL: %v", err)
+	}
+	rec := newBodyRecorder(t, originURL)
+	// Stripped from the first request, so there is never a window in which the
+	// ends agree and then forget.
+	rec.stripRequestCaps.Store(true)
+
+	serverURL, err := url.Parse(rec.server.URL + "/stream")
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	conn, err := DialXHTTP(ctx, serverURL, &DialConfig{
+		Password:   "pad-secret",
+		Path:       "/stream",
+		ALPN:       "h1",
+		StreamMode: "poll",
+	}, echoAddr, "tcp")
+	if err != nil {
+		t.Fatalf("dial through proxy: %v", err)
+	}
+	defer conn.Close()
+
+	payload := bytes.Repeat([]byte{0x5a}, 20)
+	for i := 0; i < 4; i++ {
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatalf("round %d: write: %v", i, err)
+		}
+		got, err := readFullBefore(conn, len(payload), 20*time.Second)
+		if err != nil {
+			t.Fatalf("round %d: read: %v", i, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("round %d: payload corrupted", i)
+		}
+	}
+
+	sent, replies := rec.snapshot()
+	if len(sent) < 2 {
+		t.Fatalf("the proxy saw %d request bodies, need several rounds of them", len(sent))
+	}
+	for i, b := range sent {
+		if b.pad != 0 {
+			t.Fatalf("request body %d declares X-Pad=%d although the origin never received the announcement; the handshake has to fail closed", i, b.pad)
+		}
+		frames := splitInnerFrames(t, b.body)
+		if len(frames) == 0 {
+			t.Fatalf("request body %d holds no frame", i)
+		}
+		for j, f := range frames {
+			if f.pad == 0 || f.total < 400 || f.total > 600 {
+				t.Fatalf("request body %d frame %d: total=%d pad=%d, want the frame layer's 400..600 when the transport pad is not in force", i, j, f.total, f.pad)
+			}
+		}
+	}
+	for i, b := range replies {
+		if b.pad != 0 {
+			t.Fatalf("response body %d declares X-Pad=%d although this client never announced pad-body", i, b.pad)
+		}
 	}
 }

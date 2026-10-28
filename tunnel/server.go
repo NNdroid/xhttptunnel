@@ -755,7 +755,15 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		w.Header().Set("X-Ack", strconv.FormatUint(myUpAck, 10))
 		w.Header().Set("X-Seq", strconv.FormatUint(myDownSeq, 10))
 		w.Header().Set("Content-Length", strconv.Itoa(len(downData)))
-		w.Header().Set(CapsHeader, CapPadBody)
+		// Echo the capability only to a peer that announced it. pad-body is a
+		// two-way agreement, and announcing it unconditionally would invite a
+		// client whose request header a middlebox stripped to start prefixing
+		// its bodies with an X-Pad this side has no record of expecting — if
+		// that middlebox drops X-Pad too, the prefix is read as frames. Failing
+		// the handshake closed keeps both ends on frame-level padding instead.
+		if clientPadsBody {
+			w.Header().Set(CapsHeader, CapPadBody)
+		}
 		if respPad > 0 {
 			w.Header().Set(PadHeader, strconv.Itoa(respPad))
 		}

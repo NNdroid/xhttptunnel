@@ -568,9 +568,13 @@ the header's width. So exactly one of them does:
 - **Unnegotiated, with any peer.** The frame layer pads. A frame's own pad field
   lives in the 6-byte header every peer already parses, so this needs no
   handshake and a mixed-version pair gets the full benefit in both directions.
-  The cost is that a streamed object is one 22-byte envelope header taller than
-  the band: the inner pad has already lifted the chunk past the threshold, so
-  the envelope adds its header and no pad.
+  The envelope then measures the chunk it is about to wrap, its own 22 header
+  bytes included, and pads only if the rule still asks for it: with the default
+  band the inner pad has already cleared the 400-byte threshold, so the envelope
+  adds its header and nothing else and every streamed object sits 22 bytes above
+  the band. A band that starts above the chunk's size re-bands it at the
+  envelope, so that object lands inside the band with a frame pad it did not
+  need — the shape is right, the bytes inside it are wasted.
 - **Negotiated.** Both ends advertise `pad-body` in `X-HTTP-Tunnel-Caps`.
   Padding moves out to the transport — the streaming envelope's own pad field,
   or a poll body's leading `X-Pad` bytes — and the frame layer leaves its pad
