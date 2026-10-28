@@ -591,14 +591,12 @@ Things worth knowing before changing it:
   the frame header. A larger band would be truncated on the wire and the reader
   would then strip the wrong number of bytes, handing the application padding as
   if it were payload — a silent corruption, not a shape change.
-- **Coverage stops at the framed transports.** The rule applies to every frame
-  this process writes: the inner frame of a tunnelled TCP/UDP session (one frame
-  per `Write`, which is why `WriteUDPFrame` joins its length prefix to the
-  payload instead of issuing two writes), the streaming envelope, and the close
-  marker. The legacy long-poll transport has no frames at all — its request and
-  response bodies carry raw payload behind a bare `Content-Length` — so
-  `stream_mode: "poll"`, and any downgrade onto a path that buffers the stream,
-  leaves exact sizes on the wire.
+- **The long-poll transport is covered by the same rule.** A poll body is not
+  raw payload: the session conn frames every write before it reaches the ring,
+  so a POST body and a poll response are runs of padded frames and their
+  `Content-Length` lands in the band like any other frame. One frame per
+  `Write` is what makes that hold — which is why `WriteUDPFrame` joins its
+  length prefix to the payload instead of issuing two writes.
 
 `gen-config` exposes it as `-padding`. Embedders have two ways in, both landing
 on the same process-wide policy:

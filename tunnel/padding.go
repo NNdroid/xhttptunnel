@@ -16,12 +16,12 @@ import (
 // traffic shape, never the bytes an application receives. Padding is therefore
 // local egress policy — one setting per process, not per session.
 //
-// Coverage is the framed transports only: the inner frame of a tunnelled
-// TCP/UDP session, the streaming envelope, and the close marker. The legacy
-// long-poll transport has no frames — its request and response bodies are raw
-// payload with a bare Content-Length — so nothing here can shape it, and
-// stream_mode "poll" (or a downgrade onto a buffering path) still leaks exact
-// sizes.
+// Coverage follows the frame, not the transport. A tunnelled TCP/UDP session,
+// the streaming envelope and the close marker are all framed, and the
+// long-poll transport carries those same frames as its bodies: the session
+// conn frames every write before it reaches the ring, so a poll POST or a poll
+// response is a run of padded frames rather than raw payload. Nothing bypasses
+// the frame layer, so nothing bypasses this rule.
 //
 // It is installed either imperatively with SetPadding or declaratively through
 // ClientConfig.Padding / ServerConfig.Padding. The two routes reach the same
