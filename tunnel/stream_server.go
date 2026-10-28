@@ -212,9 +212,15 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	h.Set("Expires", "0")
 	h.Set("X-Accel-Buffering", "no")
 	h.Set("Access-Control-Allow-Origin", "*")
-	h.Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Downstream-Accepted")
+	h.Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Downstream-Accepted, X-HTTP-Tunnel-Caps")
 	h.Set("X-Downstream-Accepted", "1")
 	h.Set("X-Stream-Uplink-Sync", "1")
+	// Echo the pad-body capability the client announced. It means this side
+	// reads the transport-level pad, so padding belongs in the envelope rather
+	// than the frame: with both ends agreed, a streamed frame carries exactly
+	// one pad and lands inside the band instead of 22 bytes above it. (The
+	// session already flipped padInTransport in the shared handler.)
+	h.Set(CapsHeader, CapPadBody)
 	if created {
 		h.Set("X-Session-Created", "1")
 	}

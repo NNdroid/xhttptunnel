@@ -275,11 +275,16 @@ func TestPaddingComplexRulesPickTheRightBand(t *testing.T) {
 // TestPaddingComplexRulesOnTheWire is the behavioural half: the inner frame the
 // tunnel actually writes must match its own header, land in the band the rule
 // assigns, and still deliver the payload byte for byte.
+//
+// The thresholds here are wire sizes, not payload sizes: 8 is a six-byte frame
+// header plus two payload bytes, 70 is 64 payload bytes, and 400 is where the
+// last band stops applying. Writing round payload numbers instead would test
+// where the header happens to fall rather than where the rule switches.
 func TestPaddingComplexRulesOnTheWire(t *testing.T) {
-	const spec = "1:120-200,64:300-360,400:400-600"
+	const spec = "8:120-200,70:300-360,400:400-600"
 	bands := []paddingBand{
-		{below: 1, min: 120, max: 200},
-		{below: 64, min: 300, max: 360},
+		{below: 8, min: 120, max: 200},
+		{below: 70, min: 300, max: 360},
 		{below: 400, min: 400, max: 600},
 	}
 	withPadding(t, spec)
@@ -289,12 +294,12 @@ func TestPaddingComplexRulesOnTheWire(t *testing.T) {
 		padded bool
 		band   paddingBand
 	}{
-		{0, true, bands[0]},
-		{1, true, bands[1]},
-		{63, true, bands[1]},
-		{64, true, bands[2]},
-		{399, true, bands[2]},
-		{400, false, paddingBand{}},
+		{0, true, bands[0]},         // 6 bytes on the wire
+		{2, true, bands[1]},         // 8: the threshold opens the next band
+		{63, true, bands[1]},        // 69
+		{64, true, bands[2]},        // 70
+		{393, true, bands[2]},       // 399
+		{394, false, paddingBand{}}, // 400: at the threshold, sent bare
 		{1024, false, paddingBand{}},
 	}
 
@@ -316,8 +321,8 @@ func TestPaddingComplexRulesOnTheWire(t *testing.T) {
 			t.Fatalf("payload %d: frame is %d bytes but the header declares %d pad + %d payload", tc.n, len(raw), pad, length)
 		}
 		if tc.padded {
-			if total := length + pad; total < tc.band.min || total > tc.band.max {
-				t.Fatalf("payload %d landed at %d, outside its band [%d,%d]", tc.n, total, tc.band.min, tc.band.max)
+			if total := len(raw); total < tc.band.min || total > tc.band.max {
+				t.Fatalf("payload %d landed at %d bytes on the wire, outside its band [%d,%d]", tc.n, total, tc.band.min, tc.band.max)
 			}
 		} else if pad != 0 {
 			t.Fatalf("payload %d is past the last threshold but the frame carries %d pad bytes", tc.n, pad)
@@ -339,16 +344,19 @@ func TestPaddingComplexRulesOnTheWire(t *testing.T) {
 
 // TestPaddingComplexRulesOnTheStreamWire covers the other framing: the 22-byte
 // streaming envelope shares the policy, including the close marker whose length
-// field is the marker itself.
+// field is the marker itself. The envelope is a wire object of its own, so the
+// thresholds are 22 bytes higher than the inner frame's and the band applies to
+// the whole thing — header, pad and payload.
 func TestPaddingComplexRulesOnTheStreamWire(t *testing.T) {
+	const spec = "24:120-200,86:300-360,400:400-600"
 	bands := []paddingBand{
-		{below: 1, min: 120, max: 200},
-		{below: 64, min: 300, max: 360},
+		{below: 24, min: 120, max: 200},
+		{below: 86, min: 300, max: 360},
 		{below: 400, min: 400, max: 600},
 	}
-	withPadding(t, "1:120-200,64:300-360,400:400-600")
+	withPadding(t, spec)
 
-	for _, n := range []int{0, 1, 63, 64, 399, 400, 1024} {
+	for _, n := range []int{0, 2, 63, 64, 377, 378, 1024} {
 		payload := bytes.Repeat([]byte{'z'}, n)
 		frame, err := streamFrameBytes(7, 11, payload)
 		if err != nil {
@@ -359,12 +367,12 @@ func TestPaddingComplexRulesOnTheStreamWire(t *testing.T) {
 		if length != n {
 			t.Fatalf("payload %d: envelope length = %d", n, length)
 		}
-		if len(frame) != 22+pad+length {
+		if len(frame) != streamEnvelopeHeader+pad+length {
 			t.Fatalf("payload %d: envelope is %d bytes, header says %d pad + %d payload", n, len(frame), pad, length)
 		}
-		if b, padded := bandForPayload(bands, n); padded {
-			if total := length + pad; total < b.min || total > b.max {
-				t.Fatalf("payload %d landed at %d, outside its band [%d,%d]", n, total, b.min, b.max)
+		if b, padded := bandForPayload(bands, streamEnvelopeHeader+n); padded {
+			if total := len(frame); total < b.min || total > b.max {
+				t.Fatalf("payload %d landed at %d bytes on the wire, outside its band [%d,%d]", n, total, b.min, b.max)
 			}
 		} else if pad != 0 {
 			t.Fatalf("payload %d is past the last threshold but carries %d pad bytes", n, pad)
@@ -382,13 +390,14 @@ func TestPaddingComplexRulesOnTheStreamWire(t *testing.T) {
 		}
 	}
 
-	// The close marker is an empty payload, so it takes the control band.
+	// The close marker is an empty payload, so the whole 22-byte envelope takes
+	// the control band.
 	marker, err := streamCloseFrameBytes(0, 0)
 	if err != nil {
 		t.Fatalf("streamCloseFrameBytes: %v", err)
 	}
-	if total := len(marker) - 22; total < bands[0].min || total > bands[0].max {
-		t.Fatalf("close marker is %d bytes of payload+pad, outside the control band [%d,%d]", total, bands[0].min, bands[0].max)
+	if total := len(marker); total < bands[0].min || total > bands[0].max {
+		t.Fatalf("close marker is %d bytes on the wire, outside the control band [%d,%d]", total, bands[0].min, bands[0].max)
 	}
 	f, err := readStreamFrame(bytes.NewReader(marker))
 	if err != nil {
@@ -414,8 +423,8 @@ func TestPaddingPadFieldBoundary(t *testing.T) {
 		t.Fatalf("writeSingleFrame: %v", err)
 	}
 	raw := buf.Bytes()
-	if pad := int(binary.BigEndian.Uint16(raw[4:6])); pad != 65535-len(payload) {
-		t.Fatalf("pad field = %d, want %d; the value was narrowed on the wire", pad, 65535-len(payload))
+	if pad := int(binary.BigEndian.Uint16(raw[4:6])); pad != 65535-frameHeaderSize-len(payload) {
+		t.Fatalf("pad field = %d, want %d; the value was narrowed on the wire", pad, 65535-frameHeaderSize-len(payload))
 	}
 	reader := newXHTTPConn(bytes.NewReader(raw), io.Discard, func() error { return nil }, nil, nil, nil)
 	got := make([]byte, len(payload))
@@ -431,8 +440,8 @@ func TestPaddingPadFieldBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("streamFrameBytes: %v", err)
 	}
-	if pad := int(binary.BigEndian.Uint16(frame[20:22])); pad != 65535-len(payload) {
-		t.Fatalf("stream pad field = %d, want %d", pad, 65535-len(payload))
+	if pad := int(binary.BigEndian.Uint16(frame[20:22])); pad != 65535-streamEnvelopeHeader-len(payload) {
+		t.Fatalf("stream pad field = %d, want %d", pad, 65535-streamEnvelopeHeader-len(payload))
 	}
 	f, err := readStreamFrame(bytes.NewReader(frame))
 	if err != nil {
@@ -541,7 +550,7 @@ func splitInnerFrames(t *testing.T, wire []byte) []innerFrame {
 // tunnel renders one padded frame per Write, so emitting the two-byte length
 // separately from the payload used to produce two frames per datagram: a
 // 30-byte datagram cost 1038 bytes instead of ~500, and every datagram appeared
-// as a pair of 400..600-byte frames — paying twice for the padding while
+// as a pair of frames inside the band — paying twice for the padding while
 // handing an observer a shape of its own to key on.
 func TestUDPFrameJoinsLengthAndPayload(t *testing.T) {
 	payload := bytes.Repeat([]byte{0x5a}, 30)
@@ -550,7 +559,7 @@ func TestUDPFrameJoinsLengthAndPayload(t *testing.T) {
 		spec     string
 		min, max int
 	}{
-		{name: "default rule", spec: "400-600", min: 406, max: 606},
+		{name: "default rule", spec: "400-600", min: 400, max: 600},
 		{name: "padding off", spec: "off", min: 38, max: 38},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

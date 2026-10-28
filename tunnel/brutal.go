@@ -51,6 +51,20 @@ const (
 	// target, which is a clean non-200 rather than a partial exchange.
 	CapsHeader  = "X-HTTP-Tunnel-Caps"
 	CapBrutalBw = "brutal-bw"
+	// CapPadBody advertises that this side reads a poll body whose first
+	// X-Pad bytes are padding to be dropped, not payload. Both directions are
+	// gated on it: a body padded for a peer that does not understand the
+	// header would be fed straight into the receive ring as data.
+	//
+	// It also settles how padding is placed on the wire. Once both ends have
+	// said they read the transport-level pad, the frame layer stops padding
+	// (padInTransport) and the wire object carries exactly one pad: the
+	// streaming envelope's, or the poll body's prefix.
+	CapPadBody = "pad-body"
+	// PadHeader carries the byte count of a poll body's leading pad. It is
+	// sent on requests and responses alike; zero or absent means the body
+	// starts with frames.
+	PadHeader = "X-Pad"
 
 	// TCP_BRUTAL_PARAMS. A private option number owned by the module, not
 	// published by any standards body, so it is named here rather than
@@ -426,15 +440,21 @@ func parseBwValue(s string) (v uint64, ok bool) {
 	return n, true
 }
 
-// hasBrutalBwCap reports whether a comma-separated X-HTTP-Tunnel-Caps value
-// advertises the bandwidth exchange.
-func hasBrutalBwCap(s string) bool {
-	for _, cap := range strings.Split(s, ",") {
-		if strings.TrimSpace(cap) == CapBrutalBw {
+// hasCapValue reports whether a comma-separated X-HTTP-Tunnel-Caps value
+// advertises the named extension.
+func hasCapValue(s, want string) bool {
+	for _, capability := range strings.Split(s, ",") {
+		if strings.TrimSpace(capability) == want {
 			return true
 		}
 	}
 	return false
+}
+
+// hasBrutalBwCap reports whether a comma-separated X-HTTP-Tunnel-Caps value
+// advertises the bandwidth exchange.
+func hasBrutalBwCap(s string) bool {
+	return hasCapValue(s, CapBrutalBw)
 }
 
 // brutalListener applies brutal to every connection it accepts, then hands the

@@ -131,26 +131,31 @@ func TestPaddingNeverNegative(t *testing.T) {
 func TestPaddingDefaultShape(t *testing.T) {
 	withPadding(t, "")
 
-	for _, n := range []int{0, 1, 20, 100, 399} {
+	// The rule measures the object as it reaches the wire, so the number fed
+	// to padLenFor is the header plus the payload — the same number an observer
+	// counting bytes on the socket would see. That also moves the payload
+	// threshold the header's width below the band: 393 is the longest payload a
+	// frame can carry and still be padded, since 393+6 is 399.
+	for _, payload := range []int{0, 1, 20, 100, 393} {
+		bare := frameHeaderSize + payload
 		seen := map[int]bool{}
 		for i := 0; i < 4000; i++ {
-			pad := padLenFor(n)
-			wire := n + pad + 6
-			if wire < 400+6 || wire > 600+6 {
-				t.Fatalf("payload %d produced a %d-byte frame, outside 406..606", n, wire)
+			wire := bare + padLenFor(bare)
+			if wire < 400 || wire > 600 {
+				t.Fatalf("payload %d produced a %d-byte frame, outside 400..600", payload, wire)
 			}
-			seen[pad+n] = true
+			seen[wire] = true
 		}
 		if len(seen) < 150 {
-			t.Errorf("payload %d only reached %d distinct targets, the band should be spread across 400..600", n, len(seen))
+			t.Errorf("payload %d only reached %d distinct targets, the band should be spread across 400..600", payload, len(seen))
 		}
 	}
 
-	// At and above the band the payload travels as-is: that is the whole point
+	// At and above the band the object travels as-is: that is the whole point
 	// of the threshold, and it is what keeps bulk transfer cheap.
-	for _, n := range []int{400, 480, 600, 601, 1024, 256000} {
-		if pad := padLenFor(n); pad != 0 {
-			t.Errorf("payload %d was padded by %d, want 0", n, pad)
+	for _, wire := range []int{400, 480, 600, 601, 1024, 256000} {
+		if pad := padLenFor(wire); pad != 0 {
+			t.Errorf("a %d-byte object was padded by %d, want 0", wire, pad)
 		}
 	}
 }
@@ -163,34 +168,42 @@ func TestPaddingBandOverlap(t *testing.T) {
 
 	padded := map[int]bool{}
 	for i := 0; i < 4000; i++ {
-		padded[padLenFor(0)+6] = true
-		padded[padLenFor(399)+399+6] = true
+		// An empty chunk and the largest payload the band still pads, both
+		// measured as they land: header plus payload.
+		empty := frameHeaderSize
+		padded[empty+padLenFor(empty)] = true
+		longest := frameHeaderSize + 399
+		padded[longest+padLenFor(longest)] = true
 	}
-	for n := 400; n <= 600; n++ {
-		if !padded[n+6] {
-			t.Errorf("a bare %d-byte payload (%d on the wire) is outside the padded band's range", n, n+6)
+	for wire := 400; wire <= 600; wire++ {
+		if !padded[wire] {
+			t.Errorf("a bare %d-byte frame is outside the padded band's range", wire)
 		}
 	}
 }
 
 func TestPaddingBandsSelectByThreshold(t *testing.T) {
-	withPadding(t, "1:120-200,400:400-600")
+	// 7 is the first object the frame layer can produce that is not the band's
+	// threshold: a six-byte frame header plus one payload byte. A control band
+	// written as 1:120-200 would never match anything, because nothing that
+	// short can exist on the wire.
+	withPadding(t, "7:120-200,400:400-600")
 
 	for i := 0; i < 2000; i++ {
 		// An empty chunk is a keepalive; it takes the first band.
-		if pad := padLenFor(0); pad < 120 || pad > 200 {
-			t.Fatalf("empty chunk padded by %d, want 120..200", pad)
+		if wire := frameHeaderSize + padLenFor(frameHeaderSize); wire < 120 || wire > 200 {
+			t.Fatalf("empty chunk landed at %d bytes, want the control band 120..200", wire)
 		}
-		// One byte already falls into the second band.
-		if pad := padLenFor(1); pad < 399 || pad > 599 {
-			t.Fatalf("1-byte chunk padded by %d, want 399..599", pad)
+		// One payload byte already falls into the second band.
+		if wire := frameHeaderSize + 1 + padLenFor(frameHeaderSize+1); wire < 400 || wire > 600 {
+			t.Fatalf("a one-byte chunk landed at %d bytes, want 400..600", wire)
 		}
-		if pad := padLenFor(399); pad < 1 || pad > 201 {
-			t.Fatalf("399-byte chunk padded by %d, want 1..201", pad)
+		if wire := 399 + padLenFor(399); wire < 400 || wire > 600 {
+			t.Fatalf("a 399-byte object landed at %d bytes, want 400..600", wire)
 		}
 	}
 	if pad := padLenFor(400); pad != 0 {
-		t.Fatalf("a 400-byte chunk was padded by %d, want 0", pad)
+		t.Fatalf("a 400-byte object was padded by %d, want 0", pad)
 	}
 }
 
@@ -223,8 +236,8 @@ func TestFramePaddingRoundTrip(t *testing.T) {
 	if err := sender.writeSingleFrame(payload); err != nil {
 		t.Fatalf("writeSingleFrame: %v", err)
 	}
-	if buf.Len() < 400+6 || buf.Len() > 600+6 {
-		t.Fatalf("frame is %d bytes, outside the padded band", buf.Len())
+	if buf.Len() < 400 || buf.Len() > 600 {
+		t.Fatalf("frame is %d bytes, outside the padded band 400..600", buf.Len())
 	}
 
 	reader := newXHTTPConn(&buf, io.Discard, func() error { return nil }, nil, nil, nil)
@@ -249,8 +262,8 @@ func TestCloseFrameIsPadded(t *testing.T) {
 		t.Fatalf("WriteCloseFrame: %v", err)
 	}
 	raw := buf.Bytes()
-	if len(raw) < 400+6 || len(raw) > 600+6 {
-		t.Fatalf("close frame is %d bytes, outside the padded band", len(raw))
+	if len(raw) < 400 || len(raw) > 600 {
+		t.Fatalf("close frame is %d bytes, outside the padded band 400..600", len(raw))
 	}
 	if got := binary.BigEndian.Uint32(raw[0:4]); got != ^uint32(0) {
 		t.Fatalf("close frame length field = %#x, want the close marker", got)
@@ -275,8 +288,8 @@ func TestStreamCloseFrameIsPadded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("streamCloseFrameBytes: %v", err)
 	}
-	if len(frame) < 400+22 || len(frame) > 600+22 {
-		t.Fatalf("stream close frame is %d bytes, outside the padded band", len(frame))
+	if len(frame) < 400 || len(frame) > 600 {
+		t.Fatalf("stream close frame is %d bytes, outside the padded band 400..600", len(frame))
 	}
 	f, err := readStreamFrame(bytes.NewReader(frame))
 	if err != nil {

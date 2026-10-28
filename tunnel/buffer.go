@@ -247,14 +247,17 @@ func (rb *reliableBuffer) getStreamFrame(remoteAck, dispatchSeq, ack uint64, max
 		rb.mu.Unlock()
 		return nil, seq, nil
 	}
-	pad := padLenFor(length)
+	// The band measures the wire object, envelope header included: with the
+	// frame layer no longer padding (padInTransport), this is the only pad a
+	// streamed frame carries and it must account for all 22 header bytes.
+	pad := padLenFor(streamEnvelopeHeader + length)
 	frame := streamFrameStorage(scratch, seq, ack, length, pad)
-	rb.copyRangeLocked(frame[22+pad:], start)
+	rb.copyRangeLocked(frame[streamEnvelopeHeader+pad:], start)
 	if !rb.pendingBeyond(seq + uint64(length)) {
 		rb.cond.Broadcast()
 	}
 	rb.mu.Unlock()
-	_, err := rand.Read(frame[22 : 22+pad])
+	_, err := rand.Read(frame[streamEnvelopeHeader : streamEnvelopeHeader+pad])
 	return frame, seq, err
 }
 func (rb *reliableBuffer) sliceRangeLocked(remoteAck uint64, dispatchSeq uint64, maxLen int) (uint64, int, int) {
@@ -497,6 +500,16 @@ type meekVirtualConn struct {
 	closedFlag     atomic.Bool // set once Close() wins; safe to read without the lock
 	closeRequested atomic.Bool // graceful stop: ship what is queued, then exit
 	kicked         atomic.Bool // set by Kick: the downlink must NOT send a close marker, so the client re-establishes
+	// padInTransport means the wire form itself carries the padding — the
+	// streaming envelope's pad field, or a poll body's leading pad announced
+	// by X-Pad — so the frame layer must not pad as well. One pad per wire
+	// object, otherwise the two stack and the total overshoots the band.
+	//
+	// False is the conservative default: the frame layer pads (its pad field
+	// is understood by every peer, so this costs nothing on compatibility) and
+	// the transport adds none. It flips only once the peer is known to read
+	// the transport-level pad.
+	padInTransport atomic.Bool
 	closedCh       chan struct{}
 	closedOnce     sync.Once
 	receiveChanged chan struct{} // receive/ACK progress, independent of send data

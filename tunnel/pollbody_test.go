@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -18,6 +19,7 @@ type recordedBody struct {
 	method  string
 	status  int
 	body    []byte
+	pad     int
 	isReply bool
 }
 
@@ -27,6 +29,11 @@ type recordedBody struct {
 type bodyRecorder struct {
 	server *httptest.Server
 	origin *url.URL
+
+	// stripCaps makes the proxy drop the capability header from responses, the
+	// way a middlebox that does not understand it would. The bodies and their
+	// X-Pad pass through untouched.
+	stripCaps atomic.Bool
 
 	mu     sync.Mutex
 	bodies []recordedBody
@@ -44,8 +51,9 @@ func newBodyRecorder(t *testing.T, originURL *url.URL) *bodyRecorder {
 			return
 		}
 		r.Body.Close()
+		pad, _ := parsePollPad(r.Header.Get(PadHeader))
 		if len(sent) > 0 {
-			rec.record(recordedBody{method: r.Method, body: sent})
+			rec.record(recordedBody{method: r.Method, body: sent, pad: pad})
 		}
 
 		r.RequestURI = ""
@@ -68,11 +76,17 @@ func newBodyRecorder(t *testing.T, originURL *url.URL) *bodyRecorder {
 			return
 		}
 		if len(got) > 0 {
-			rec.record(recordedBody{status: resp.StatusCode, body: got, isReply: true})
+			respPad, _ := parsePollPad(resp.Header.Get(PadHeader))
+			rec.record(recordedBody{status: resp.StatusCode, body: got, pad: respPad, isReply: true})
 		}
 		for k, vv := range resp.Header {
-			if http.CanonicalHeaderKey(k) == "Content-Length" {
+			switch http.CanonicalHeaderKey(k) {
+			case "Content-Length":
 				continue
+			case http.CanonicalHeaderKey(CapsHeader):
+				if rec.stripCaps.Load() {
+					continue
+				}
 			}
 			for _, v := range vv {
 				w.Header().Add(k, v)
@@ -92,6 +106,26 @@ func (r *bodyRecorder) record(b recordedBody) {
 	r.mu.Unlock()
 }
 
+// mark returns a position in the recorded stream, so a test can ask what
+// happened after a particular moment rather than searching the whole run.
+func (r *bodyRecorder) mark() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.bodies)
+}
+
+// recordedSince returns everything recorded at or after a mark.
+func (r *bodyRecorder) recordedSince(mark int) []recordedBody {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if mark > len(r.bodies) {
+		mark = len(r.bodies)
+	}
+	out := make([]recordedBody, len(r.bodies)-mark)
+	copy(out, r.bodies[mark:])
+	return out
+}
+
 func (r *bodyRecorder) snapshot() (sent, replies []recordedBody) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -105,14 +139,20 @@ func (r *bodyRecorder) snapshot() (sent, replies []recordedBody) {
 	return sent, replies
 }
 
-// TestPollBodiesCarryPaddedFrames pins the fact that the long-poll transport
-// needs no padding of its own: the session conn frames every write before it
-// reaches the ring, so a poll body is a run of frames and the frame rule has
-// already shaped it. An earlier review called this transport unprotected
-// because the POST body "looks" like raw payload at the call site; this test is
-// what disproves that, and what would catch a future change that starts putting
-// unframed bytes in the ring.
-func TestPollBodiesCarryPaddedFrames(t *testing.T) {
+// TestPollBodiesArePaddedOnTheWire covers both halves of poll-body padding, as
+// an intermediary sees them.
+//
+// A poll body is a run of session frames, so the compatible shape — what a
+// mixed-version pair produces — is a run of frames the frame layer padded. That
+// is the only pad an old peer understands.
+//
+// Once the client has seen the server echo CapPadBody, padding moves out of the
+// frame and onto the body: the frames in the ring go out bare (six-byte headers,
+// so the send window carries payload instead of padding) and the body grows a
+// leading pad announced by X-Pad, whose total still lands inside the band. The
+// assertion that matters is that the two never stack — a body with an X-Pad must
+// contain only unpadded frames.
+func TestPollBodiesArePaddedOnTheWire(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -174,20 +214,31 @@ func TestPollBodiesCarryPaddedFrames(t *testing.T) {
 		t.Fatal("the proxy saw no response bodies")
 	}
 
-	// A frame is 6 header bytes plus pad plus payload, and the rule keeps
-	// pad+payload inside 400..600, so a padded frame totals 406..606.
+	// Each body has to be either a run of frames the frame rule already shaped,
+	// or a padded body whose frames are bare. Never both on the same object.
+	sawBodyPad := false
 	check := func(dir string, b recordedBody) {
 		t.Helper()
-		frames := splitInnerFrames(t, b.body)
-		if len(frames) == 0 {
-			t.Fatalf("%s: a %d-byte body holds no frame", dir, len(b.body))
-		}
-		for i, f := range frames {
-			if f.payload != len(payload) {
-				t.Fatalf("%s frame %d: payloadLen=%d, want %d — the body is not a run of data frames, so the frame rule is not covering it", dir, i, f.payload, len(payload))
+		body := b.body
+		if b.pad > 0 {
+			sawBodyPad = true
+			if b.pad > len(body) {
+				t.Fatalf("%s: declared pad %d exceeds the %d-byte body", dir, b.pad, len(body))
 			}
-			if f.total < 406 || f.total > 606 {
-				t.Fatalf("%s frame %d: total=%d (pad=%d), want 406..606", dir, i, f.total, f.pad)
+			if total := len(body); total < 400 || total > 600 {
+				t.Fatalf("%s: padded body is %d bytes, want 400..600", dir, total)
+			}
+			body = body[b.pad:]
+		}
+		for i, f := range splitInnerFrames(t, body) {
+			if f.payload != len(payload) {
+				t.Fatalf("%s frame %d: payloadLen=%d, want %d — the body is not a run of data frames", dir, i, f.payload, len(payload))
+			}
+			switch {
+			case b.pad > 0 && f.pad != 0:
+				t.Fatalf("%s frame %d: frame pad of %d sits on top of a padded body; the pad must be applied once", dir, i, f.pad)
+			case b.pad == 0 && (f.total < 400 || f.total > 600):
+				t.Fatalf("%s frame %d: total=%d (pad=%d), want 400..600 when the frame layer owns the pad", dir, i, f.total, f.pad)
 			}
 		}
 	}
@@ -196,5 +247,142 @@ func TestPollBodiesCarryPaddedFrames(t *testing.T) {
 	}
 	for _, b := range replies {
 		check("poll response", b)
+	}
+	if !sawBodyPad {
+		t.Fatal("no body carried X-Pad: the capability never took effect, so padding stayed in the frame layer and every body is a frame taller than the band")
+	}
+}
+
+// TestPollPaddingFollowsThePeerRatherThanLatching pins the lifetime of the
+// capability. Padding a request body is only safe while the peer that will read
+// it honours X-Pad, and a session outlives any one response: a fleet mid-upgrade
+// mixes builds, so an echo from one node says nothing about the next. Latching
+// on the first echo would keep prefixing bodies after the peer stopped
+// advertising, and those bytes land in the origin's reassembly as payload —
+// silent corruption, not a shape change.
+//
+// The proxy here drops the capability from responses while leaving the bodies
+// and their X-Pad alone. The client has to notice and go back to padding in the
+// frame, which every peer can read.
+func TestPollPaddingFollowsThePeerRatherThanLatching(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	snapshotPadding(t)
+	if err := SetPadding("400-600"); err != nil {
+		t.Fatal(err)
+	}
+
+	echoAddr, closeEcho := startTCPEchoServer(t)
+	defer closeEcho()
+
+	origin, err := ListenXHTTP(ctx, "127.0.0.1:0", "/stream", "pad-secret", "", "", "")
+	if err != nil {
+		t.Fatalf("start origin: %v", err)
+	}
+	defer origin.Close()
+	serveAcceptedTCPEcho(t, ctx, origin)
+
+	originURL, err := url.Parse("http://" + origin.Addr().String() + "/stream")
+	if err != nil {
+		t.Fatalf("parse origin URL: %v", err)
+	}
+	rec := newBodyRecorder(t, originURL)
+
+	serverURL, err := url.Parse(rec.server.URL + "/stream")
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	conn, err := DialXHTTP(ctx, serverURL, &DialConfig{
+		Password:   "pad-secret",
+		Path:       "/stream",
+		ALPN:       "h1",
+		StreamMode: "poll",
+	}, echoAddr, "tcp")
+	if err != nil {
+		t.Fatalf("dial through proxy: %v", err)
+	}
+	defer conn.Close()
+
+	payload := bytes.Repeat([]byte{0x33}, 20)
+	round := func(tag string) {
+		t.Helper()
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatalf("%s: write: %v", tag, err)
+		}
+		got, err := readFullBefore(conn, len(payload), 20*time.Second)
+		if err != nil {
+			t.Fatalf("%s: read: %v", tag, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("%s: payload corrupted", tag)
+		}
+	}
+
+	// Settle the negotiation: two rounds are enough for the client to have seen
+	// the echo and switched its bodies over.
+	for i := 0; i < 2; i++ {
+		round("negotiated")
+	}
+
+	rec.stripCaps.Store(true)
+	mark := rec.mark()
+	for i := 0; i < 4; i++ {
+		round("after the strip")
+	}
+
+	// The bodies already in flight when the capability disappeared were built
+	// before the answer arrived — some from frames written while the frame layer
+	// was still leaving the pad to the transport — so a couple of them are
+	// expected to carry the old shape. What must not happen is staying there:
+	// every body built after the client has seen an answer without the
+	// capability has to carry its pad in the frame again.
+	//
+	// The two shapes are measured differently on purpose: a padded body is the
+	// wire object, so the band applies to len(body); a bare body is a run of
+	// frames the frame layer padded, so the band applies to each frame.
+	const inFlight = 2
+	var requests, fromTransport, fromFrame int
+	for _, b := range rec.recordedSince(mark) {
+		if b.isReply {
+			continue
+		}
+		requests++
+		body := b.body
+		if b.pad > 0 {
+			body = body[b.pad:]
+			if total := len(b.body); total < 400 || total > 600 {
+				t.Fatalf("padded body is %d bytes, want 400..600", total)
+			}
+		}
+		frames := splitInnerFrames(t, body)
+		if len(frames) == 0 {
+			t.Fatalf("body %d holds no frame", requests)
+		}
+		framePadded := true
+		for _, f := range frames {
+			if f.pad == 0 {
+				framePadded = false
+			}
+		}
+		if framePadded {
+			fromFrame++
+			for _, f := range frames {
+				if f.total < 400 || f.total > 600 {
+					t.Fatalf("frame total %d, want 400..600 when the frame layer owns the pad", f.total)
+				}
+			}
+		} else {
+			fromTransport++
+		}
+	}
+	if requests < 4 {
+		t.Fatalf("only %d request bodies after the strip, need enough to see the decision change", requests)
+	}
+	if fromTransport > inFlight {
+		t.Fatalf("%d of %d bodies after the strip still carried the transport's shape: the client latched on the first echo instead of following the peer", fromTransport, requests)
+	}
+	if fromFrame < 2 {
+		t.Fatalf("only %d of %d bodies went back to frame-level padding after the capability disappeared", fromFrame, requests)
 	}
 }

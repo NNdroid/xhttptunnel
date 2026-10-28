@@ -645,6 +645,12 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		var windowMu sync.Mutex
 		var triggerRetry int32
 		var emptyPollers int32
+		// peerPadsBody records that the server answered this session with the
+		// pad-body capability, which says it will drop a leading X-Pad before
+		// reading a request body. Until then every request goes out unpadded:
+		// an X-Pad a peer does not honour is padding fed straight into its
+		// receive ring as payload.
+		var peerPadsBody atomic.Bool
 
 		restartCount := 0
 
@@ -730,11 +736,26 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 
 					var method string
 					var bodyReader io.Reader
+					bodyLen := 0
+					upPad := 0
 					if len(upData) > 0 {
 						method = http.MethodPost
-						// The transport owns upData until it closes the
-						// body — see pooledBody. Never recycle it by hand.
-						bodyReader = newPooledBody(upData, upBufPtr)
+						body := upData
+						if peerPadsBody.Load() {
+							padded, pad, padErr := padPollBody(upData)
+							if padErr != nil {
+								// Padding is best-effort: a broken entropy source
+								// must not take the tunnel down with it.
+								logger.Warn("⚠️ [Pump] could not draw poll padding, sending this body bare", zap.Error(padErr))
+							} else {
+								body, upPad = padded, pad
+							}
+						}
+						bodyLen = len(body)
+						// The transport owns the body until it closes the
+						// body — see pooledBody. Never recycle the send
+						// buffer by hand; a padded copy is collected with it.
+						bodyReader = newPooledBody(body, upBufPtr)
 					} else {
 						method = http.MethodGet
 						bodyReader = http.NoBody
@@ -762,8 +783,8 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 
 					req, _ := http.NewRequestWithContext(reqCtx, method, reqURL, bodyReader)
 
-					if len(upData) > 0 {
-						req.ContentLength = int64(len(upData))
+					if bodyLen > 0 {
+						req.ContentLength = int64(bodyLen)
 					} else {
 						q := req.URL.Query()
 						q.Set("t", strconv.FormatInt(time.Now().UnixNano(), 36))
@@ -810,6 +831,13 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 
 					req.Header.Set("X-Seq", strconv.FormatUint(currentSeq, 10))
 					req.Header.Set("X-Ack", strconv.FormatUint(myAck, 10))
+					// Advertise that this side reads a padded poll body. The
+					// server echoes it once it agrees; only then does this side
+					// start prefixing its own bodies (peerPadsBody).
+					req.Header.Set(CapsHeader, CapPadBody)
+					if upPad > 0 {
+						req.Header.Set(PadHeader, strconv.Itoa(upPad))
+					}
 					if len(upData) > 0 {
 						req.Header.Set("Content-Type", "application/octet-stream")
 					}
@@ -1032,6 +1060,39 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					}
 					sSeq, _ := strconv.ParseUint(sSeqStr, 10, 64)
 
+					// The server answers in kind. Echoing the capability means
+					// it drops a leading pad from a request body, so this side
+					// may now prefix its own bodies and the frame layer can
+					// stop padding: the body's pad shapes the wire object, and
+					// two pads on one object would overshoot the band.
+					//
+					// Stored per response rather than latched on the first
+					// echo: a session can outlive the node that answered it,
+					// and a fleet mid-upgrade mixes builds. A peer that stops
+					// advertising the capability goes back to frame-level
+					// padding, which every peer can read — the alternative is
+					// prefixing bodies with a pad that peer feeds to its
+					// reassembly as payload.
+					echoed := hasCapValue(resp.Header.Get(CapsHeader), CapPadBody)
+					if was := peerPadsBody.Swap(echoed); echoed && !was {
+						logger.Debug("🧩 [Pump] server reads a padded poll body; frame-level padding handed to the transport", zap.String("session", sessionID))
+					} else if !echoed && was {
+						logger.Debug("🧩 [Pump] server stopped advertising a padded poll body; padding back in the frame layer", zap.String("session", sessionID))
+					}
+					virtualConn.padInTransport.Store(echoed)
+					downPad, padErr := parsePollPad(resp.Header.Get(PadHeader))
+					if padErr != nil {
+						io.Copy(io.Discard, resp.Body)
+						resp.Body.Close()
+						if handle != nil {
+							handle.cancel()
+						}
+						virtualConn.setCloseErr(padErr)
+						virtualConn.Close()
+						pumpCancel()
+						return
+					}
+
 					// A CDN/WAF that ignores Accept-Encoding: identity and
 					// no-transform will gzip/brotli the octet-stream body anyway.
 					// The sequence numbers still advance, so the tunnel looks alive
@@ -1043,6 +1104,27 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							zap.String("session", sessionID),
 							zap.String("content_encoding", ce),
 						)
+					}
+
+					// The body's leading pad is not payload and must not reach
+					// the reassembly stream: it is dropped before the first
+					// frame byte, and the sequence starts at sSeq as before.
+					if downPad > 0 {
+						if err := skipPollPad(resp.Body, downPad); err != nil {
+							resp.Body.Close()
+							if handle != nil {
+								handle.cancel()
+							}
+							logger.Warn("⚠️ [Pump] could not skip the response's declared padding, triggering a safe retransmit", zap.Error(err))
+							windowMu.Lock()
+							dispatchSeq = ackedByServer.Load()
+							windowMu.Unlock()
+							atomic.StoreInt32(&triggerRetry, 1)
+							if !sleepCtx(pumpCtx, 300*time.Millisecond) {
+								break
+							}
+							continue
+						}
 					}
 
 					bufPtr := sendBuf.Get().(*[]byte)
@@ -1371,7 +1453,7 @@ type ClientConfig struct {
 	// Zero uses the package default configured by SetChunkSizeKB.
 	ChunkSizeKB int
 	// Padding sets the frame padding rule for traffic this process emits, in
-	// the syntax documented on SetPadding ("400-600", "1:120-200,400:400-600",
+	// the syntax documented on SetPadding ("400-600", "23:120-200,400:400-600",
 	// "off"). Empty leaves the process policy alone, and restating the rule in
 	// force is a no-op. Padding is process-wide egress policy rather than a
 	// per-client setting: a rule that differs from one already in force — set

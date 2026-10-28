@@ -179,16 +179,32 @@ func (c *XHTTPConn) Err() error {
 	return nil
 }
 
+// frameHeaderSize is the inner frame's header: payload length and pad length.
+const frameHeaderSize = 6
+
+// transportPads reports whether the wire form this conn feeds already pads, in
+// which case the frame layer must leave the pad field at zero.
+//
+// A conn built from raw pipes in a test has no session and always pads at the
+// frame layer, which is the pre-negotiation behaviour the unit tests describe.
+func (c *XHTTPConn) transportPads() bool {
+	return c.vc != nil && c.vc.padInTransport.Load()
+}
+
 // WriteCloseFrame sends the end-of-session marker. It is padded by the same
-// rule as data frames: the marker is identified by its length field, not by its
-// size, and an unpadded six-byte write is the only object of that size on the
-// wire — an exact fingerprint of "a tunnel just closed". Readers drain the pad
-// before acting on the marker, so older peers accept it unchanged.
+// rule as data frames wherever the frame layer still owns the pad: the marker
+// is identified by its length field, not by its size, and an unpadded six-byte
+// write is the only object of that size on the wire — an exact fingerprint of
+// "a tunnel just closed". Readers drain the pad before acting on the marker, so
+// older peers accept it unchanged.
 func (c *XHTTPConn) WriteCloseFrame() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	pad := padLenFor(0)
+	pad := 0
+	if !c.transportPads() {
+		pad = padLenFor(frameHeaderSize)
+	}
 	frameLen := 6 + pad
 	if frameLen > cap(c.frameBuf) {
 		c.frameBuf = make([]byte, frameLen)
@@ -208,7 +224,13 @@ func (c *XHTTPConn) WriteCloseFrame() error {
 
 func (c *XHTTPConn) writeSingleFrame(chunk []byte) error {
 	chunkSize := len(chunk)
-	padLenInt := padLenFor(chunkSize)
+	padLenInt := 0
+	if !c.transportPads() {
+		// The band measures the frame as it lands on the wire, header included:
+		// counting the payload alone would put every frame six bytes above the
+		// band's top and make the unpadded range start six bytes early.
+		padLenInt = padLenFor(frameHeaderSize + chunkSize)
+	}
 
 	frameLen := 6 + padLenInt + chunkSize
 	if frameLen > cap(c.frameBuf) {
@@ -245,15 +267,19 @@ func (c *XHTTPConn) writeSingleFrame(chunk []byte) error {
 }
 
 // streamFrameBytes renders one chunk of the stream-mode wire format into a
-// single buffer: a 16-byte metadata block (sender's stream sequence, ack of
-// the peer's stream) followed by the standard 6-byte padded frame. One buffer
-// means one Write per chunk on the wire.
+// single buffer: a 22-byte metadata block (sender's stream sequence, ack of the
+// peer's stream, payload length, pad length) followed by the pad and the
+// payload. One buffer means one Write per chunk on the wire.
 func streamFrameBytes(seq, ack uint64, payload []byte) ([]byte, error) {
 	return streamFrameBytesInto(nil, seq, ack, payload)
 }
 
+// streamEnvelopeHeader is the metadata block in front of the payload: stream
+// seq, ack of the peer's stream, payload length and pad length.
+const streamEnvelopeHeader = 22
+
 func streamFrameStorage(scratch []byte, seq, ack uint64, length, pad int) []byte {
-	total := 22 + pad + length
+	total := streamEnvelopeHeader + pad + length
 	if cap(scratch) < total {
 		scratch = make([]byte, total)
 	}
@@ -265,15 +291,21 @@ func streamFrameStorage(scratch []byte, seq, ack uint64, length, pad int) []byte
 	return buf
 }
 
+// streamFrameBytesInto renders one stream-mode chunk. The rule is applied to
+// the whole wire object — header included — so a chunk that is small only
+// because it carries a short payload still lands inside the band. Counting the
+// payload alone would leave every streamed frame 22 bytes over the top of the
+// band, which is a size distribution of its own and a giveaway that the
+// session is streaming rather than polling.
 func streamFrameBytesInto(scratch []byte, seq, ack uint64, payload []byte) ([]byte, error) {
-	padLenInt := padLenFor(len(payload))
+	padLenInt := padLenFor(streamEnvelopeHeader + len(payload))
 	buf := streamFrameStorage(scratch, seq, ack, len(payload), padLenInt)
 	if padLenInt > 0 {
-		if _, err := rand.Read(buf[22 : 22+padLenInt]); err != nil {
+		if _, err := rand.Read(buf[streamEnvelopeHeader : streamEnvelopeHeader+padLenInt]); err != nil {
 			return nil, err
 		}
 	}
-	copy(buf[22+padLenInt:], payload)
+	copy(buf[streamEnvelopeHeader+padLenInt:], payload)
 	return buf, nil
 }
 
@@ -303,7 +335,7 @@ func readStreamFrame(r io.Reader) (streamFrame, error) {
 // The payload is borrowed until the next call. PutReadData copies accepted
 // data into its bounded reassembly storage before that call occurs.
 func readStreamFrameInto(r io.Reader, scratch *[]byte) (streamFrame, error) {
-	var meta [22]byte
+	var meta [streamEnvelopeHeader]byte
 	if _, err := io.ReadFull(r, meta[:]); err != nil {
 		return streamFrame{}, err
 	}

@@ -9,19 +9,29 @@ import (
 	"sync/atomic"
 )
 
-// Padding shapes the frames this process puts on the wire.
+// Padding shapes every object this process puts on the wire, and each object
+// carries exactly one pad.
 //
-// Each side pads only what it sends, and every frame header carries its own pad
-// length, so the two ends never have to agree on a rule: a mismatch changes the
-// traffic shape, never the bytes an application receives. Padding is therefore
-// local egress policy — one setting per process, not per session.
+// The session frames a write before it reaches the ring, so both transports
+// hand out the same bytes: the streaming envelope wraps a run of them and the
+// long-poll body ships a run verbatim. Two layers could therefore pad, and
+// padding at both would stack — an envelope header on top of an already padded
+// frame overshoots the band by the header's width. So exactly one of them does:
 //
-// Coverage follows the frame, not the transport. A tunnelled TCP/UDP session,
-// the streaming envelope and the close marker are all framed, and the
-// long-poll transport carries those same frames as its bodies: the session
-// conn frames every write before it reaches the ring, so a poll POST or a poll
-// response is a run of padded frames rather than raw payload. Nothing bypasses
-// the frame layer, so nothing bypasses this rule.
+//   - until the peer confirms it reads the transport-level pad, the frame layer
+//     pads. A frame's own pad field is understood by every peer, so this is the
+//     compatible default: nothing has to be negotiated to get it.
+//   - once both ends advertise CapPadBody, padding moves out to the transport —
+//     the envelope's own pad field, or a poll body's leading X-Pad bytes — and
+//     the frame layer leaves its pad field at zero.
+//
+// Either way the rule measures the object as it lands on the wire, headers
+// included, so a 20-byte keystroke leaves a 400..600-byte object rather than a
+// payload plus whatever header happened to precede it.
+//
+// Padding is local egress policy: one setting per process, not per session, and
+// the two ends never have to agree on a rule. A mismatch changes the traffic
+// shape, never the bytes an application receives.
 //
 // It is installed either imperatively with SetPadding or declaratively through
 // ClientConfig.Padding / ServerConfig.Padding. The two routes reach the same
@@ -38,24 +48,31 @@ import (
 //
 //	off | none             emit no padding at all
 //	auto | default | ""    the built-in policy (400-600)
-//	MIN-MAX                payloads shorter than MIN are padded so that
-//	                       payload+pad lands uniformly in [MIN,MAX]; longer
-//	                       payloads go out as they are
+//	MIN-MAX                objects that would reach the wire shorter than MIN
+//	                       are padded so their total lands uniformly in
+//	                       [MIN,MAX]; anything already that long goes out bare
 //	BELOW:MIN-MAX          the same, with an explicit threshold
 //	RULE,RULE,...          several bands; the first matching one wins
 //
-// So "400-600" reads: anything under 400 bytes is padded up into 400..600, and
-// anything at or above 400 is sent unpadded. Because the unpadded range starts
-// at the band's own lower bound, the two halves overlap exactly: a 20-byte
-// keystroke and a 480-byte record both leave a 480-byte frame.
+// So "400-600" reads: anything that would be shorter than 400 bytes on the wire
+// is padded up into 400..600, and anything at or above 400 is sent unpadded.
+// Because the unpadded range starts at the band's own lower bound, the two
+// halves overlap exactly: a 20-byte keystroke and a 480-byte record both leave a
+// 480-byte object.
 //
 // A band may set its threshold below its own lower bound, which is how the
 // control channel is kept inside the same size distribution instead of being
-// the only frames on the wire shorter than the band:
+// the only objects on the wire shorter than the band:
 //
-//	1:120-200,400:400-600   empty (keepalive/ack-only) frames carry 120..200
-//	                        bytes of padding, everything else under 400 is
+//	23:120-200,400:400-600  empty (keepalive/ack-only) objects are 120..200
+//	                        bytes on the wire, everything else under 400 is
 //	                        padded into 400..600
+//
+// A threshold is a wire size, so it has to clear the header of the object it is
+// meant to catch — 23 is the streaming envelope's 22 bytes plus a byte of
+// payload, and the inner frame's 6-byte header means the same band starts at 7
+// there. A threshold at or below the header size is accepted but unreachable:
+// it can never match, because no object that small can exist.
 //
 // Bands must be listed in increasing threshold order. For a band to be
 // satisfiable its lower bound must be at least BELOW-1, otherwise the largest
@@ -79,8 +96,9 @@ const (
 	maxPaddingBands = 8
 )
 
-// paddingBand pads payloads shorter than below so that payload+pad lands
-// uniformly in [min,max].
+// paddingBand pads objects shorter than below so that the object plus its pad
+// lands uniformly in [min,max]. Both bounds are wire sizes, so a band's own
+// thresholds are compared against a frame or envelope as it will be sent.
 type paddingBand struct {
 	below    int
 	min, max int
@@ -181,10 +199,12 @@ func installDeclaredPadding(component, spec string) error {
 	return nil
 }
 
-// padLenFor returns how many padding bytes to append after a chunk of the given
-// size. Zero means send it bare.
-func padLenFor(chunkSize int) int {
-	return activePadding.Load().padLen(chunkSize)
+// padLenFor returns how many padding bytes an object of the given wire size
+// still needs. Callers pass the size the object reaches without padding —
+// headers included — so the band is measured against the bytes a observer
+// actually sees. Zero means send it bare.
+func padLenFor(wireSize int) int {
+	return activePadding.Load().padLen(wireSize)
 }
 
 func (p *paddingPolicy) padLen(n int) int {

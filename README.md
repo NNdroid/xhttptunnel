@@ -286,7 +286,7 @@ journalctl -u xhttptunnel -f   # View live logs
 | `max_sessions_per_ip` | `int` | `0` | Server: cap concurrent sessions from one client address; `0` (engine default) = unlimited. The installer and sample configs ship 50. Bounds one PSK holder's blast radius against the shared registry. Counts the TCP peer address unless `trust_proxy_headers` is on. |
 | `max_conns` | `int` | `2000` | Client max concurrent local connections / sessions. `0` selects the engine default of 2000; the installer and the sample configs ship 512. |
 | `chunk_size_kb` | `int` | `256` | Upstream payload per poll request (clamped 16–900). Must match on both ends. |
-| `padding` | `string` | `"400-600"` | Frame padding rule for outgoing traffic. `MIN-MAX` pads payloads shorter than `MIN` up into `[MIN,MAX]` and sends longer ones bare; `BELOW:MIN-MAX` sets the threshold explicitly; a comma-separated list is an ordered band list; `off` disables padding. Local egress policy: the peer strips whatever pad arrives, so the ends need not match. Invalid rules fail startup. See [Frame padding](#frame-padding). |
+| `padding` | `string` | `"400-600"` | Padding rule for outgoing traffic. `MIN-MAX` pads objects that would reach the wire shorter than `MIN` up into `[MIN,MAX]` and sends longer ones bare; `BELOW:MIN-MAX` sets the threshold explicitly; a comma-separated list is an ordered band list; `off` disables padding. Local egress policy: the peer strips whatever pad arrives, so the ends need not match, and a peer that understands `pad-body` lets the pad move from the frame to the transport so the wire object lands inside the band. Invalid rules fail startup. See [Frame padding](#frame-padding). |
 | `idle_timeout` | `int` | `900` | Client: drop a local connection after this many seconds of silence. |
 | `allowed_targets` | `[]string` | `[]` | Server: restrict client-requested targets. Each entry is `host:port`, `:port`, `host:`, `[host]` or `*` — an unbracketed IPv6 literal is rejected because its colons are ambiguous, so write `[::1]:22` or `[::1]` — optionally prefixed `tcp://` / `udp://` to admit only that protocol (`udp://:53` = UDP DNS on any host; `tcp://192.168.1.10:` = TCP on any port of that host; a scheme-less `127.0.0.1:` admits either; the prefix is a protocol gate only and is never part of the address that gets dialed). An entry that cannot be parsed matches nothing rather than widening the policy. Enforcement runs at session creation, so a custom `Handler` sees only allowlisted targets too. Empty = allow all. |
 | `trust_proxy_headers` | `bool` | `false` | Server: honour `CF-Connecting-IP`/`X-Forwarded-For`/`X-Real-IP` for client-address logging. Enable only behind a trusted proxy that strips them. |
@@ -543,18 +543,43 @@ safely rebased. The application can then open a fresh tunnel.
 
 ### Frame padding
 
-Every frame header carries its own pad length, so padding is a local egress
-decision: each side pads what it sends and the receiver drops the pad before
-handing bytes to the application. The ends never negotiate it — a mismatch
-changes the traffic shape, never the payload.
+Padding shapes every object this process puts on the wire, and each object
+carries exactly one pad. The rule measures the object as it lands — headers
+included — so a 20-byte keystroke leaves a 400..600-byte object rather than a
+payload plus whatever header happened to precede it.
 
-The default `400-600` reads: a payload shorter than 400 bytes is padded so that
-payload+pad lands uniformly at random in 400..600, and a payload of 400 bytes or
-more is sent as it is. Because the bare range starts exactly where the band does,
-both halves occupy the same window on the wire — a keystroke and a 500-byte
-record leave the same size, which is the point. The previous built-in shape
-(small payloads into 600..1200, bulk always plus 16..127) did not have that
-property, and it left the control frames a disjoint 38..165-byte cluster.
+The default `400-600` reads: an object that would reach the wire shorter than
+400 bytes is padded so its total lands uniformly at random in 400..600, and
+anything already that long is sent as it is. Because the bare range starts
+exactly where the band does, both halves occupy the same window on the wire — a
+keystroke and a 500-byte record leave the same size, which is the point. The
+previous built-in shape (small payloads into 600..1200, bulk always plus
+16..127) did not have that property, and it left the control frames a disjoint
+38..165-byte cluster.
+
+#### Where the pad goes
+
+The session frames a write before it reaches the ring, so both transports hand
+out the same bytes: the streaming envelope wraps a run of them, and the long-poll
+body ships a run verbatim. Two layers could pad, and padding at both would stack
+— an envelope header on top of an already padded frame overshoots the band by
+the header's width. So exactly one of them does:
+
+- **Unnegotiated, with any peer.** The frame layer pads. A frame's own pad field
+  lives in the 6-byte header every peer already parses, so this needs no
+  handshake and a mixed-version pair gets the full benefit in both directions.
+  The cost is that a streamed object is one 22-byte envelope header taller than
+  the band: the inner pad has already lifted the chunk past the threshold, so
+  the envelope adds its header and no pad.
+- **Negotiated.** Both ends advertise `pad-body` in `X-HTTP-Tunnel-Caps`.
+  Padding moves out to the transport — the streaming envelope's own pad field,
+  or a poll body's leading `X-Pad` bytes — and the frame layer leaves its pad
+  field at zero. The wire object then lands inside the band: 400..600 on both
+  transports, with no header to account for because the pad now counts it. The
+  send window benefits too, since the ring carries bare frames.
+
+Either way the ends may use different rules: a mismatch changes the traffic
+shape, never the payload.
 
 The rule is a short ordered band list; the first matching band wins:
 
@@ -562,16 +587,24 @@ The rule is a short ordered band list; the first matching band wins:
 | :--- | :--- |
 | `off` / `none` | No padding at all. |
 | `auto` / `default` / empty | The built-in `400-600`. |
-| `MIN-MAX` | Threshold is `MIN`: payloads below it land in `[MIN,MAX]`, longer ones are sent bare. |
+| `MIN-MAX` | Threshold is `MIN`, a wire size: objects that would reach the wire below it land in `[MIN,MAX]`, longer ones are sent bare. |
 | `BELOW:MIN-MAX` | The same with an explicit threshold, e.g. `512:600-1199` for the old shape. |
 | `A,B,...` | Several bands, matched in increasing threshold order. |
 
-`1:120-200,400:400-600`, for instance, keeps empty keepalive and ack-only frames
-at 120..200 bytes and everything else under 400 in the main band, so the control
-channel is not the only traffic on the wire shorter than the band. Thresholds
-must increase, and a band's lower bound must be at least `threshold-1`
-(otherwise its longest payload already exceeds its own target and the pad would
-be negative); a spec that breaks either rule fails startup naming the band.
+`23:120-200,400:400-600`, for instance, keeps empty keepalive and ack-only
+objects at 120..200 bytes and everything else under 400 in the main band, so the
+control channel is not the only traffic on the wire shorter than the band.
+
+Thresholds are wire sizes, so they have to clear the header of the object they
+are meant to catch. 23 is the 22-byte streaming envelope plus a byte of payload;
+the inner frame carries a 6-byte header, so the same control band starts at `7`
+there. A threshold at or below the header size matches only objects that cannot
+exist — `1:120-200` pads nothing, because the smallest frame is already 6 bytes
+— and a spec is rejected only when the numbers contradict each other, not when a
+band is simply unreachable. Thresholds must increase, and a band's lower bound
+must be at least `threshold-1` (otherwise its longest object already exceeds its
+own target and the pad would be negative); a spec that breaks either rule fails
+startup naming the band.
 
 Things worth knowing before changing it:
 
@@ -579,31 +612,36 @@ Things worth knowing before changing it:
   only object of that size on the wire, and therefore an exact signature for "a
   tunnel just closed". It is identified by its length field, so padding it is
   invisible to the reader and to older peers.
-- **Pad is charged to the window, not only to the wire.** The session conn
-  frames every write before it reaches the ring, so the ring carries frames and
-  not payload: a 20-byte write occupies 406..606 bytes of send window, and the
-  peer's reassembly holds that frame until `XHTTPConn.Read` strips the pad.
-  Long-poll bodies are those frames verbatim. Worth remembering when a rule uses
-  a large band and `window_size_mb` is sized for payload rather than frames.
-- **The streaming transport wraps those frames in a second, padded frame.** The
-  22-byte envelope carries its own pad, computed over the bytes it takes from
-  the ring. For a lone small write the inner pad has already lifted the chunk
-  past the band's threshold, so the envelope adds its header and no pad and the
-  wire lands at 428..628 rather than 406..606. That inner pad is not redundant:
-  it is what keeps a session's shape intact if it falls back to long polling.
-- **Padding stops at `MIN`.** Bulk transfer keeps exact frame sizes. Covering
-  those would cost a 20× overhead per record for a size an observer can already
+- **Where the pad is charged depends on the negotiation.** Unnegotiated, the
+  session conn frames every write before it reaches the ring, so the ring carries
+  frames: a 20-byte write occupies 400..600 bytes of send window and the peer's
+  reassembly holds that frame until `XHTTPConn.Read` strips the pad. Negotiated,
+  the ring carries bare 26-byte frames and the pad exists only in the envelope or
+  the poll body, so the window is sized for payload. Watch `window_size_mb` when
+  a rule uses a large band and the peer may be an older one.
+- **Padding stops at `MIN`.** Bulk transfer keeps exact sizes. Covering those
+  would cost a 20× overhead per record for a size an observer can already
   estimate from the tunnel's throughput.
-- **Bands are capped at 65535 bytes**, the width of the two-byte pad field in
-  the frame header. A larger band would be truncated on the wire and the reader
-  would then strip the wrong number of bytes, handing the application padding as
-  if it were payload — a silent corruption, not a shape change.
-- **The long-poll transport is covered by the same rule.** A poll body is not
-  raw payload: the session conn frames every write before it reaches the ring,
-  so a POST body and a poll response are runs of padded frames and their
-  `Content-Length` lands in the band like any other frame. One frame per
-  `Write` is what makes that hold — which is why `WriteUDPFrame` joins its
-  length prefix to the payload instead of issuing two writes.
+- **Bands are capped at 65535 bytes**, the width of the pad field. A larger band
+  would be truncated on the wire and the reader would then strip the wrong number
+  of bytes, handing the application padding as if it were payload — a silent
+  corruption, not a shape change.
+- **The long-poll transport is covered either way.** Unnegotiated, a poll body is
+  a run of padded frames and its `Content-Length` lands in the band like any
+  other frame — which is why `WriteUDPFrame` joins its length prefix to the
+  payload instead of issuing two writes, since one frame per `Write` is what
+  makes that hold. Negotiated, the frames go out bare and the body carries
+  `X-Pad` bytes in front; `Content-Length` is the pad plus the frames, so the
+  band still describes the object an observer sees. Both directions of the pad
+  ride on the one capability: the client pads a request body once it has seen the
+  server echo the capability, and the server pads a response once the request has
+  advertised it. The client re-reads the echo on every response rather than
+  latching on the first one, because a session outlives any single node and a
+  fleet mid-upgrade mixes builds — a body padded for a node that does not read
+  `X-Pad` would have its padding delivered as payload. Losing the echo puts the
+  pad back in the frame, which every peer can read. A cleared `X-Pad` on a body
+  that carries padding is a protocol violation the reader refuses rather than a
+  silently misaligned stream.
 
 `gen-config` exposes it as `-padding`. Embedders have two ways in, both landing
 on the same process-wide policy:

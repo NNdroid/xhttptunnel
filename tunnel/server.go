@@ -513,6 +513,16 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			return
 		}
 
+		// The pad-body capability belongs to the session, not to one request:
+		// whichever request announces it first settles where padding lives for
+		// both transports. See meekVirtualConn.padInTransport.
+		//
+		// Stored unconditionally rather than only when present: a session can
+		// outlive a reconnect, and a peer that stops advertising the capability
+		// has to put the frame layer back in charge — otherwise a downgraded
+		// client would receive frames nobody pads.
+		vConn.padInTransport.Store(hasCapValue(r.Header.Get(CapsHeader), CapPadBody))
+
 		// Stream-mode downlink: one persistent GET whose response body is a
 		// continuous frame stream (SSE-style — the one full-duplex-ish shape
 		// old proxies tolerate). Must run before the poll path below.
@@ -570,12 +580,34 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		}
 		vConn.noteDownPeerAck(cAck)
 
+		// A client that advertises pad-body reads a leading X-Pad, which is
+		// what lets this side skip the padding on its request and put padding
+		// on its response. Both directions ride on the one capability:
+		// padding a body for a peer that does not know the header would land
+		// in its receive ring as payload.
+		clientPadsBody := hasCapValue(r.Header.Get(CapsHeader), CapPadBody)
+		upPad, err := parsePollPad(r.Header.Get(PadHeader))
+		if err != nil {
+			logger.Warn("❌ [HTTP] rejected request: unreadable padding header", zap.Error(err))
+			nginxError(w, http.StatusBadRequest)
+			return
+		}
+
 		bufPtr := sendBuf.Get().(*[]byte)
 		readChunk := *bufPtr
 		var totalUpBytes int
 		var errBody error
 		currentSeq := cSeq
 		var myUpAck uint64
+
+		// The declared padding is not uplink data: drop it before the first
+		// frame byte so the sequence arithmetic sees only frames.
+		if skipErr := skipPollPad(r.Body, upPad); skipErr != nil {
+			safelyPutSendBuf(bufPtr)
+			logger.Warn("⚠️ [HTTP] could not skip the request's declared padding", zap.Error(skipErr))
+			nginxError(w, http.StatusBadRequest)
+			return
+		}
 
 		for {
 			n, err := r.Body.Read(readChunk)
@@ -699,11 +731,34 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		w.Header().Set("Expires", "0")
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, Content-Length")
+		// X-Pad has to be readable by whatever consumes this response: a
+		// browser-shaped client that cannot see it would read the leading pad
+		// as frames. The capability header matters for the same reason — it is
+		// how the client learns the pad is there at all.
+		w.Header().Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Pad, X-HTTP-Tunnel-Caps, Content-Length")
+
+		// Pad the response for a client that announced pad-body. The pad goes
+		// in front so the client can skip it with a bounded read and stream
+		// the rest into its ring; an empty body is padded too, otherwise "no
+		// downlink data yet" would be the one response size an observer can
+		// pick out of the distribution.
+		respPad := 0
+		if clientPadsBody {
+			padded, pad, padErr := padPollBody(downData)
+			if padErr != nil {
+				logger.Warn("⚠️ [HTTP] could not draw response padding, sending this body bare", zap.Error(padErr))
+			} else {
+				downData, respPad = padded, pad
+			}
+		}
 
 		w.Header().Set("X-Ack", strconv.FormatUint(myUpAck, 10))
 		w.Header().Set("X-Seq", strconv.FormatUint(myDownSeq, 10))
 		w.Header().Set("Content-Length", strconv.Itoa(len(downData)))
+		w.Header().Set(CapsHeader, CapPadBody)
+		if respPad > 0 {
+			w.Header().Set(PadHeader, strconv.Itoa(respPad))
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Server", "nginx")
 		w.WriteHeader(http.StatusOK)
@@ -1046,7 +1101,7 @@ type ServerConfig struct {
 	// send no header.
 	MinProtoVersion int
 	// Padding sets the frame padding rule for traffic this process emits, in
-	// the syntax documented on SetPadding ("400-600", "1:120-200,400:400-600",
+	// the syntax documented on SetPadding ("400-600", "23:120-200,400:400-600",
 	// "off"). Empty leaves the process policy alone, and restating the rule in
 	// force is a no-op. Padding is process-wide egress policy rather than a
 	// per-server setting: a rule that differs from one already in force — set

@@ -625,6 +625,19 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return false, fmt.Errorf("%w (the origin did not accept the streaming downlink)", errStreamUnavailable)
 	}
+	// The origin reads the transport-level pad, so padding can move out of the
+	// frame and into the envelope. Left in the frame it would fill the chunk
+	// past the band's threshold and the envelope would add its 22 bytes on top,
+	// putting every streamed frame above the band instead of inside it.
+	//
+	// Latched here, unlike the poll path which re-reads the echo per response:
+	// a streamed frame is read through the envelope, and every origin parses an
+	// envelope pad, so reconnecting to a node that does not advertise the
+	// capability costs shape but can never misalign a body. A poll body has no
+	// envelope, which is why its gate has to follow the peer.
+	if hasCapValue(resp.Header.Get(CapsHeader), CapPadBody) {
+		virtualConn.padInTransport.Store(true)
+	}
 	if resp.Header.Get("X-Stream-Uplink-Sync") != "1" {
 		// Older origins can send a downlink hello before the companion POST is
 		// admitted, making Dial report success for a one-way connection. Fall
@@ -986,5 +999,10 @@ func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, n
 	req.Header.Set("X-Network", network)
 	req.Header.Set("X-Session-ID", sessionID)
 	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
+	// Announces that this side reads the transport-level pad, which is what
+	// lets the frame layer stop padding: a streamed frame then carries one pad
+	// (the envelope's) instead of an envelope header on top of an already
+	// padded frame. An origin that ignores the header keeps the old shape.
+	req.Header.Set(CapsHeader, CapPadBody)
 	return nil
 }
