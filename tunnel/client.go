@@ -744,7 +744,8 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					// abort: the server parks them for the full longPollTimeout
 					// when no downlink exists, and they carry no body, so
 					// aborting one at close time is lossless. POSTs stay on
-					// pumpCtx — the close frame may ride the last one.
+					// pumpCtx: their body carries uplink bytes the server may
+					// already have consumed, so it has to be allowed to finish.
 					reqCtx := pumpCtx
 					var handle *pollHandle
 					if len(upData) == 0 {

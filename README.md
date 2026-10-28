@@ -579,10 +579,11 @@ Things worth knowing before changing it:
   only object of that size on the wire, and therefore an exact signature for "a
   tunnel just closed". It is identified by its length field, so padding it is
   invisible to the reader and to older peers.
-- **Pad rides inside the reliable frame.** A 20-byte write consumes `MIN` bytes
-  of send window and receive reassembly, not 20. At the default that is 400..600
-  bytes per interactive write — roughly half the cost of the old shape, but still
-  a multiple of the payload.
+- **Pad costs wire bytes, not window.** Padding is applied when a chunk is
+  rendered into a frame, after the reliable ring has already accounted for the
+  payload, and the receiver drops it before reassembly. A 20-byte write
+  therefore draws 20 bytes of send window and receive reassembly while leaving
+  400..600 bytes on the wire — the pad is bandwidth, not buffering.
 - **Padding stops at `MIN`.** Bulk transfer keeps exact frame sizes. Covering
   those would cost a 20× overhead per record for a size an observer can already
   estimate from the tunnel's throughput.
@@ -590,8 +591,14 @@ Things worth knowing before changing it:
   the frame header. A larger band would be truncated on the wire and the reader
   would then strip the wrong number of bytes, handing the application padding as
   if it were payload — a silent corruption, not a shape change.
-- The rule applies to every frame this process emits, both the inner payload
-  frame and the streaming envelope, so one setting covers both transports.
+- **Coverage stops at the framed transports.** The rule applies to every frame
+  this process writes: the inner frame of a tunnelled TCP/UDP session (one frame
+  per `Write`, which is why `WriteUDPFrame` joins its length prefix to the
+  payload instead of issuing two writes), the streaming envelope, and the close
+  marker. The legacy long-poll transport has no frames at all — its request and
+  response bodies carry raw payload behind a bare `Content-Length` — so
+  `stream_mode: "poll"`, and any downgrade onto a path that buffers the stream,
+  leaves exact sizes on the wire.
 
 `gen-config` exposes it as `-padding`. Embedders have two ways in, both landing
 on the same process-wide policy:
