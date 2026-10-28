@@ -508,3 +508,84 @@ func runPaddedSession(t *testing.T, spec string, sizes []int) {
 		}
 	}
 }
+
+// innerFrame is one 6-byte-header frame as it appears on the wire.
+type innerFrame struct {
+	payload int
+	pad     int
+	total   int
+}
+
+// splitInnerFrames walks a byte stream the way an XHTTPConn reader would,
+// returning one entry per frame it finds.
+func splitInnerFrames(t *testing.T, wire []byte) []innerFrame {
+	t.Helper()
+	var frames []innerFrame
+	for off := 0; off < len(wire); {
+		if off+6 > len(wire) {
+			t.Fatalf("truncated frame header at offset %d of %d", off, len(wire))
+		}
+		payload := int(binary.BigEndian.Uint32(wire[off : off+4]))
+		pad := int(binary.BigEndian.Uint16(wire[off+4 : off+6]))
+		total := 6 + payload + pad
+		if off+total > len(wire) {
+			t.Fatalf("frame at offset %d runs past the buffer: total=%d remaining=%d", off, total, len(wire)-off)
+		}
+		frames = append(frames, innerFrame{payload: payload, pad: pad, total: total})
+		off += total
+	}
+	return frames
+}
+
+// TestUDPFrameJoinsLengthAndPayload pins the framing of WriteUDPFrame. The
+// tunnel renders one padded frame per Write, so emitting the two-byte length
+// separately from the payload used to produce two frames per datagram: a
+// 30-byte datagram cost 1038 bytes instead of ~500, and every datagram appeared
+// as a pair of 400..600-byte frames — paying twice for the padding while
+// handing an observer a shape of its own to key on.
+func TestUDPFrameJoinsLengthAndPayload(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x5a}, 30)
+	for _, tc := range []struct {
+		name     string
+		spec     string
+		min, max int
+	}{
+		{name: "default rule", spec: "400-600", min: 406, max: 606},
+		{name: "padding off", spec: "off", min: 38, max: 38},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshotPadding(t)
+			if err := SetPadding(tc.spec); err != nil {
+				t.Fatalf("set padding %q: %v", tc.spec, err)
+			}
+
+			var wire bytes.Buffer
+			conn := newXHTTPConn(nil, &wire, nil, nil, nil, nil)
+			if err := WriteUDPFrame(conn, payload); err != nil {
+				t.Fatalf("write datagram: %v", err)
+			}
+
+			frames := splitInnerFrames(t, wire.Bytes())
+			if len(frames) != 1 {
+				t.Fatalf("a %d-byte datagram took %d frames (%+v), want 1", len(payload), len(frames), frames)
+			}
+			if frames[0].payload != 2+len(payload) {
+				t.Fatalf("frame payload = %d, want the length prefix and the datagram together (%d)", frames[0].payload, 2+len(payload))
+			}
+			if frames[0].total < tc.min || frames[0].total > tc.max {
+				t.Fatalf("frame total = %d, want %d..%d", frames[0].total, tc.min, tc.max)
+			}
+
+			// The reader must still strip the pad and hand back the datagram.
+			reader := newXHTTPConn(bytes.NewReader(wire.Bytes()), nil, nil, nil, nil, nil)
+			got := make([]byte, maxUDPFrameSize)
+			n, err := ReadUDPFrameInto(reader, got)
+			if err != nil {
+				t.Fatalf("read datagram back: %v", err)
+			}
+			if !bytes.Equal(got[:n], payload) {
+				t.Fatalf("datagram corrupted through the frame: got %d bytes, want %d", n, len(payload))
+			}
+		})
+	}
+}

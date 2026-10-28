@@ -39,17 +39,38 @@ func ReadUDPFrameInto(r io.Reader, buf []byte) (int, error) {
 	return length, nil
 }
 
+// udpFrameBufPool recycles the buffer that joins a datagram's length prefix to
+// its payload. See WriteUDPFrame for why they must not be written separately.
+var udpFrameBufPool = sync.Pool{
+	New: func() interface{} { return new([]byte) },
+}
+
+// WriteUDPFrame writes one datagram as a single write: the two-byte length
+// followed by the payload.
+//
+// Both parts have to leave in one call. The tunnel renders exactly one padded
+// frame per Write, so writing the prefix and the payload separately produces
+// two independently padded frames: a 30-byte datagram costs 1038 bytes on the
+// wire at the default rule instead of ~500, and every datagram turns into a
+// pair of 400..600-byte frames, which is a traffic shape of its own. The reader
+// is unaffected either way — ReadUDPFrameInto reads through XHTTPConn.Read,
+// which is transparent to frame boundaries.
 func WriteUDPFrame(w io.Writer, payload []byte) error {
 	length := len(payload)
 	if length > 65535 {
 		return fmt.Errorf("UDP payload too large: %d > 65535", length)
 	}
-	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], uint16(length))
-	if _, err := w.Write(buf[:]); err != nil {
-		return err
+	bufPtr := udpFrameBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
+	if cap(buf) < length+2 {
+		buf = make([]byte, length+2)
 	}
-	_, err := w.Write(payload)
+	buf = buf[:length+2]
+	binary.BigEndian.PutUint16(buf[0:2], uint16(length))
+	copy(buf[2:], payload)
+	_, err := w.Write(buf)
+	*bufPtr = buf
+	udpFrameBufPool.Put(bufPtr)
 	return err
 }
 
