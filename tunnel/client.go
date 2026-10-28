@@ -581,7 +581,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		if cfg.ChunkSizeKB != 0 {
 			uploadChunk = chunkSizeBytes(cfg.ChunkSizeKB)
 		}
-		conn, serr := dialXHTTPStream(streamDialArgs{
+		conn, serr := dialStreamMode(ctx, modeKey, streamDialArgs{
 			ctx: ctx, cfg: cfg, rt: rt, ownTransport: ownTransport,
 			client: &http.Client{Transport: rt},
 			reqURL: reqURL, sessionID: sessionID, key: modeKey,
@@ -593,14 +593,20 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		if serr == nil {
 			return conn, nil
 		}
-		if !errors.Is(serr, errStreamUnavailable) {
+		// An inconclusive probe (the budget ran out during connection setup)
+		// is not a path verdict, but it still means this session cannot stream
+		// right now: poll, without touching the cache. The pump already logged
+		// that decision, so nothing to add here.
+		if !errors.Is(serr, errStreamUnavailable) && !errors.Is(serr, errProbeInconclusive) {
 			return nil, serr
 		}
 		if strings.EqualFold(strings.TrimSpace(cfg.StreamMode), "stream") {
 			return nil, serr
 		}
-		logger.Warn("⚠️ [Stream] streaming downlink unavailable on this path, this session falls back to long polling",
-			zap.String("session", sessionID), zap.Error(serr))
+		if errors.Is(serr, errStreamUnavailable) {
+			logger.Warn("⚠️ [Stream] streaming downlink unavailable on this path, this session falls back to long polling",
+				zap.String("session", sessionID), zap.Error(serr))
+		}
 	}
 
 	client := &http.Client{Transport: rt, Timeout: clientRequestTimeout}

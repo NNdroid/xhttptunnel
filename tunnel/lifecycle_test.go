@@ -297,18 +297,26 @@ func TestPerInstanceLoggers(t *testing.T) {
 	}
 }
 
-// TestStreamClientFallsBackOnLegacyServer proves the negotiation is backward
-// compatible: a legacy origin (built via the low-level ListenXHTTP, whose
-// long-poll GET never sends X-Downstream-Accepted) makes the auto client
-// abandon streaming and fall back to the poll mode — data still flows.
-func TestStreamClientFallsBackOnLegacyServer(t *testing.T) {
+// TestStreamClientFallsBackOnPollOnlyOrigin proves the negotiation is backward
+// compatible: when the origin never confirms the streaming downlink, the auto
+// client abandons it and falls back to the poll mode — data still flows in both
+// directions.
+//
+// The origin is fronted by a proxy that drops X-Downstream because the in-process
+// listener (ListenXHTTP) implements the streaming branch too, so pointing the
+// client straight at it exercises stream mode and would make this test vacuous.
+// Dropping the capability header is exactly what a CDN that does not forward
+// unknown headers does, and it is the shape of the real-world fallback.
+func TestStreamClientFallsBackOnPollOnlyOrigin(t *testing.T) {
+	resetStreamVerdicts()
+	defer resetStreamVerdicts()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	echoAddr, closeEcho := startTCPEchoServer(t)
 	defer closeEcho()
 
-	// Legacy origin: no stream-mode branch exists on this path.
 	origin, err := ListenXHTTP(ctx, "127.0.0.1:0", "/stream", "legacy-secret", "", "", "")
 	if err != nil {
 		t.Fatalf("ListenXHTTP: %v", err)
@@ -316,7 +324,10 @@ func TestStreamClientFallsBackOnLegacyServer(t *testing.T) {
 	defer origin.Close()
 	serveAcceptedTCPEcho(t, ctx, origin)
 
-	serverURL, _ := url.Parse("http://" + origin.Addr().String() + "/stream")
+	originURL, _ := url.Parse("http://" + origin.Addr().String())
+	front, _ := stripDownstreamProxy(t, originURL)
+	serverURL, _ := url.Parse(front.URL + "/stream")
+
 	conn, err := DialXHTTP(ctx, serverURL, &DialConfig{
 		Password: "legacy-secret",
 		Path:     "/stream",
@@ -325,9 +336,14 @@ func TestStreamClientFallsBackOnLegacyServer(t *testing.T) {
 		// must fall back to polling without losing data.
 	}, echoAddr, "tcp")
 	if err != nil {
-		t.Fatalf("dial legacy origin: %v", err)
+		t.Fatalf("dial poll-only origin: %v", err)
 	}
 	defer conn.Close()
+
+	key := (&DialConfig{Path: "/stream"}).streamModeKey("http/1.1", serverURL.Host)
+	if mode, failures := streamVerdict(key); mode == "stream" || failures == 0 {
+		t.Fatalf("the client did not negotiate against this path: mode=%q failures=%d", mode, failures)
+	}
 
 	for i := 0; i < 3; i++ {
 		payload := []byte("legacy-fallback-ping")

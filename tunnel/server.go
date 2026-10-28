@@ -643,24 +643,30 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// A streaming downlink response owns the dispatch cursor while it
 		// lives; poll responses must not piggyback downlink alongside it or
 		// the two writers would split the stream.
-		if vConn.downWriterActive() {
+		streamOwns := vConn.downWriterActive()
+		if r.Method == http.MethodGet {
+			// A poll GET takes the cursor even from a live streaming writer:
+			// that is the mode-downgrade path. The client abandons the stream
+			// when the path cannot sustain it, but the stale writer can stay
+			// attached for as long as its socket lives. Guarding this behind
+			// !downWriterActive made the takeover unreachable in exactly the
+			// case it exists for, and every poll answered an immediate empty
+			// 200 — no long poll, no data — turning the downgrade into a
+			// request storm. Acquiring also rewinds the cursor to the peer's
+			// ack, which recovers the downlink bytes an abandoned probe
+			// response already consumed.
+			ticket := &downWriterTicket{}
+			vConn.AcquireDownWriter(ticket)
+			defer vConn.ReleaseDownWriter(ticket)
+			streamOwns = false
+		}
+		if streamOwns {
 			logger.Debug("📡 [HTTP] streaming downlink owns the session; this response will not piggyback downlink data", zap.String("session", sessionID))
-		} else {
-			if r.Method == http.MethodGet {
-				// A poll GET briefly owns the cursor and evicts a streaming
-				// writer if one is still attached (mode downgrade).
-				ticket := &downWriterTicket{}
-				vConn.AcquireDownWriter(ticket)
-				defer vConn.ReleaseDownWriter(ticket)
-			}
-			if totalUpBytes > 0 {
-				fetchDownData()
-			} else {
-				if !fetchDownData() && !vConn.isClosed() {
-					vConn.writeBuf.waitLongPoll(r.Context(), st.longPollTimeout)
-					fetchDownData()
-				}
-			}
+		} else if totalUpBytes > 0 {
+			fetchDownData()
+		} else if !fetchDownData() && !vConn.isClosed() {
+			vConn.writeBuf.waitLongPoll(r.Context(), st.longPollTimeout)
+			fetchDownData()
 		}
 
 		// HTTP/3 cannot write straight out of the pooled buffer. quic-go's

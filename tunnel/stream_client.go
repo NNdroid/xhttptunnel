@@ -9,6 +9,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,11 +81,26 @@ var errTargetDenied = errors.New("tunnel: target refused by server policy")
 // no failure accounting.
 var errProbeAborted = errors.New("tunnel: stream probe aborted by local close")
 
+// errProbeInconclusive means the probe budget expired before the request even
+// reached the origin — a cold TCP/TLS handshake on a slow link costs the same
+// seconds a buffering path does, and the two are indistinguishable by elapsed
+// time alone. It is not a path verdict: the session falls back to polling but
+// nothing is cached, so the next dial (on the now-warm pooled transport)
+// negotiates again instead of inheriting a five-minute downgrade.
+var errProbeInconclusive = errors.New("tunnel: stream probe inconclusive")
+
 // errServerSessionGone means the origin recreated a stream session after the
 // application connection had already exchanged data. The old reliable-buffer
 // sequence space cannot be rebased without risking duplication or loss, so the
 // caller must establish a fresh application connection.
 var errServerSessionGone = errors.New("tunnel: server session was recreated")
+
+// errSessionClosedEmpty means the origin accepted the session and ended it
+// before a single byte flowed. The usual causes are a target that refused the
+// connection or a session the origin rejected after admitting it; either way the
+// dial has no usable tunnel to hand back, and polling would meet the same
+// refusal.
+var errSessionClosedEmpty = errors.New("tunnel: the origin closed the session before any data flowed (target refused, session rejected, or the origin does not stream)")
 
 // errInvalidPeerAck reports that the server's acknowledgement does not match
 // the client's write cursor. Unlike transport blips the server is
@@ -92,19 +108,44 @@ var errServerSessionGone = errors.New("tunnel: server session was recreated")
 // stop and let the caller observe a fatal closeErr.
 var errInvalidPeerAck = errors.New("tunnel: invalid peer acknowledgement")
 
+// streamPollDowngradeAfter is how many consecutive conclusive "this path cannot
+// stream" verdicts it takes to downgrade one endpoint to long polling. A single
+// sample is not enough: one probe can be tripped by a transient edge state (a
+// 429 or 503 from a CDN, an origin restarting mid-probe), and every session
+// dialed during the TTL would inherit that verdict. Two consecutive failures
+// from two separate sessions is the threshold.
+const streamPollDowngradeAfter = 2
+
 type streamModeEntry struct {
-	mode     string // "stream" or "poll"
+	mode     string // "stream", "poll", or "" while failures accumulate
 	expiry   time.Time
 	ttfbBase time.Duration
+	failures int // consecutive conclusive "cannot stream" verdicts
 }
 
 var (
 	streamModeMu    sync.Mutex
 	streamModeCache = map[string]streamModeEntry{}
+
+	// streamProbeGates collapses concurrent negotiations for one endpoint: see
+	// dialStreamMode. Keyed like streamModeCache.
+	streamProbeGatesMu sync.Mutex
+	streamProbeGates   = map[string]*streamProbeGate{}
 )
 
 func (c *DialConfig) streamModeKey(protocol, hostPort string) string {
 	return protocol + "|" + hostPort + "|" + c.SNI + "|" + c.CertificateFingerprint + "|" + c.TransportKey
+}
+
+// pruneStreamModesLocked drops expired entries. The cache lives for the process
+// lifetime and is keyed per endpoint, so without a sweep a client that roams
+// across many CDN endpoints would keep a key for every one it ever saw.
+func pruneStreamModesLocked(now time.Time) {
+	for k, e := range streamModeCache {
+		if now.After(e.expiry) {
+			delete(streamModeCache, k)
+		}
+	}
 }
 
 func cachedStreamMode(key string) (string, time.Duration) {
@@ -117,10 +158,51 @@ func cachedStreamMode(key string) (string, time.Duration) {
 	return e.mode, e.ttfbBase
 }
 
+// cacheStreamMode records a negotiated verdict. A successful negotiation clears
+// any accumulated failures and publishes the measured TTFB, which widens the
+// probe window for the next session on a high-RTT path.
 func cacheStreamMode(key, mode string, ttfb time.Duration) {
 	streamModeMu.Lock()
 	defer streamModeMu.Unlock()
-	streamModeCache[key] = streamModeEntry{mode: mode, expiry: time.Now().Add(streamModeCacheTTL), ttfbBase: ttfb}
+	now := time.Now()
+	pruneStreamModesLocked(now)
+	streamModeCache[key] = streamModeEntry{mode: mode, expiry: now.Add(streamModeCacheTTL), ttfbBase: ttfb}
+}
+
+// recordStreamPollVerdict records one conclusive "this path cannot stream"
+// verdict and downgrades the endpoint only once the failures are consecutive.
+// It is deliberately noisy about the downgrade: without a log line an operator
+// can only observe that new sessions stopped streaming for the whole TTL.
+func recordStreamPollVerdict(key, reason string, lg *zap.Logger) {
+	streamModeMu.Lock()
+	now := time.Now()
+	pruneStreamModesLocked(now)
+	e := streamModeCache[key]
+	e.failures++
+	downgrade := e.failures >= streamPollDowngradeAfter
+	e.mode = ""
+	if downgrade {
+		e.mode = "poll"
+		e.ttfbBase = 0
+	}
+	e.expiry = now.Add(streamModeCacheTTL)
+	streamModeCache[key] = e
+	streamModeMu.Unlock()
+
+	if downgrade {
+		lg.Warn("⬇️ [Stream] endpoint downgraded to long polling after consecutive failed negotiations",
+			zap.String("key", key),
+			zap.Int("failures", e.failures),
+			zap.String("reason", reason),
+			zap.Duration("ttl", streamModeCacheTTL),
+		)
+		return
+	}
+	lg.Debug("📉 [Stream] path could not stream once; the next session still probes",
+		zap.String("key", key),
+		zap.Int("failures", e.failures),
+		zap.String("reason", reason),
+	)
 }
 
 // streamDownlinkEnabled decides whether this session's first attempt uses the
@@ -136,6 +218,71 @@ func (c *DialConfig) streamDownlinkEnabled(key string) bool {
 		mode, _ := cachedStreamMode(key)
 		return mode != "poll"
 	}
+}
+
+// streamProbeGate marks an endpoint whose negotiation is already in flight.
+type streamProbeGate struct{ done chan struct{} }
+
+// joinStreamProbe returns the gate for key and whether this caller owns it. The
+// owner probes; everyone else waits for its verdict (see dialStreamMode).
+func joinStreamProbe(key string) (*streamProbeGate, bool) {
+	streamProbeGatesMu.Lock()
+	defer streamProbeGatesMu.Unlock()
+	if g, ok := streamProbeGates[key]; ok {
+		return g, false
+	}
+	g := &streamProbeGate{done: make(chan struct{})}
+	streamProbeGates[key] = g
+	return g, true
+}
+
+// finishStreamProbe publishes the verdict to the waiting dials and forgets the
+// gate. It must run on every path out of the owner's negotiation.
+func finishStreamProbe(key string, gate *streamProbeGate) {
+	streamProbeGatesMu.Lock()
+	if streamProbeGates[key] == gate {
+		delete(streamProbeGates, key)
+	}
+	streamProbeGatesMu.Unlock()
+	close(gate.done)
+}
+
+// waitStreamProbe parks a joining dial until the owner publishes its verdict,
+// the dial is cancelled, or the wait budget elapses. The budget is the minimum
+// probe window, not the owner's: waiting longer than that would make a joining
+// dial slower than simply probing on its own.
+func waitStreamProbe(ctx context.Context, gate *streamProbeGate) {
+	t := time.NewTimer(streamProbeMinWindow)
+	defer t.Stop()
+	select {
+	case <-gate.done:
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+// dialStreamMode negotiates the streaming downlink for one session, collapsing
+// concurrent negotiations for the same endpoint. Waiting for another dial's
+// verdict costs the same wall clock as probing in parallel, but a poll-only path
+// then produces one probe instead of one per concurrent session — and that
+// request burst is exactly what a CDN rate-limits.
+func dialStreamMode(ctx context.Context, key string, a streamDialArgs) (net.Conn, error) {
+	gate, owner := joinStreamProbe(key)
+	if owner {
+		defer finishStreamProbe(key, gate)
+		return dialXHTTPStream(a)
+	}
+	waitStreamProbe(ctx, gate)
+	if mode, _ := cachedStreamMode(key); mode == "poll" {
+		return nil, fmt.Errorf("%w (a concurrent dial already found the endpoint poll-only)", errStreamUnavailable)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// No verdict, or a "stream" verdict: a successful negotiation belongs to
+	// one session (it owns that GET and its companion POST), so negotiate here
+	// too — now with the TTFB baseline the owner just published.
+	return dialXHTTPStream(a)
 }
 
 type streamDialArgs struct {
@@ -197,6 +344,21 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 			var roundReady time.Time
 			a.onReady = func() { roundReady = time.Now(); announce(nil) }
 			serverClosed, err := a.runStreamRound(pumpCtx, a.client, virtualConn, &ackedByServer, &lastDown, &established, t0)
+			if !established {
+				// A session that ends before the first byte — whether the round
+				// reports a clean close or the downlink simply stopped — has
+				// nothing to hand back. Fail the dial with the reason this path
+				// can see, and do not count it as a verdict: polling would meet
+				// the same refusal.
+				if err == nil && serverClosed {
+					err = errSessionClosedEmpty
+				}
+				if errors.Is(err, errSessionClosedEmpty) {
+					announce(err)
+					a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "peer closed before data", Detail: err.Error()})
+					return
+				}
+			}
 			announce(err)
 			elapsed := time.Since(t0)
 
@@ -232,20 +394,30 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 				a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "server session recreated", Detail: err.Error()})
 				return
 			}
+			if errors.Is(err, errProbeInconclusive) {
+				// The budget expired during connection setup, which happens on
+				// any cold or high-RTT link. This session polls, but no verdict
+				// is recorded: the transport is pooled now, so the next dial
+				// negotiates again instead of inheriting a downgrade.
+				logger.Warn("⚠️ [Stream] probe inconclusive (the request never reached the origin within the window); this session falls back to long polling, verdict not cached",
+					zap.String("session", a.sessionID),
+					zap.Error(err),
+				)
+				return
+			}
 			if errors.Is(err, errStreamUnavailable) && !established {
-				// Path/origin cannot stream: remember and let DialXHTTP fall
-				// back to polling. A forced StreamMode="stream" keeps the
-				// decision local to this session (no cache write happens for
-				// it — the caller handles that).
+				// Path/origin cannot stream: record the verdict and let
+				// DialXHTTP fall back to polling. A forced StreamMode="stream"
+				// keeps the decision local to this session (no cache write).
 				if !strings.EqualFold(strings.TrimSpace(a.cfg.StreamMode), "stream") {
-					cacheStreamMode(a.key, "poll", 0)
+					recordStreamPollVerdict(a.key, err.Error(), logger)
 				}
 				return
 			}
 			if errors.Is(err, errInvalidPeerAck) {
 				virtualConn.setCloseErr(err)
 				if !established && !strings.EqualFold(strings.TrimSpace(a.cfg.StreamMode), "stream") {
-					cacheStreamMode(a.key, "poll", 0)
+					recordStreamPollVerdict(a.key, err.Error(), logger)
 				}
 				logger.Warn("❌ [Stream] invalid peer ack, not reconnecting",
 					zap.String("session", a.sessionID),
@@ -334,6 +506,26 @@ func streamReconnectBackoff(failures int) time.Duration {
 	return half + time.Duration(mrand.Int63n(int64(base-half)+1))
 }
 
+// roundErrCause returns the error that explains why a round ended, skipping the
+// errors that unwinding the round itself produces. `finish` closes the upload
+// pipe, and the writer goroutine then fails on that closed pipe — reporting
+// "io: read/write on closed pipe" instead of the read EOF that actually ended
+// the round hides the real cause (a refused target, a reaped session) from the
+// operator.
+func roundErrCause(ch chan error) error {
+	for {
+		select {
+		case err := <-ch:
+			if err == nil || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, context.Canceled) {
+				continue
+			}
+			return err
+		default:
+			return nil
+		}
+	}
+}
+
 // runStreamRound establishes one streaming GET and drives it to completion.
 // serverClosed reports that the peer ended the session with a close marker.
 //
@@ -364,7 +556,14 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		probeWindow = 30 * time.Second
 	}
 	deadline := roundStart.Add(probeWindow)
-	probeTimer := time.AfterFunc(time.Until(deadline), cancelRound)
+	// probeExpired records that the window itself ended the round, as opposed
+	// to our own upload plumbing cancelling it. The two are indistinguishable
+	// from roundCtx after the fact, and only the first is a path verdict.
+	var probeExpired atomic.Bool
+	probeTimer := time.AfterFunc(time.Until(deadline), func() {
+		probeExpired.Store(true)
+		cancelRound()
+	})
 	defer probeTimer.Stop()
 
 	req, _ := http.NewRequestWithContext(roundCtx, http.MethodGet, a.reqURL, nil)
@@ -380,11 +579,22 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	if err := applyStreamRequestHeaders(req, a.cfg, a.targetAddr, a.network, a.sessionID); err != nil {
 		return false, err
 	}
+	// WroteRequest separates the two phases that share the probe budget. If the
+	// request never left the socket, the budget was spent on connection setup —
+	// no verdict. If it did, the origin (or an intermediary) is holding back the
+	// response headers, which is exactly the "this path buffers" verdict.
+	var wroteRequest atomic.Bool
+	req = req.WithContext(httptrace.WithClientTrace(roundCtx, &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest.Store(true) },
+	}))
 
 	resp, err := client.Do(req)
 	if err != nil {
 		if pumpCtx.Err() == nil && roundCtx.Err() != nil {
-			return false, errStreamUnavailable
+			if !wroteRequest.Load() {
+				return false, fmt.Errorf("%w (connection setup exceeded %v)", errProbeInconclusive, probeWindow)
+			}
+			return false, fmt.Errorf("%w (no response headers within %v: the path buffers responses)", errStreamUnavailable, probeWindow)
 		}
 		return false, err
 	}
@@ -401,12 +611,19 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 			a.events.emit(TargetDenied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Remote: resp.Request.RemoteAddr})
 			return false, errTargetDenied
 		}
-		return false, errStreamUnavailable
+		// 429/503 are transient edge states (rate limit, full origin), not a
+		// statement about the path. They still fall back for this session, but
+		// the reason travels in the error so an operator can tell them apart
+		// from a genuine "cannot stream" verdict in the log.
+		return false, fmt.Errorf("%w (origin answered HTTP %d)", errStreamUnavailable, resp.StatusCode)
 	}
 	if resp.Header.Get("X-Downstream-Accepted") != "1" {
-		// Old origin: it ran the long-poll branch and will answer normally.
+		// Old origin or a proxy that dropped the header: it ran the long-poll
+		// branch. Note this response may already carry downlink bytes, which is
+		// why the poll fallback relies on AcquireDownWriter rewinding the
+		// dispatch cursor to the peer's (zero) acknowledgement.
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return false, errStreamUnavailable
+		return false, fmt.Errorf("%w (the origin did not accept the streaming downlink)", errStreamUnavailable)
 	}
 	if resp.Header.Get("X-Stream-Uplink-Sync") != "1" {
 		// Older origins can send a downlink hello before the companion POST is
@@ -414,7 +631,7 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		// back (or fail loudly in forced mode) until the origin supports the
 		// two-direction readiness handshake.
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return false, errStreamUnavailable
+		return false, fmt.Errorf("%w (the origin predates the two-direction readiness handshake)", errStreamUnavailable)
 	}
 	// A server announcing a newer protocol generation than this client speaks
 	// is fatal, not a fallback: the frame layout may already differ, so
@@ -431,7 +648,10 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	if roundCtx.Err() == nil {
 		probeTimer.Stop()
 		deadline = time.Now().Add(probeWindow)
-		probeTimer = time.AfterFunc(time.Until(deadline), cancelRound)
+		probeTimer = time.AfterFunc(time.Until(deadline), func() {
+			probeExpired.Store(true)
+			cancelRound()
+		})
 	}
 
 	// Start the companion POST before waiting for the hello frame. A current
@@ -529,11 +749,23 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	select {
 	case res := <-firstC:
 		if res.err != nil {
+			// Sample the round state BEFORE finish(): it cancels roundCtx, after
+			// which every cancellation looks like ours.
+			canceledByRound := roundCtx.Err() != nil && pumpCtx.Err() == nil
 			finish()
-			select {
-			case uerr := <-roundErr:
+			if uerr := roundErrCause(roundErr); uerr != nil {
 				return false, uerr
-			default:
+			}
+			if canceledByRound && probeExpired.Load() {
+				// Our own probe window ended the read, not the peer: the
+				// response headers arrived but the hello did not.
+				return false, fmt.Errorf("%w (no frame within %v: the path buffers responses)", errStreamUnavailable, probeWindow)
+			}
+			if !canceledByRound || errors.Is(res.err, io.EOF) || errors.Is(res.err, io.ErrUnexpectedEOF) {
+				// The origin ended the downlink before the first frame, or our
+				// upload plumbing died before the window did. Either way this is
+				// not a verdict on the path: a refused target, a reaped session.
+				return false, fmt.Errorf("%w: %v", errSessionClosedEmpty, res.err)
 			}
 			return false, res.err
 		}
@@ -544,18 +776,19 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		// failure count — this is a local close, not a path verdict.
 		return false, errProbeAborted
 	case <-roundCtx.Done():
-		select {
-		case uerr := <-roundErr:
+		if uerr := roundErrCause(roundErr); uerr != nil {
 			return false, uerr
-		default:
 		}
 		if pumpCtx.Err() != nil {
 			return false, pumpCtx.Err()
 		}
-		return false, errStreamUnavailable
+		if probeExpired.Load() {
+			return false, fmt.Errorf("%w (no frame within %v: the path buffers responses)", errStreamUnavailable, probeWindow)
+		}
+		return false, errSessionClosedEmpty
 	}
 	if !probeTimer.Stop() && roundCtx.Err() != nil {
-		return false, errStreamUnavailable
+		return false, fmt.Errorf("%w (no frame within %v: the path buffers responses)", errStreamUnavailable, probeWindow)
 	}
 
 	logger := a.logger
@@ -608,10 +841,8 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		if rerr != nil {
 			// Drain the uplink goroutines before reporting.
 			finish()
-			select {
-			case uerr := <-roundErr:
+			if uerr := roundErrCause(roundErr); uerr != nil {
 				return false, uerr
-			default:
 			}
 			return false, rerr
 		}

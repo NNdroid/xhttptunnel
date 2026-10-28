@@ -501,8 +501,37 @@ TTL 5 min):
    hello frame. If it arrives within `max(5s, 3× measured TTFB)` (capped at
    30 s), both directions are usable and the path does not buffer responses.
 3. **Watchdog** — an established stream must see a frame (data or keepalive,
-   emitted every 5 s) within 30 s; two consecutive breaks downgrade the
-   endpoint to poll mode.
+   emitted every 5 s) within 30 s, otherwise it is re-established with resume
+   (`X-Ack`), indefinitely and with capped exponential backoff. An established
+   session is never demoted to polling: its acknowledged sequence space cannot be
+   rebased onto the poll cursor. Only a *failed negotiation* downgrades an
+   endpoint.
+
+A failed negotiation downgrades the endpoint for the TTL only after **two
+consecutive conclusive** failures. A single sample is not enough, because one
+probe can be tripped by a transient edge state (a 429/503 from a CDN, an origin
+restarting mid-probe) and every session dialed during the TTL would inherit that
+verdict. Two outcomes are explicitly *not* conclusive and never cache anything:
+
+- **Connection setup exceeded the probe window** — a cold TCP/TLS handshake on a
+  slow link costs the same seconds a buffering path does, and elapsed time
+  cannot tell them apart (`httptrace` separates the phases: if the request never
+  reached the origin, nothing is recorded). The session polls, the transport is
+  pooled now, and the next dial negotiates again instead of inheriting a
+  five-minute downgrade.
+- **A non-200 answer from the origin** — the status is named in the fallback log
+  line and counted as one sample, but a rate limit or a full origin says nothing
+  about whether the path can stream.
+- **A session the origin ends before the first byte** — a refused target or a
+  session reaped right after admission. The dial fails with that reason rather
+  than handing back a connection that is already at EOF, and the endpoint is not
+  blamed for the target's refusal.
+
+Downgrades are logged (`endpoint downgraded to long polling after consecutive
+failed negotiations`, with the reason and TTL), and concurrent dials that miss
+the cache collapse onto one negotiation: the rest wait for its verdict instead of
+probing in parallel, so a poll-only path sees one probe per burst rather than one
+per connection.
 
 Set `StreamMode: "poll"` to force the legacy mode. `"stream"` requires the
 stream handshake to succeed and fails instead of silently falling back. A
