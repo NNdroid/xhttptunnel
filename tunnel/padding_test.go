@@ -9,19 +9,15 @@ import (
 )
 
 // withPadding installs a rule for the duration of the test. Padding is
-// process-wide state, so every test that touches it must restore it or it
-// silently reshapes the frames of everything that runs afterwards.
+// process-wide state, so every test that touches it must restore it — the
+// compiled policy, the declaration record and the SetPadding override flag —
+// or it silently reshapes the frames of everything that runs afterwards.
 func withPadding(t *testing.T, spec string) {
 	t.Helper()
-	prev := PaddingSpec()
+	snapshotPadding(t)
 	if err := SetPadding(spec); err != nil {
 		t.Fatalf("SetPadding(%q): %v", spec, err)
 	}
-	t.Cleanup(func() {
-		if err := SetPadding(prev); err != nil {
-			t.Fatalf("restore padding %q: %v", prev, err)
-		}
-	})
 }
 
 func TestPaddingSpecParsesBands(t *testing.T) {

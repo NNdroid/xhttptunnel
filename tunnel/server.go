@@ -1047,11 +1047,12 @@ type ServerConfig struct {
 	MinProtoVersion int
 	// Padding sets the frame padding rule for traffic this process emits, in
 	// the syntax documented on SetPadding ("400-600", "1:120-200,400:400-600",
-	// "off"). Empty leaves the process policy alone. Padding is process-wide
-	// egress policy rather than a per-server setting: a server whose rule
-	// differs from one that another server or client already declared fails
-	// here instead of silently reshaping that instance's traffic. Invalid
-	// rules are rejected by NewServer.
+	// "off"). Empty leaves the process policy alone, and restating the rule in
+	// force is a no-op. Padding is process-wide egress policy rather than a
+	// per-server setting: a rule that differs from one already in force — set
+	// by another server or client, or by SetPadding — fails here instead of
+	// silently reshaping that instance's traffic. Invalid rules are rejected by
+	// NewServer.
 	Padding string
 	// HealthPath, when non-empty (e.g. "/healthz"), serves an unauthenticated
 	// JSON TunnelStats snapshot on GET at that path, independent of the tunnel

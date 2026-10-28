@@ -1372,11 +1372,12 @@ type ClientConfig struct {
 	ChunkSizeKB int
 	// Padding sets the frame padding rule for traffic this process emits, in
 	// the syntax documented on SetPadding ("400-600", "1:120-200,400:400-600",
-	// "off"). Empty leaves the process policy alone. Padding is process-wide
-	// egress policy rather than a per-client setting: a client whose rule
-	// differs from one that another client or server already declared fails
-	// here instead of silently reshaping that instance's traffic. Invalid
-	// rules are rejected by NewClient.
+	// "off"). Empty leaves the process policy alone, and restating the rule in
+	// force is a no-op. Padding is process-wide egress policy rather than a
+	// per-client setting: a rule that differs from one already in force — set
+	// by another client or server, or by SetPadding — fails here instead of
+	// silently reshaping that instance's traffic. Invalid rules are rejected by
+	// NewClient.
 	Padding string
 	// Brutal configures TCP Brutal on the client's TCP tunnel sockets.
 	// Invalid combinations are rejected by NewClient. HTTP/3 sessions run over

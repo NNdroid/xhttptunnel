@@ -25,10 +25,12 @@ import (
 //
 // It is installed either imperatively with SetPadding or declaratively through
 // ClientConfig.Padding / ServerConfig.Padding. The two routes reach the same
-// process-wide policy, and a config that declares a rule different from one
-// another config already declared is rejected: honouring both is impossible,
-// and silently picking the later one would reshape the earlier instance's
-// traffic without a word.
+// process-wide policy, so a declaration is a statement about that policy rather
+// than a per-instance setting: it installs a rule when nothing has decided one
+// yet, and it is a no-op when it agrees with the rule in force. A declaration
+// that would change a rule another config or a SetPadding call already decided
+// is rejected — honouring both is impossible, and silently picking the later
+// one would reshape the earlier instance's traffic without a word.
 //
 // # Syntax
 //
@@ -51,8 +53,9 @@ import (
 // control channel is kept inside the same size distribution instead of being
 // the only frames on the wire shorter than the band:
 //
-//	1:120-200,400:400-600   empty (keepalive/ack-only) frames 120..200,
-//	                        everything else under 400 padded to 400..600
+//	1:120-200,400:400-600   empty (keepalive/ack-only) frames carry 120..200
+//	                        bytes of padding, everything else under 400 is
+//	                        padded into 400..600
 //
 // Bands must be listed in increasing threshold order. For a band to be
 // satisfiable its lower bound must be at least BELOW-1, otherwise the largest
@@ -107,12 +110,20 @@ func init() {
 // "default" selects the built-in policy; "off" disables padding entirely.
 // Invalid specs are rejected with the syntax, so a bad config fails at startup
 // rather than turning every frame into a malformed one.
+//
+// This is the explicit route: it decides the rule for the process, and a later
+// ClientConfig.Padding / ServerConfig.Padding asking for something else fails
+// at construction instead of quietly replacing it. Declaring the same rule
+// again is not a conflict — the compiled band lists compare equal.
 func SetPadding(spec string) error {
 	p, err := parsePaddingSpec(spec)
 	if err != nil {
 		return err
 	}
+	declaredPaddingMu.Lock()
+	paddingOverridden = true
 	activePadding.Store(p)
+	declaredPaddingMu.Unlock()
 	return nil
 }
 
@@ -128,19 +139,25 @@ func ValidatePadding(spec string) error {
 }
 
 // declaredPadding is the rule a ClientConfig or ServerConfig asked for, in
-// normalised form. Padding is a process-wide egress policy, so two instances in
-// one process cannot each have their own: the second declaration is refused
-// rather than allowed to reshape the first instance's traffic behind its back.
-// An imperative SetPadding is not recorded here — it is an explicit override
-// and always wins.
+// normalised form; paddingOverridden records that SetPadding was also called.
+// Together they answer the only question a new declaration has to ask: who
+// decided the rule currently in force, and does this declaration contradict
+// them?
 var (
 	declaredPaddingMu sync.Mutex
 	declaredPadding   string
+	paddingOverridden bool
 )
 
 // installDeclaredPadding installs a rule that came from a config struct. Empty
 // means "no opinion" and leaves whatever is in force alone, so a process that
 // sets the policy once (SetPadding) does not have to repeat it in every config.
+//
+// A declaration is checked against the rule actually in force rather than
+// against a history of declarations. Restating the rule in force is always
+// accepted — it changes nothing, so there is nothing to disagree about — and
+// asking for a different one fails naming whatever decided the current rule: a
+// SetPadding override, or an earlier declaration from another config.
 func installDeclaredPadding(component, spec string) error {
 	if strings.TrimSpace(spec) == "" {
 		return nil
@@ -151,8 +168,13 @@ func installDeclaredPadding(component, spec string) error {
 	}
 	declaredPaddingMu.Lock()
 	defer declaredPaddingMu.Unlock()
-	if declaredPadding != "" && declaredPadding != p.spec {
-		return fmt.Errorf("tunnel: %s asks for padding %q but this process already applies %q; padding shapes every frame the process emits, so a single rule must cover all of its clients and servers", component, p.spec, declaredPadding)
+	if inForce := activePadding.Load().spec; inForce != p.spec {
+		if paddingOverridden {
+			return fmt.Errorf("tunnel: %s asks for padding %q but SetPadding already set this process to %q; padding shapes every frame the process emits, so one of the two has to go", component, p.spec, inForce)
+		}
+		if declaredPadding != "" {
+			return fmt.Errorf("tunnel: %s asks for padding %q but this process already applies %q; padding shapes every frame the process emits, so a single rule must cover all of its clients and servers", component, p.spec, inForce)
+		}
 	}
 	declaredPadding = p.spec
 	activePadding.Store(p)

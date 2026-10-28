@@ -5,20 +5,22 @@ import (
 	"testing"
 )
 
-// snapshotPadding restores both halves of the padding state — the compiled
-// policy and the declaration record — so a test that installs a rule through a
-// config struct cannot leak into the next one.
+// snapshotPadding restores every half of the padding state — the compiled
+// policy, the declaration record and the override flag — so a test that
+// installs a rule cannot leak into the next one.
 func snapshotPadding(t *testing.T) {
 	t.Helper()
 	prevPolicy := activePadding.Load()
 	declaredPaddingMu.Lock()
 	prevDeclared := declaredPadding
+	prevOverridden := paddingOverridden
 	declaredPaddingMu.Unlock()
 	t.Cleanup(func() {
-		activePadding.Store(prevPolicy)
 		declaredPaddingMu.Lock()
 		declaredPadding = prevDeclared
+		paddingOverridden = prevOverridden
 		declaredPaddingMu.Unlock()
+		activePadding.Store(prevPolicy)
 	})
 }
 
@@ -114,5 +116,67 @@ func TestPaddingConfigRejectsInvalid(t *testing.T) {
 	}
 	if got := PaddingSpec(); got != "400:400-600" {
 		t.Errorf("a rejected rule was installed anyway: %q", got)
+	}
+}
+
+// TestPaddingOverrideBlocksDifferingDeclaration pins what "explicit override"
+// means for the declarative route. SetPadding decides the rule for the process,
+// so a config field asking for something else must fail rather than win
+// silently — the alternative is a rule that depends on which of two unrelated
+// lines of user code happened to run last.
+func TestPaddingOverrideBlocksDifferingDeclaration(t *testing.T) {
+	snapshotPadding(t)
+	if err := SetPadding("off"); err != nil {
+		t.Fatalf("SetPadding: %v", err)
+	}
+
+	_, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", Padding: "400-600"})
+	if err == nil {
+		t.Fatal("NewClient replaced a SetPadding override without saying so")
+	}
+	for _, want := range []string{"SetPadding", "\"400:400-600\"", "\"off\""} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err.Error(), want)
+		}
+	}
+	if got := PaddingSpec(); got != "off" {
+		t.Fatalf("the rejected declaration still changed the rule to %q", got)
+	}
+
+	// Restating the override is not a conflict: nothing changes.
+	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", Padding: "none"}); err != nil {
+		t.Errorf("NewClient rejected a config that restates the override: %v", err)
+	}
+	if _, err := NewServer(ServerConfig{Padding: "off"}); err != nil {
+		t.Errorf("NewServer rejected a config that restates the override: %v", err)
+	}
+}
+
+// TestPaddingDeclarationMatchingTheRuleInForceIsAccepted is the other half of
+// comparing against the rule in force rather than against a history of
+// declarations: a client declared a rule, an explicit override then changed it,
+// and a config that asks for the rule now in force is not a contradiction.
+// Comparing with the declaration record alone reported a conflict about a rule
+// the process had already stopped using.
+func TestPaddingDeclarationMatchingTheRuleInForceIsAccepted(t *testing.T) {
+	snapshotPadding(t)
+
+	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", Padding: "off"}); err != nil {
+		t.Fatalf("first declaration: %v", err)
+	}
+	if err := SetPadding("400-600"); err != nil {
+		t.Fatalf("override: %v", err)
+	}
+	if _, err := NewServer(ServerConfig{Padding: "400:400-600"}); err != nil {
+		t.Fatalf("a config asking for the rule in force was rejected: %v", err)
+	}
+	// Asking for the retired rule now contradicts the override, and the error
+	// must name the decision it contradicts.
+	_, err := NewServer(ServerConfig{Padding: "off"})
+	if err == nil {
+		t.Fatal("a rule the override retired was accepted")
+	}
+	if !strings.Contains(err.Error(), "SetPadding") {
+		t.Errorf("error %q blames the wrong decision", err.Error())
 	}
 }
