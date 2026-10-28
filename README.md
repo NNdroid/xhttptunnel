@@ -586,8 +586,10 @@ Things worth knowing before changing it:
 - **Padding stops at `MIN`.** Bulk transfer keeps exact frame sizes. Covering
   those would cost a 20× overhead per record for a size an observer can already
   estimate from the tunnel's throughput.
-- **Bands are capped at 90000 bytes**, the per-frame scratch headroom that the
-  send buffers and the admission budget are sized from.
+- **Bands are capped at 65535 bytes**, the width of the two-byte pad field in
+  the frame header. A larger band would be truncated on the wire and the reader
+  would then strip the wrong number of bytes, handing the application padding as
+  if it were payload — a silent corruption, not a shape change.
 - The rule applies to every frame this process emits, both the inner payload
   frame and the streaming envelope, so one setting covers both transports.
 

@@ -57,10 +57,14 @@ const (
 	// on (SSH keystrokes, TLS handshake records, DNS) and 600 is still one
 	// MSS of tunnel payload, so the band costs no extra round trip.
 	DefaultPaddingSpec = "400-600"
-	// maxPaddingTotal bounds a band's upper bound. A frame's scratch buffer
-	// carries framePaddingBudget bytes of headroom, and the same constant
-	// sizes bufferReservation, so a larger band would silently outgrow both.
-	maxPaddingTotal = framePaddingBudget
+	// maxPaddingTotal bounds a band's upper bound, and it is the width of the
+	// pad field rather than a buffer size: the pad length travels in the frame
+	// header's two-byte field (writeSingleFrame and streamFrameStorage both
+	// narrow it to uint16). A larger band would be truncated on the wire, and
+	// the reader would then strip the wrong number of bytes and hand the
+	// application padding as if it were payload. framePaddingBudget (90000) is
+	// the per-frame scratch headroom, which covers this limit plus the header.
+	maxPaddingTotal = 65535
 	// maxPaddingBands keeps a typo from turning the lookup into a search.
 	maxPaddingBands = 8
 )
@@ -165,7 +169,9 @@ func (p *paddingPolicy) padLen(n int) int {
 		target := b.min + rand.Intn(b.max-b.min+1)
 		if target <= n {
 			// Unreachable for a validated band; keep a bad spec from emitting
-			// a negative pad, which would slice a frame buffer backwards.
+			// a negative pad, which would slice a frame buffer backwards. The
+			// upper side is guaranteed by the parser too: a band's max is
+			// capped at maxPaddingTotal, the width of the header's pad field.
 			return 0
 		}
 		return target - n
@@ -223,7 +229,7 @@ func parsePaddingSpec(spec string) (*paddingPolicy, error) {
 			return nil, fmt.Errorf("padding rule %q: band %q has an inverted range", spec, part)
 		}
 		if maxTotal > maxPaddingTotal {
-			return nil, fmt.Errorf("padding rule %q: band %q upper bound %d exceeds %d, the frame scratch headroom", spec, part, maxTotal, maxPaddingTotal)
+			return nil, fmt.Errorf("padding rule %q: band %q upper bound %d exceeds %d, the width of the header's pad field; a longer pad would be truncated and the reader would mistake padding for payload", spec, part, maxTotal, maxPaddingTotal)
 		}
 		if threshold < 0 {
 			// MIN-MAX shorthand: pad everything shorter than the lower bound,
