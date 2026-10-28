@@ -579,11 +579,18 @@ Things worth knowing before changing it:
   only object of that size on the wire, and therefore an exact signature for "a
   tunnel just closed". It is identified by its length field, so padding it is
   invisible to the reader and to older peers.
-- **Pad costs wire bytes, not window.** Padding is applied when a chunk is
-  rendered into a frame, after the reliable ring has already accounted for the
-  payload, and the receiver drops it before reassembly. A 20-byte write
-  therefore draws 20 bytes of send window and receive reassembly while leaving
-  400..600 bytes on the wire — the pad is bandwidth, not buffering.
+- **Pad is charged to the window, not only to the wire.** The session conn
+  frames every write before it reaches the ring, so the ring carries frames and
+  not payload: a 20-byte write occupies 406..606 bytes of send window, and the
+  peer's reassembly holds that frame until `XHTTPConn.Read` strips the pad.
+  Long-poll bodies are those frames verbatim. Worth remembering when a rule uses
+  a large band and `window_size_mb` is sized for payload rather than frames.
+- **The streaming transport wraps those frames in a second, padded frame.** The
+  22-byte envelope carries its own pad, computed over the bytes it takes from
+  the ring. For a lone small write the inner pad has already lifted the chunk
+  past the band's threshold, so the envelope adds its header and no pad and the
+  wire lands at 428..628 rather than 406..606. That inner pad is not redundant:
+  it is what keeps a session's shape intact if it falls back to long polling.
 - **Padding stops at `MIN`.** Bulk transfer keeps exact frame sizes. Covering
   those would cost a 20× overhead per record for a size an observer can already
   estimate from the tunnel's throughput.
@@ -606,14 +613,20 @@ on the same process-wide policy:
   rejected by `NewClient`/`NewServer` naming the field.
 - **Imperatively**, through `tunnel.SetPadding` at startup, with
   `tunnel.PaddingSpec` reading back the normalised rule (`400:400-600`, `off`).
-  `SetPadding` is an explicit override and is not compared against declarations.
+  An imperative call decides the rule for the process: a config field asking for
+  something else later fails at construction (empty, or the same rule, is fine),
+  so a deliberate override is never replaced without a word.
 
-If two configs in one process declare *different* rules, the second
-`NewClient`/`NewServer` fails instead of quietly reshaping the traffic of the
-instance that declared first — padding is a property of the process, not of a
-single client or server. The same rule spelled differently (`400-600` vs
-`400:400-600`, `none` vs `off`) compares equal, since the comparison uses the
-compiled band list.
+A declaration is checked against the rule actually in force rather than against
+a history of declarations. Restating the current rule is a no-op — there is
+nothing to disagree about — and asking for a different one fails naming whatever
+decided it: a `SetPadding` call, or an earlier config. That covers two configs
+in one process disagreeing (the second `NewClient`/`NewServer` fails instead of
+quietly reshaping the traffic of the instance that declared first — padding is a
+property of the process, not of a single client or server) and one config
+disagreeing with an explicit override. The same rule spelled differently
+(`400-600` vs `400:400-600`, `none` vs `off`) compares equal, since the
+comparison uses the compiled band list.
 
 ### TCP Brutal & bandwidth exchange
 
