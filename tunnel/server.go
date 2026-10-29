@@ -243,6 +243,11 @@ func describeAuth(r *http.Request) string {
 // carries the bare pre-shared key (Proxy-Authorization is hop-by-hop and Go's
 // ReverseProxy already strips it, which is exactly why this duplicate exists),
 // and X-Target names the internal address clients are dialing through.
+// tunnelHeaderPrefix is the namespace every protocol header lives under, in
+// lower case because header names reach the scrubber canonicalised and the
+// comparison is case-insensitive.
+const tunnelHeaderPrefix = "x-http-tunnel-"
+
 var tunnelRequestHeaders = []string{
 	"X-Auth-Token",
 	AuthNonceHeader,
@@ -270,6 +275,17 @@ var tunnelRequestHeaders = []string{
 func scrubTunnelRequest(req *http.Request) {
 	for _, h := range tunnelRequestHeaders {
 		req.Header.Del(h)
+	}
+	// The list above is hand-kept, so every header added to the protocol is
+	// one more chance to forget it and forward it to a third party. X-Pad,
+	// X-HTTP-Tunnel-Caps and X-HTTP-Tunnel-Bw each spent time on the wrong
+	// side of that gap. The prefix closes the class rather than the instance:
+	// everything in this namespace belongs to the protocol, whether or not
+	// someone remembered to name it.
+	for h := range req.Header {
+		if strings.HasPrefix(strings.ToLower(h), tunnelHeaderPrefix) {
+			req.Header.Del(h)
+		}
 	}
 	if req.Body != nil && req.Body != http.NoBody {
 		_ = req.Body.Close()

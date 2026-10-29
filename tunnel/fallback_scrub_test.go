@@ -93,6 +93,55 @@ func TestFallbackProxyScrubTunnelState(t *testing.T) {
 	}
 }
 
+// TestScrubDropsEveryProtocolHeader is the guard the test above cannot be.
+// That one asks whether scrubbing removed the names on the scrub list, which is
+// true by construction: it iterates the same list it is checking. This one
+// names the headers independently, so removing an entry from the list fails
+// here while passing there.
+//
+// X-Pad, X-HTTP-Tunnel-Caps and X-HTTP-Tunnel-Bw travelled to the disguise
+// target for exactly as long as this test did not exist — the only check was
+// the one derived from the list they were missing from.
+func TestScrubDropsEveryProtocolHeader(t *testing.T) {
+	// Written out rather than read from tunnelRequestHeaders: an independent
+	// copy that has to be kept in agreement is the whole point.
+	sent := []string{
+		AuthNonceHeader, AuthMACHeader, AuthBodyMACHeader,
+		PadHeader, CapsHeader, BwHeader, ProtoHeader,
+		"X-Auth-Token",
+		"X-Target", "X-Network", "X-Session-ID",
+		"X-Seq", "X-Ack", "X-Retry", "X-Downstream",
+		"X-Stream-Resume", "X-Stream-Probe-Window",
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://example.invalid/", strings.NewReader("frame bytes"))
+	for _, h := range sent {
+		req.Header.Set(h, "probe")
+	}
+	// A protocol header nobody has written yet, spelled the way this package
+	// spells its own: the prefix rule has to catch it without an entry.
+	req.Header.Set("X-HTTP-Tunnel-Not-Invented-Yet", "probe")
+	// Ordinary browser headers, which camouflage depends on keeping.
+	req.Header.Set("User-Agent", "curl/8.0.0")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	scrubTunnelRequest(req)
+
+	for _, h := range sent {
+		if v := req.Header.Get(h); v != "" {
+			t.Errorf("%s survived the scrub: %q", h, v)
+		}
+	}
+	if v := req.Header.Get("X-HTTP-Tunnel-Not-Invented-Yet"); v != "" {
+		t.Errorf("an unlisted header in the protocol's own namespace survived the scrub: %q", v)
+	}
+	if req.Header.Get("User-Agent") == "" || req.Header.Get("Accept-Language") == "" {
+		t.Error("ordinary headers must survive the scrub")
+	}
+	if len(req.Header) != 2 {
+		t.Errorf("scrubbed request still carries %d headers: %v", len(req.Header), req.Header)
+	}
+}
+
 // TestScrubTunnelRequestNoBody is the guard against a future refactor: the
 // scrubber must be safe to run on a request that already carries no body, and
 // it must not panic on http.NoBody.
