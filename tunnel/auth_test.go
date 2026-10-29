@@ -240,15 +240,22 @@ func TestNonceWindowSweepsWhenOverCapacity(t *testing.T) {
 // Client-side header helper
 // ---------------------------------------------------------------------------
 
-func TestSetAuthHeaders(t *testing.T) {
+func TestSignRequest(t *testing.T) {
+	testAuth := requestAuth{
+		sessionID: "session-A",
+		network:   "tcp",
+		target:    "127.0.0.1:8080",
+		method:    http.MethodGet,
+		proto:     offeredProtoVersion,
+	}
 	req, err := http.NewRequest(http.MethodGet, "http://example/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := setAuthHeaders(req, "psk", "session-A", "tcp", "127.0.0.1:8080"); err != nil {
-		t.Fatalf("setAuthHeaders: %v", err)
+	nonce, err := signRequest(req, "psk", testAuth)
+	if err != nil {
+		t.Fatalf("signRequest: %v", err)
 	}
-	nonce := req.Header.Get(AuthNonceHeader)
 	mac := req.Header.Get(AuthMACHeader)
 	if !validAuthNonce(nonce) {
 		t.Fatalf("nonce header = %q, want %d hex chars", nonce, authNonceBytes*2)
@@ -256,29 +263,41 @@ func TestSetAuthHeaders(t *testing.T) {
 	if !validHex(mac, sha256.Size) {
 		t.Fatalf("MAC header = %q, want %d hex chars", mac, sha256.Size*2)
 	}
-	// The MAC must be verifiable against the same session id, network and
-	// target that the request itself carries. That is the binding the server
-	// checks.
-	if !authMACMatches("psk", authMessage(nonce, "session-A", "tcp", "127.0.0.1:8080"), mac) {
+	// A signed request states how much pad it carries even when the answer
+	// is none, and the pad it states is the masked one: what is signed has
+	// to be what is on the wire.
+	if got := req.Header.Get(PadHeader); got == "" {
+		t.Fatal("a signed request states its pad, including when it carries none")
+	}
+	m := maskFor(reqMaskDomain, "psk", nonce)
+	wire := counters{pad: strconv.Itoa(int(maskU16(0, m, 16)))}
+	// The MAC must be verifiable against everything the request itself
+	// carries. That is the binding the server checks.
+	if !authMACMatches("psk", v3Message(nonce, testAuth, wire), mac) {
 		t.Fatal("the MAC does not cover the request's own session, network and target")
 	}
 
 	// Two requests from the same PSK must carry different nonces.
 	req2, _ := http.NewRequest(http.MethodGet, "http://example/", nil)
-	if err := setAuthHeaders(req2, "psk", "session-A", "tcp", "127.0.0.1:8080"); err != nil {
-		t.Fatalf("setAuthHeaders: %v", err)
+	nonce2, err := signRequest(req2, "psk", testAuth)
+	if err != nil {
+		t.Fatalf("signRequest: %v", err)
 	}
-	if req2.Header.Get(AuthNonceHeader) == nonce {
+	if nonce2 == nonce {
 		t.Fatal("two consecutive requests reused a nonce")
+	}
+	if req2.Header.Get(AuthMACHeader) == req.Header.Get(AuthMACHeader) {
+		t.Fatal("two consecutive requests produced the same MAC: the nonce is not being signed")
 	}
 }
 
-func TestSetAuthHeadersEmptyPassword(t *testing.T) {
+func TestSignRequestEmptyPassword(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "http://example/", nil)
-	if err := setAuthHeaders(req, "", "session-A", "tcp", "127.0.0.1:8080"); err != nil {
-		t.Fatalf("setAuthHeaders with an empty password: %v", err)
+	nonce, err := signRequest(req, "", requestAuth{sessionID: "session-A"})
+	if err != nil {
+		t.Fatalf("signRequest with an empty password: %v", err)
 	}
-	if req.Header.Get(AuthNonceHeader) != "" || req.Header.Get(AuthMACHeader) != "" {
+	if nonce != "" || req.Header.Get(AuthNonceHeader) != "" || req.Header.Get(AuthMACHeader) != "" {
 		t.Fatal("an open tunnel must not carry signed credentials")
 	}
 }
@@ -316,21 +335,68 @@ func authTestServer(t *testing.T, ctx context.Context, cfg ServerConfig) *url.UR
 
 // authHeaders builds a signed v2 request against the fixed session, network
 // and target. signingKey lets a case mint a digest under the wrong PSK.
+// authHeaders signs a request the way the client does and hands back its
+// headers. Building it through signRequest rather than assembling the MAC by
+// hand is what keeps a test honest: a request that advertises the current
+// generation has to be signed the way that generation signs, or the test is
+// only pinning that the server rejects its own forgery.
 func authHeaders(t *testing.T, signingKey string) map[string]string {
 	t.Helper()
 	const session, network, target = "auth-test-sid", "tcp", "127.0.0.1:7"
-	nonce, err := newAuthNonce()
+	return signedHeadersFor(t, signingKey, http.MethodGet, session, network, target, nil)
+}
+
+// signedHeadersFor signs the given request description and returns its headers.
+// The counters and the pad are left out, as the bandwidth exchange and a
+// session's first request leave them out.
+func signedHeadersFor(t *testing.T, signingKey, method, session, network, target string, extra map[string]string) map[string]string {
+	t.Helper()
+	req, err := http.NewRequest(method, "http://tunnel.invalid/stream", http.NoBody)
 	if err != nil {
-		t.Fatalf("newAuthNonce: %v", err)
+		t.Fatalf("new request: %v", err)
 	}
-	return map[string]string{
-		"X-Session-ID":  session,
-		"X-Network":     network,
-		"X-Target":      target,
-		ProtoHeader:     strconv.Itoa(offeredProtoVersion),
-		AuthNonceHeader: nonce,
-		AuthMACHeader:   authMAC(signingKey, authMessage(nonce, session, network, target)),
+	req.Header.Set("X-Session-ID", session)
+	req.Header.Set("X-Network", network)
+	req.Header.Set("X-Target", target)
+	// The generation this request advertises, which is what decides whether
+	// the server holds it to its signature at all.
+	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
+	for k, v := range extra {
+		req.Header.Set(k, v)
 	}
+	if _, err := signRequest(req, signingKey, requestAuth{
+		sessionID: session,
+		network:   network,
+		target:    target,
+		method:    method,
+		proto:     offeredProtoVersion,
+		bodyKind:  bodyKindFor(req),
+		// Signed as carrying nothing: an empty body has a digest, and it is
+		// not the same as no digest at all.
+		body: []byte{},
+	}); err != nil {
+		t.Fatalf("signRequest: %v", err)
+	}
+	// Copied out by name rather than ranging over req.Header: Header
+	// canonicalises the keys it is given, so a range would hand back
+	// "X-Http-Tunnel-Mac" where every caller — and the server — spells it
+	// AuthMACHeader. Get canonicalises the name it is asked for, so the
+	// constants still key into it correctly.
+	h := map[string]string{}
+	for _, name := range []string{
+		"X-Session-ID", "X-Network", "X-Target", ProtoHeader,
+		AuthNonceHeader, AuthMACHeader, AuthBodyMACHeader, CapsHeader, PadHeader,
+	} {
+		if v := req.Header.Get(name); v != "" {
+			h[name] = v
+		}
+	}
+	for k, v := range extra {
+		if v != "" {
+			h[k] = v
+		}
+	}
+	return h
 }
 
 func authTestStatus(t *testing.T, base *url.URL, headers map[string]string) int {

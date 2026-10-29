@@ -31,8 +31,8 @@ type bodyRecorder struct {
 	origin *url.URL
 
 	// stripCaps makes the proxy drop the capability header from responses, the
-	// way a middlebox that does not understand it would. The bodies and their
-	// X-Pad pass through untouched.
+	// way a middlebox that does not understand it would. The bodies pass
+	// through untouched.
 	stripCaps atomic.Bool
 	// stripRequestCaps does the same to requests, one direction only: the
 	// origin never learns the client can read a padded body, so it must not
@@ -40,14 +40,39 @@ type bodyRecorder struct {
 	// dangerous half of the case — the capability can be lost while the bytes
 	// that depend on it are not.
 	stripRequestCaps atomic.Bool
+	// psk lets the recorder read the masked pad length, the way its owner
+	// does and the way an observer cannot.
+	psk string
 
 	mu     sync.Mutex
 	bodies []recordedBody
 }
 
+// padSecret is the PSK the padding scenarios share. The recorder holds it so it
+// can read the pad length off the wire the way its owner does: the count
+// travels masked, which is the point, so a hop or an observer cannot read it.
+const padSecret = "pad-secret"
+
+// unmaskPadLen recovers the pad length a request or response travelled with.
+// With no key it is the plaintext value, which is what a peer that never
+// negotiated a PSK sends.
+func unmaskPadLen(psk, nonce, direction, wire string) int {
+	if wire == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(wire)
+	if err != nil {
+		return 0
+	}
+	if psk == "" || nonce == "" {
+		return n
+	}
+	return int(maskU16(n, maskFor(direction, psk, nonce), 16))
+}
+
 func newBodyRecorder(t *testing.T, originURL *url.URL) *bodyRecorder {
 	t.Helper()
-	rec := &bodyRecorder{origin: originURL}
+	rec := &bodyRecorder{origin: originURL, psk: padSecret}
 	transport := &http.Transport{}
 	t.Cleanup(transport.CloseIdleConnections)
 	rec.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,8 +82,13 @@ func newBodyRecorder(t *testing.T, originURL *url.URL) *bodyRecorder {
 			return
 		}
 		r.Body.Close()
-		pad, _ := parsePollPad(r.Header.Get(PadHeader))
+		reqNonce := r.Header.Get(AuthNonceHeader)
 		if len(sent) > 0 {
+			// The pad's length travels masked, so it is read the way its
+			// owner reads it and not the way an observer would: the recorder
+			// holds the key, which is the only thing that makes the header
+			// say anything at all.
+			pad := unmaskPadLen(rec.psk, r.Header.Get(AuthNonceHeader), reqMaskDomain, r.Header.Get(PadHeader))
 			rec.record(recordedBody{method: r.Method, body: sent, pad: pad})
 		}
 
@@ -70,7 +100,15 @@ func newBodyRecorder(t *testing.T, originURL *url.URL) *bodyRecorder {
 		r.URL.Scheme = rec.origin.Scheme
 		r.URL.Host = rec.origin.Host
 		r.Host = rec.origin.Host
-		r.Body = io.NopCloser(bytes.NewReader(sent))
+		// NoBody for an empty body, so the forwarded request still travels
+		// with a Content-Length it can name: a tunnel request signed over an
+		// unstated length is refused, and the hop in the middle is not where
+		// that rule should bite.
+		if len(sent) == 0 {
+			r.Body = http.NoBody
+		} else {
+			r.Body = io.NopCloser(bytes.NewReader(sent))
+		}
 		r.GetBody = nil
 		r.ContentLength = int64(len(sent))
 
@@ -86,7 +124,7 @@ func newBodyRecorder(t *testing.T, originURL *url.URL) *bodyRecorder {
 			return
 		}
 		if len(got) > 0 {
-			respPad, _ := parsePollPad(resp.Header.Get(PadHeader))
+			respPad := unmaskPadLen(rec.psk, reqNonce, respMaskDomain, resp.Header.Get(PadHeader))
 			rec.record(recordedBody{status: resp.StatusCode, body: got, pad: respPad, isReply: true})
 		}
 		for k, vv := range resp.Header {
@@ -365,9 +403,16 @@ func TestPollPaddingFollowsThePeerRatherThanLatching(t *testing.T) {
 				t.Fatalf("padded body is %d bytes, want 400..600", total)
 			}
 		}
+		if b.pad == len(b.body) {
+			// An idle poll: all pad, no frames. Its pad is still the
+			// transport's, so it belongs to the shape being counted here even
+			// though there is nothing inside it to measure.
+			fromTransport++
+			continue
+		}
 		frames := splitInnerFrames(t, body)
 		if len(frames) == 0 {
-			t.Fatalf("body %d holds no frame", requests)
+			t.Fatalf("body %d holds no frame: len=%d pad=%d", requests, len(b.body), b.pad)
 		}
 		framePadded := true
 		for _, f := range frames {

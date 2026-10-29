@@ -501,9 +501,9 @@ type meekVirtualConn struct {
 	closeRequested atomic.Bool // graceful stop: ship what is queued, then exit
 	kicked         atomic.Bool // set by Kick: the downlink must NOT send a close marker, so the client re-establishes
 	// padInTransport means the wire form itself carries the padding — the
-	// streaming envelope's pad field, or a poll body's leading pad announced
-	// by X-Pad — so the frame layer must not pad as well. One pad per wire
-	// object, otherwise the two stack and the total overshoots the band.
+	// streaming envelope's pad field, or a poll body's leading pad — so the
+	// frame layer must not pad as well. One pad per wire object, otherwise
+	// the two stack and the total overshoots the band.
 	//
 	// False is the conservative default: the frame layer pads (its pad field
 	// is understood by every peer, so this costs nothing on compatibility) and

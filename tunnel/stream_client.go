@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -566,17 +567,35 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	})
 	defer probeTimer.Stop()
 
-	req, _ := http.NewRequestWithContext(roundCtx, http.MethodGet, a.reqURL, nil)
+	// A POST, carrying a body of nothing but pad, exactly like an idle poll.
+	// The two are the same request as far as this side is concerned: a hop
+	// that strips X-Downstream — which is the whole point of this probe —
+	// hands the origin an idle poll and gets one answered, and the client then
+	// falls back on seeing no X-Downstream-Accepted. A GET would have landed
+	// in the same place carrying no body at all, which is the one shape no
+	// padding rule can smooth and the one the signature refuses to vouch for.
+	padded, probePad, padErr := padPollBody(nil)
+	if padErr != nil {
+		// A probe that cannot draw its padding is one this side will not
+		// send, rather than one it sends carrying less than it says.
+		return false, padErr
+	}
+	req, _ := http.NewRequestWithContext(roundCtx, http.MethodPost, a.reqURL, nil)
 	req.Header.Set("X-Downstream", "1")
 	req.Header.Set("X-Stream-Probe-Window", strconv.Itoa(int(probeWindow.Seconds())))
+	req.Body = io.NopCloser(bytes.NewReader(padded))
+	req.GetBody = nil
+	req.ContentLength = int64(len(padded))
+	// Reconnect within the same server session: X-Ack identifies downlink bytes
+	// already delivered. Uplink resume is carried by each frame's sequence and
+	// acknowledgement metadata. It is handed to the signer rather than written
+	// here, because it is one of the counters the signature covers.
+	resumeAck := ""
 	if *lastDown > 0 {
-		// Reconnect within the same server session: X-Ack identifies downlink
-		// bytes already delivered. Uplink resume is carried by each frame's
-		// sequence and acknowledgement metadata.
-		req.Header.Set("X-Ack", strconv.FormatUint(*lastDown, 10))
+		resumeAck = strconv.FormatUint(*lastDown, 10)
 		req.Header.Set("X-Retry", "1")
 	}
-	if err := applyStreamRequestHeaders(req, a.cfg, a.targetAddr, a.network, a.sessionID); err != nil {
+	if err := applyStreamRequestHeaders(req, a.cfg, a.targetAddr, a.network, a.sessionID, resumeAck, padded, probePad); err != nil {
 		return false, err
 	}
 	// WroteRequest separates the two phases that share the probe budget. If the
@@ -702,12 +721,19 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 			failRound(uerr)
 			return
 		}
-		if err := applyStreamRequestHeaders(upReq, a.cfg, a.targetAddr, a.network, a.sessionID); err != nil {
+		// Set before signing, not after: the content type is what says this
+		// request carries a continuous stream, and the signature covers that
+		// statement, so it has to be in place by the time it is made.
+		upReq.Header.Set("Content-Type", streamContentType)
+		upReq.Header.Set("X-Stream-Resume", "1")
+		// A stream upload carries no leading pad: its body has no end to
+		// pad to, which is the same reason its kind says it is not digestible
+		// whole. It still states that, so a hop that splices a pad onto a
+		// stream is refused instead of being believed.
+		if err := applyStreamRequestHeaders(upReq, a.cfg, a.targetAddr, a.network, a.sessionID, "", nil, 0); err != nil {
 			failRound(err)
 			return
 		}
-		upReq.Header.Set("Content-Type", streamContentType)
-		upReq.Header.Set("X-Stream-Resume", "1")
 		upResp, uerr := client.Do(upReq)
 		if uerr != nil {
 			failRound(uerr)
@@ -979,7 +1005,12 @@ func (a streamDialArgs) isolatedClient() *http.Client {
 
 // applyStreamRequestHeaders sets the headers shared by the streaming GET and
 // its companion POST (auth, camouflage, routing).
-func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, network, sessionID string) error {
+// applyStreamRequestHeaders signs one stream-mode request. pad is the length
+// of the leading pad its body carries, and it is signed with the request: a
+// downlink probe is a POST whose whole body is that pad, so without it the
+// origin would count the padding as uplink bytes and the acknowledgement it
+// hands back would be one this side's send buffer cannot vouch for.
+func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, network, sessionID, ack string, body []byte, pad int) error {
 	req.Header.Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Accept", "*/*")
@@ -990,19 +1021,33 @@ func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, n
 		req.Host = cfg.SNI
 	}
 	req.Header.Set("User-Agent", clientUserAgent)
-	// Signed credentials: the PSK itself never goes on the wire, so a captured
-	// request leaks nothing, and the per-request nonce makes replay a no-op.
-	if err := setAuthHeaders(req, cfg.Password, sessionID, network, targetAddr); err != nil {
-		return fmt.Errorf("tunnel: could not generate a nonce: %w", err)
-	}
 	req.Header.Set("X-Target", targetAddr)
 	req.Header.Set("X-Network", network)
 	req.Header.Set("X-Session-ID", sessionID)
 	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
-	// Announces that this side reads the transport-level pad, which is what
-	// lets the frame layer stop padding: a streamed frame then carries one pad
-	// (the envelope's) instead of an envelope header on top of an already
-	// padded frame. An origin that ignores the header keeps the old shape.
-	req.Header.Set(CapsHeader, CapPadBody)
+	// The PSK itself never goes on the wire, so a captured request leaks
+	// nothing, and the per-request nonce makes replay a no-op.
+	//
+	// The kind is drawn from the same input the origin will draw it from, so
+	// the two agree without a header saying which: a downlink request is a
+	// bounded body and is signed whole, and an upload is a continuous stream
+	// with no end to digest, which it says in the signed message rather than
+	// by leaving a header out.
+	if _, err := signRequest(req, cfg.Password, requestAuth{
+		sessionID: sessionID,
+		network:   network,
+		target:    targetAddr,
+		method:    req.Method,
+		proto:     offeredProtoVersion,
+		caps:      CapPadBody,
+		ack:       ack,
+		pad:       strconv.Itoa(pad),
+		bodyKind:  bodyKindFor(req),
+		body:      body,
+	}); err != nil {
+		return fmt.Errorf("tunnel: could not generate a nonce: %w", err)
+	}
+	// The capability is written by the signer too, since it is signed: an
+	// origin that ignores the header keeps the old shape.
 	return nil
 }

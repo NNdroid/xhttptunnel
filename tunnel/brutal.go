@@ -51,20 +51,22 @@ const (
 	// target, which is a clean non-200 rather than a partial exchange.
 	CapsHeader  = "X-HTTP-Tunnel-Caps"
 	CapBrutalBw = "brutal-bw"
-	// CapPadBody advertises that this side reads a poll body whose first
-	// X-Pad bytes are padding to be dropped, not payload. Both directions are
-	// gated on it: a body padded for a peer that does not understand the
-	// header would be fed straight into the receive ring as data.
+	// PadHeader carries the byte count of a poll body's leading pad. It is
+	// sent on requests and responses alike. The count travels masked, and it
+	// is bound into the signature: an observer who reads the header learns
+	// nothing about the payload inside the body, and a hop that drops or
+	// alters it is refused rather than being believed.
+	PadHeader = "X-Pad"
+	// CapPadBody advertises that this side reads a poll body with a leading
+	// pad in it, and can tell one from a body that has none. Both directions
+	// are gated on it: a body padded for a peer that does not look for the pad
+	// would be fed straight into the receive ring as data.
 	//
 	// It also settles how padding is placed on the wire. Once both ends have
 	// said they read the transport-level pad, the frame layer stops padding
 	// (padInTransport) and the wire object carries exactly one pad: the
 	// streaming envelope's, or the poll body's prefix.
 	CapPadBody = "pad-body"
-	// PadHeader carries the byte count of a poll body's leading pad. It is
-	// sent on requests and responses alike; zero or absent means the body
-	// starts with frames.
-	PadHeader = "X-Pad"
 
 	// TCP_BRUTAL_PARAMS. A private option number owned by the module, not
 	// published by any standards body, so it is named here rather than

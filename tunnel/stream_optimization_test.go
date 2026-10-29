@@ -103,7 +103,7 @@ func TestStreamDialWaitsForUplinkAdmission(t *testing.T) {
 	handler := s.Handler()
 	postSeen := make(chan struct{}, 1)
 	host := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
+		if r.Header.Get("Content-Type") == streamContentType {
 			postSeen <- struct{}{}
 			_ = http.NewResponseController(w).EnableFullDuplex()
 			http.Error(w, "refused", http.StatusProxyAuthRequired)
@@ -168,7 +168,7 @@ func TestStreamResumePreservesBytesAfterRepeatedBreaks(t *testing.T) {
 	faults.Store(3)
 	handler := s.Handler()
 	host := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
+		if r.Header.Get("X-Downstream") == "1" {
 			w = &interruptedResponse{ResponseWriter: w, faults: &faults}
 		}
 		handler.ServeHTTP(w, r)
@@ -262,7 +262,7 @@ func TestStreamProbeAdaptiveWindowSucceedsOnSlowHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	rt := streamTestTransport(func(r *http.Request) (*http.Response, error) {
-		if r.Method == http.MethodPost {
+		if r.Header.Get("Content-Type") == streamContentType {
 			io.Copy(io.Discard, r.Body)
 			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(nil)), Request: r}, nil
 		}

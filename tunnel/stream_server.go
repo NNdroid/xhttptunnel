@@ -173,7 +173,7 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 // streaming is the one "almost duplex" shape legacy proxies tolerate, so the
 // deployment requirements are identical to the long-poll mode's
 // (X-Accel-Buffering: no + response streaming enabled).
-func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState, vConn *meekVirtualConn, sessionID string, created bool) {
+func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState, vConn *meekVirtualConn, sessionID string, created bool, cred requestCred) {
 	if r.Context().Err() != nil {
 		return
 	}
@@ -191,7 +191,9 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	// where a stale X-Ack (referring to the old session) would discard the
 	// first bytes and misalign the frame stream; the client detects the
 	// recreated session via hello.seq == 0 and resets its own bookkeeping.
-	if ack, err := strconvParseUint(r.Header.Get("X-Ack")); err == nil && ack > 0 && !created {
+	// The counter arrives masked, under the key that signed the request.
+	_, ack, _, err := decodeCounters(cred.mask, countersFrom(r))
+	if err == nil && ack > 0 && !created {
 		vConn.noteDownPeerAck(ack)
 	}
 
@@ -211,7 +213,7 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	h.Set("Pragma", "no-cache")
 	h.Set("Expires", "0")
 	h.Set("X-Accel-Buffering", "no")
-	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Origin", st.corsAllowOrigin())
 	h.Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Downstream-Accepted, X-HTTP-Tunnel-Caps")
 	h.Set("X-Downstream-Accepted", "1")
 	h.Set("X-Stream-Uplink-Sync", "1")

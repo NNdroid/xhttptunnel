@@ -76,6 +76,19 @@ type AuthRejected struct {
 
 func (AuthRejected) Kind() string { return "auth.rejected" }
 
+// BodyTampered fires when a request body does not match the signature that
+// arrived with it. The signature covers the padding too, so this is never a
+// client bug: something between the two ends rewrote the bytes. It is the
+// signal that a hop the tunnel traverses is modifying traffic, and the session
+// is closed when it fires.
+type BodyTampered struct {
+	SessionID string
+	Remote    string // client address as seen by the server
+	Bytes     int    // the body length the signature was checked against
+}
+
+func (BodyTampered) Kind() string { return "body.tampered" }
+
 // SessionLimitRejected fires when the server refuses a new session because
 // ServerConfig.MaxSessions sessions are already open.
 type SessionLimitRejected struct {

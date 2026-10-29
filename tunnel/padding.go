@@ -22,8 +22,8 @@ import (
 //     pads. A frame's own pad field is understood by every peer, so this is the
 //     compatible default: nothing has to be negotiated to get it.
 //   - once both ends advertise CapPadBody, padding moves out to the transport —
-//     the envelope's own pad field, or a poll body's leading X-Pad bytes — and
-//     the frame layer leaves its pad field at zero.
+//     the envelope's own pad field, or a poll body's leading pad — and the
+//     frame layer leaves its pad field at zero.
 //
 // Either way the rule measures the object as it lands on the wire, headers
 // included, so a 20-byte keystroke leaves a 400..600-byte object rather than a

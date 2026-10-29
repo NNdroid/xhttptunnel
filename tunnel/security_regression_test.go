@@ -62,7 +62,7 @@ func TestStreamDownlinkStopsOnFailure(t *testing.T) {
 			vc.lastActive.Store(1)
 			w := &failingStreamResponse{header: make(http.Header), failWrite: tc.write, failFlush: tc.flush, cancel: cancel, vc: vc}
 			r := httptest.NewRequest(http.MethodGet, "/stream", nil).WithContext(ctx)
-			serveStreamDownlink(w, r, newServerState(1), vc, "idle", false)
+			serveStreamDownlink(w, r, newServerState(1), vc, "idle", false, requestCred{})
 			if w.writes > 2 {
 				t.Fatalf("abandoned handler kept writing: %d writes", w.writes)
 			}

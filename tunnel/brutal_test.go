@@ -628,22 +628,11 @@ func bwTestServer(t *testing.T, ctx context.Context, cfg ServerConfig) *url.URL 
 func bwSignedHeaders(t *testing.T, key, target, advertised string) map[string]string {
 	t.Helper()
 	const session = "bw-exchange-sid"
-	nonce, err := newAuthNonce()
-	if err != nil {
-		t.Fatalf("newAuthNonce: %v", err)
-	}
-	h := map[string]string{
-		"X-Session-ID":  session,
-		"X-Network":     "tcp",
-		"X-Target":      target,
-		ProtoHeader:     strconv.Itoa(offeredProtoVersion),
-		AuthNonceHeader: nonce,
-		AuthMACHeader:   authMAC(key, authMessage(nonce, session, "tcp", target)),
-	}
+	extra := map[string]string{}
 	if advertised != "" {
-		h[BwHeader] = advertised
+		extra[BwHeader] = advertised
 	}
-	return h
+	return signedHeadersFor(t, key, http.MethodPost, session, "tcp", target, extra)
 }
 
 func bwPost(t *testing.T, base *url.URL, headers map[string]string) *http.Response {

@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
@@ -246,6 +247,7 @@ var tunnelRequestHeaders = []string{
 	"X-Auth-Token",
 	AuthNonceHeader,
 	AuthMACHeader,
+	AuthBodyMACHeader,
 	"X-Target",
 	"X-Network",
 	"X-Session-ID",
@@ -288,7 +290,26 @@ func scrubTunnelRequest(req *http.Request) {
 // endpoint is upgraded. To retire the legacy path set min_proto_version to 2:
 // a v2 client that does not sign is refused below rather than downgraded, so
 // that setting genuinely closes the bare-token hole.
-func (st *serverState) authorize(r *http.Request, expected string) bool {
+// requestCred records which key authenticated a request, under which nonce, and
+// at which generation. The counters and the body are readable only with the key
+// that signed them, and a server can hold several keys at once, so the handlers
+// downstream need the one this request matched rather than any.
+type requestCred struct {
+	key   string
+	nonce string
+	proto int
+	// mask unmasks the request's counters. Nil means an older generation:
+	// those travel in the clear and are not signed.
+	mask []byte
+}
+
+// signed reports whether this request binds its metadata and its body, which is
+// what lets the handlers trust what they read.
+func (c requestCred) signed() bool {
+	return c.key != "" && c.proto >= bodyProtoVersion
+}
+
+func (st *serverState) authorize(r *http.Request, expected string) (requestCred, bool) {
 	if requiresMAC(r) {
 		// This client announced the signed generation, so it commits to it: the
 		// bare-token path is closed to it. Without this rule min_proto_version
@@ -301,11 +322,14 @@ func (st *serverState) authorize(r *http.Request, expected string) bool {
 		// A legacy-generation client that still signs is a migration hybrid.
 		// Take the signature; if it is wrong, fall through to the bare token
 		// rather than treating it as a protocol error.
-		if st.authorizeByMAC(r, expected, mac) {
-			return true
+		if cred, ok := st.authorizeByMAC(r, expected, mac); ok {
+			return cred, true
 		}
 	}
-	return st.authorizeByToken(r, expected)
+	if st.authorizeByToken(r, expected) {
+		return requestCred{}, true
+	}
+	return requestCred{}, false
 }
 
 // requiresMAC reports whether a request announced the signed protocol
@@ -313,20 +337,40 @@ func (st *serverState) authorize(r *http.Request, expected string) bool {
 // and is not held to it, which is what keeps the dual-mode window open.
 func requiresMAC(r *http.Request) bool {
 	v, err := strconv.Atoi(r.Header.Get(ProtoHeader))
-	return err == nil && v >= offeredProtoVersion
+	return err == nil && v >= authProtoVersion
 }
 
-func (st *serverState) authorizeByMAC(r *http.Request, expected, mac string) bool {
+func (st *serverState) authorizeByMAC(r *http.Request, expected, mac string) (requestCred, bool) {
 	nonce := r.Header.Get(AuthNonceHeader)
 	if !validAuthNonce(nonce) {
-		return false
+		return requestCred{}, false
 	}
-	// The session id, network and target are bound into the signature so a
-	// valid request cannot be replayed against a different session, aimed at
-	// a different address, or switched to a different transport protocol.
-	// They are read from the headers, not from local state, so the value
-	// verified here is exactly the value the dispatcher uses.
-	msg := authMessage(nonce, r.Header.Get("X-Session-ID"), r.Header.Get("X-Network"), r.Header.Get("X-Target"))
+	// Everything the signature covers is read from the headers, not from local
+	// state, so the value verified here is exactly the value the dispatcher
+	// uses — the counters included, in the masked form they travel.
+	proto, _ := strconv.Atoi(r.Header.Get(ProtoHeader))
+	var msg []byte
+	if proto >= bodyProtoVersion {
+		msg = v3Message(nonce, requestAuth{
+			sessionID: r.Header.Get("X-Session-ID"),
+			network:   r.Header.Get("X-Network"),
+			target:    r.Header.Get("X-Target"),
+			method:    r.Method,
+			proto:     proto,
+			// The kind is not read from a header of its own: it is the
+			// conclusion this side draws from the same routing input it will
+			// act on. A hop that adds or removes that input makes the two
+			// ends draw different conclusions, and the signature is what
+			// catches it.
+			bodyKind: bodyKindFor(r),
+		}, countersFrom(r))
+	} else {
+		// The session id, network and target are bound into the signature so a
+		// valid request cannot be replayed against a different session, aimed
+		// at a different address, or switched to a different transport
+		// protocol.
+		msg = authMessage(nonce, r.Header.Get("X-Session-ID"), r.Header.Get("X-Network"), r.Header.Get("X-Target"))
+	}
 	for _, tok := range splitTokens(expected) {
 		if tok == "" {
 			continue
@@ -335,10 +379,40 @@ func (st *serverState) authorizeByMAC(r *http.Request, expected, mac string) boo
 			// Consume the nonce only after the signature checks out: a caller
 			// who cannot sign must not be able to fill the window and evict
 			// legitimate requests by flooding it.
-			return st.nonces.mark(nonce)
+			if !st.nonces.mark(nonce) {
+				return requestCred{}, false
+			}
+			cred := requestCred{key: tok, nonce: nonce, proto: proto}
+			if proto >= bodyProtoVersion {
+				cred.mask = maskFor(reqMaskDomain, tok, nonce)
+			}
+			return cred, true
 		}
 	}
-	return false
+	return requestCred{}, false
+}
+
+// countersFrom reads the three sequence fields exactly as they arrived, which
+// is the form they are signed and verified in.
+func countersFrom(r *http.Request) counters {
+	return counters{
+		seq: r.Header.Get("X-Seq"),
+		ack: r.Header.Get("X-Ack"),
+		pad: r.Header.Get(PadHeader),
+	}
+}
+
+// bodyKindFor says what kind of body this request is carrying, read from the
+// one input that decides where the request is routed. It has to agree with the
+// kind the sender signed, or the signature does not verify: a hop that labels a
+// bounded body a stream would otherwise have its bytes read unverified, and
+// one that labels a stream a poll would have it refused, which is the answer
+// either way.
+func bodyKindFor(r *http.Request) string {
+	if r.Header.Get("Content-Type") == streamContentType {
+		return bodyKindStream
+	}
+	return bodyKindPoll
 }
 
 func (st *serverState) authorizeByToken(r *http.Request, expected string) bool {
@@ -472,14 +546,21 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			nginxError(w, http.StatusBadRequest)
 			return
 		}
-		if xl.expectedToken != "" && !st.authorize(r, xl.expectedToken) {
-			logger.Warn("❌ [HTTP] rejected request: bad password or unauthorized",
-				zap.String("remote", r.RemoteAddr),
-				zap.Bool("signed", r.Header.Get(AuthMACHeader) != ""),
-			)
-			st.events.emit(AuthRejected{Remote: r.RemoteAddr, Path: r.URL.Path})
-			nginxError(w, http.StatusProxyAuthRequired)
-			return
+		var cred requestCred
+		if xl.expectedToken != "" {
+			// The credential a request arrived with is what decides how much of
+			// it can be trusted: a v3 request signed its counters and its body,
+			// and the handlers below read them through this.
+			var ok bool
+			if cred, ok = st.authorize(r, xl.expectedToken); !ok {
+				logger.Warn("❌ [HTTP] rejected request: bad password or unauthorized",
+					zap.String("remote", r.RemoteAddr),
+					zap.Bool("signed", r.Header.Get(AuthMACHeader) != ""),
+				)
+				st.events.emit(AuthRejected{Remote: r.RemoteAddr, Path: r.URL.Path})
+				nginxError(w, http.StatusProxyAuthRequired)
+				return
+			}
 		}
 
 		if target == TargetBwExchange {
@@ -523,11 +604,17 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// client would receive frames nobody pads.
 		vConn.padInTransport.Store(hasCapValue(r.Header.Get(CapsHeader), CapPadBody))
 
-		// Stream-mode downlink: one persistent GET whose response body is a
-		// continuous frame stream (SSE-style — the one full-duplex-ish shape
+		// Stream-mode downlink: one persistent request whose response body is
+		// a continuous frame stream (SSE-style — the one full-duplex-ish shape
 		// old proxies tolerate). Must run before the poll path below.
-		if r.Method == http.MethodGet && r.Header.Get("X-Downstream") == "1" {
-			serveStreamDownlink(w, r, st, vConn, sessionID, created)
+		//
+		// It is the X-Downstream header that names it, not its method: every
+		// request this side answers is a POST, the streaming ones included.
+		// A streaming request that arrives without the header — a hop did not
+		// understand it — degrades into an ordinary idle poll, and the client
+		// falls back on its own.
+		if r.Header.Get("X-Downstream") == "1" {
+			serveStreamDownlink(w, r, st, vConn, sessionID, created, cred)
 			return
 		}
 		// Stream-mode uplink: one long POST whose body is a continuous frame
@@ -556,42 +643,48 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		}
 		defer vConn.uploads.Add(-1)
 
-		cSeqStr := r.Header.Get("X-Seq")
-		cSeq := uint64(0)
-		if cSeqStr != "" {
-			var err error
-			cSeq, err = strconv.ParseUint(cSeqStr, 10, 64)
-			if err != nil {
-				nginxError(w, http.StatusBadRequest)
-				return
-			}
+		// The three sequence fields are read as they travelled and then
+		// unmasked with the key that signed them, so their signature is
+		// verified in auth and their meaning recovered here — and a request
+		// that was not signed carries them in the clear, which decodeCounters
+		// handles by leaving them alone.
+		wire := countersFrom(r)
+		cSeq, cAck, upPad, err := decodeCounters(cred.mask, wire)
+		if err != nil {
+			logger.Warn("❌ [HTTP] rejected request: unreadable sequence fields", zap.Error(err))
+			nginxError(w, http.StatusBadRequest)
+			return
 		}
-		if cSeqStr == "" && vConn.consumedUpSeq() > 0 {
+		if cred.signed() && wire.pad == "" {
+			// A signed request made a statement about its pad and the
+			// signature vouches for that statement, not for a pad of zero.
+			// Reading a missing header as "there is none" is the answer that
+			// hands the padding to the reassembly as payload, so refuse
+			// instead — a hop that does not forward the header cannot
+			// forward this request at all.
+			nginxError(w, http.StatusBadRequest)
+			return
+		}
+		if wire.seq == "" && vConn.consumedUpSeq() > 0 {
 			// X-Seq missing but the server already consumed uplink bytes:
 			// the header was stripped, and the alignment logic would
 			// misplace the body.
 			nginxError(w, http.StatusBadRequest)
 			return
 		}
-		cAck, _ := strconv.ParseUint(r.Header.Get("X-Ack"), 10, 64)
 		if !vConn.writeBuf.validAck(cAck) {
 			nginxError(w, http.StatusBadRequest)
 			return
 		}
 		vConn.noteDownPeerAck(cAck)
 
-		// A client that advertises pad-body reads a leading X-Pad, which is
-		// what lets this side skip the padding on its request and put padding
-		// on its response. Both directions ride on the one capability:
-		// padding a body for a peer that does not know the header would land
-		// in its receive ring as payload.
+		// A client that advertises pad-body prefixes its bodies with a pad
+		// that says where it ends, which is what lets this side skip the
+		// padding on the request and put padding on the response. Both
+		// directions ride on the one capability: padding a body for a peer
+		// that is not looking for it would land in its receive ring as
+		// payload.
 		clientPadsBody := hasCapValue(r.Header.Get(CapsHeader), CapPadBody)
-		upPad, err := parsePollPad(r.Header.Get(PadHeader))
-		if err != nil {
-			logger.Warn("❌ [HTTP] rejected request: unreadable padding header", zap.Error(err))
-			nginxError(w, http.StatusBadRequest)
-			return
-		}
 
 		bufPtr := sendBuf.Get().(*[]byte)
 		readChunk := *bufPtr
@@ -600,33 +693,92 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		currentSeq := cSeq
 		var myUpAck uint64
 
-		// The declared padding is not uplink data: drop it before the first
-		// frame byte so the sequence arithmetic sees only frames.
-		if skipErr := skipPollPad(r.Body, upPad); skipErr != nil {
-			safelyPutSendBuf(bufPtr)
-			logger.Warn("⚠️ [HTTP] could not skip the request's declared padding", zap.Error(skipErr))
-			nginxError(w, http.StatusBadRequest)
-			return
-		}
+		if cred.signed() {
+			// A signed request promises its length, so the body is read whole
+			// and checked before a byte of it can reach the ring: the point of
+			// the digest is that a rewritten body is refused rather than
+			// reassembled.
+			bodyLen := int(r.ContentLength)
+			if bodyLen < 0 || bodyLen > len(readChunk) {
+				safelyPutSendBuf(bufPtr)
+				logger.Warn("❌ [HTTP] rejected request: body length missing or too long",
+					zap.String("session", sessionID),
+					zap.Int64("content_length", r.ContentLength),
+				)
+				nginxError(w, http.StatusBadRequest)
+				return
+			}
+			n, readErr := io.ReadFull(r.Body, readChunk[:bodyLen])
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				safelyPutSendBuf(bufPtr)
+				logger.Warn("⚠️ [HTTP] failed to read uplink body", zap.Error(readErr))
+				nginxError(w, http.StatusBadRequest)
+				return
+			}
+			digest := sha256.Sum256(readChunk[:n])
+			if !bodyMACMatches(cred.key, cred.nonce, &digest, r.Header.Get(AuthBodyMACHeader)) {
+				safelyPutSendBuf(bufPtr)
+				// The pad is part of the signed bytes, so a mismatch is not a
+				// client bug: something between the two ends changed them.
+				// Say so, and end the session rather than go on reassembling
+				// from a stream whose other half cannot be trusted.
+				logger.Warn("❌ [HTTP] rejected request: body does not match its signature, closing the session",
+					zap.String("session", sessionID),
+					zap.Int("body", n),
+				)
+				st.events.emit(BodyTampered{SessionID: sessionID, Remote: r.RemoteAddr, Bytes: n})
+				vConn.setCloseErr(errRequestBodyTampered)
+				vConn.Close()
+				nginxError(w, http.StatusBadRequest)
+				return
+			}
+			// The pad's length is one the signature vouched for, so the
+			// boundary cannot disagree with the bytes just verified.
+			frames, err := splitPollBody(readChunk[:n], upPad)
+			if err != nil {
+				safelyPutSendBuf(bufPtr)
+				logger.Warn("❌ [HTTP] rejected request: body declares a pad it cannot carry",
+					zap.String("session", sessionID),
+					zap.Int("pad", upPad),
+					zap.Int("body", n),
+				)
+				nginxError(w, http.StatusBadRequest)
+				return
+			}
+			if len(frames) > 0 {
+				myUpAck, errBody = vConn.PutReadDataContext(r.Context(), cSeq, frames)
+				totalUpBytes = len(frames)
+			}
+		} else {
+			// The leading padding is not uplink data: drop it before the
+			// first frame byte so the sequence arithmetic sees only frames.
+			frameReader, skipErr := skipPollPad(r.Body, upPad)
+			if skipErr != nil {
+				safelyPutSendBuf(bufPtr)
+				logger.Warn("⚠️ [HTTP] could not skip the request's leading padding", zap.Error(skipErr))
+				nginxError(w, http.StatusBadRequest)
+				return
+			}
 
-		for {
-			n, err := r.Body.Read(readChunk)
-			if n > 0 {
-				myUpAck, errBody = vConn.PutReadDataContext(r.Context(), currentSeq, readChunk[:n])
-				if errBody != nil {
+			for {
+				n, err := frameReader.Read(readChunk)
+				if n > 0 {
+					myUpAck, errBody = vConn.PutReadDataContext(r.Context(), currentSeq, readChunk[:n])
+					if errBody != nil {
+						break
+					}
+					currentSeq += uint64(n)
+					totalUpBytes += n
+				}
+				if err != nil {
+					if err != io.EOF {
+						errBody = err
+					}
 					break
 				}
-				currentSeq += uint64(n)
-				totalUpBytes += n
 			}
-			if err != nil {
-				if err != io.EOF {
-					errBody = err
-				}
-				break
-			}
+			r.Body.Close()
 		}
-		r.Body.Close()
 		safelyPutSendBuf(bufPtr)
 
 		if errBody != nil {
@@ -676,17 +828,20 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// lives; poll responses must not piggyback downlink alongside it or
 		// the two writers would split the stream.
 		streamOwns := vConn.downWriterActive()
-		if r.Method == http.MethodGet {
-			// A poll GET takes the cursor even from a live streaming writer:
-			// that is the mode-downgrade path. The client abandons the stream
-			// when the path cannot sustain it, but the stale writer can stay
-			// attached for as long as its socket lives. Guarding this behind
-			// !downWriterActive made the takeover unreachable in exactly the
-			// case it exists for, and every poll answered an immediate empty
-			// 200 — no long poll, no data — turning the downgrade into a
+		if totalUpBytes == 0 {
+			// An idle poll takes the cursor even from a live streaming
+			// writer: that is the mode-downgrade path. The client abandons the
+			// stream when the path cannot sustain it, but the stale writer can
+			// stay attached for as long as its socket lives. Guarding this
+			// behind !downWriterActive made the takeover unreachable in exactly
+			// the case it exists for, and every poll answered an immediate
+			// empty 200 — no long poll, no data — turning the downgrade into a
 			// request storm. Acquiring also rewinds the cursor to the peer's
 			// ack, which recovers the downlink bytes an abandoned probe
 			// response already consumed.
+			//
+			// It is the body's contents that make a poll idle, not its method:
+			// an idle poll is a POST too, carrying a body of nothing but pad.
 			ticket := &downWriterTicket{}
 			vConn.AcquireDownWriter(ticket)
 			defer vConn.ReleaseDownWriter(ticket)
@@ -730,12 +885,9 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
 		w.Header().Set("X-Accel-Buffering", "no")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		// X-Pad has to be readable by whatever consumes this response: a
-		// browser-shaped client that cannot see it would read the leading pad
-		// as frames. The capability header matters for the same reason — it is
-		// how the client learns the pad is there at all.
-		w.Header().Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Pad, X-HTTP-Tunnel-Caps, Content-Length")
+		w.Header().Set("Access-Control-Allow-Origin", st.corsAllowOrigin())
+		// The exposed list is set further down, together with the counters, so
+		// the response signature's name is added with the signature.
 
 		// Pad the response for a client that announced pad-body. The pad goes
 		// in front so the client can skip it with a bounded read and stream
@@ -744,6 +896,9 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// pick out of the distribution.
 		respPad := 0
 		if clientPadsBody {
+			// If the pad cannot be drawn, the body goes out with its frames
+			// bare and its size unpadded — the client reads either shape, so
+			// this costs the shape and not the stream.
 			padded, pad, padErr := padPollBody(downData)
 			if padErr != nil {
 				logger.Warn("⚠️ [HTTP] could not draw response padding, sending this body bare", zap.Error(padErr))
@@ -752,21 +907,35 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			}
 		}
 
-		w.Header().Set("X-Ack", strconv.FormatUint(myUpAck, 10))
-		w.Header().Set("X-Seq", strconv.FormatUint(myDownSeq, 10))
-		w.Header().Set("Content-Length", strconv.Itoa(len(downData)))
+		// The counters leave under a mask of their own, keyed to the request's
+		// nonce, and the signature covers the masked strings: what is signed
+		// has to be what travels. The pad's length goes with them, so it is
+		// unreadable on the wire and unforgeable without the key.
+		respWire := responseCounters(myDownSeq, myUpAck, respPad, nil)
+		caps := ""
 		// Echo the capability only to a peer that announced it. pad-body is a
-		// two-way agreement, and announcing it unconditionally would invite a
-		// client whose request header a middlebox stripped to start prefixing
-		// its bodies with an X-Pad this side has no record of expecting — if
-		// that middlebox drops X-Pad too, the prefix is read as frames. Failing
-		// the handshake closed keeps both ends on frame-level padding instead.
+		// two-way agreement: announcing it to a client whose request header a
+		// middlebox stripped would invite that client to start prefixing its
+		// bodies with a pad this side has no record of expecting. The echo is
+		// also what tells the client to look for a pad at all, so it has to
+		// be true.
 		if clientPadsBody {
-			w.Header().Set(CapsHeader, CapPadBody)
+			caps = CapPadBody
 		}
-		if respPad > 0 {
-			w.Header().Set(PadHeader, strconv.Itoa(respPad))
+		if cred.signed() {
+			rm := maskFor(respMaskDomain, cred.key, cred.nonce)
+			respWire = responseCounters(myDownSeq, myUpAck, respPad, rm)
+			digest := sha256.Sum256(downData)
+			w.Header().Set(AuthRespMACHeader, respMAC(cred.key, cred.nonce, respWire, &digest))
 		}
+		w.Header().Set("X-Ack", respWire.ack)
+		w.Header().Set("X-Seq", respWire.seq)
+		w.Header().Set(PadHeader, respWire.pad)
+		w.Header().Set("Content-Length", strconv.Itoa(len(downData)))
+		if caps != "" {
+			w.Header().Set(CapsHeader, caps)
+		}
+		w.Header().Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Pad, X-HTTP-Tunnel-Caps, X-HTTP-Tunnel-Resp-MAC, Content-Length")
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Server", "nginx")
 		w.WriteHeader(http.StatusOK)
@@ -1117,6 +1286,17 @@ type ServerConfig struct {
 	// silently reshaping that instance's traffic. Invalid rules are rejected by
 	// NewServer.
 	Padding string
+	// CORSOrigin is what tunnel responses answer Access-Control-Allow-Origin
+	// with. Empty (default) answers "*", which keeps the behaviour of every
+	// earlier build and is what a browser-based client behind a CDN needs.
+	//
+	// Narrow it to a single origin — "https://cdn.example.com" — when the
+	// endpoint is reachable from pages you do not control. A wildcard origin
+	// answers a cross-origin fetch from anywhere at all, and the tunnel's
+	// counters are readable in that response without the PSK: see
+	// Access-Control-Expose-Headers. Narrowing costs the embeds that rely on
+	// the wildcard, so it is opt-in rather than the default.
+	CORSOrigin string
 	// HealthPath, when non-empty (e.g. "/healthz"), serves an unauthenticated
 	// JSON TunnelStats snapshot on GET at that path, independent of the tunnel
 	// path. Intended for localhost or an operator-only listener.
@@ -1232,6 +1412,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	state.maxPerIP = cfg.MaxSessionsPerIP
 	state.minProto = cfg.MinProtoVersion
 	state.healthPath = cfg.HealthPath
+	state.corsOrigin = cfg.CORSOrigin
 	state.brutalCfg = cfg.Brutal
 	if cfg.Brutal.Enabled {
 		state.brutalWarns = newWarnGate()

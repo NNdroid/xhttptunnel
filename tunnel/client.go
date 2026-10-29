@@ -3,6 +3,7 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -731,13 +732,26 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					}
 					windowMu.Unlock()
 
-					var method string
+					// Every request this session sends is a POST, idle ones
+					// included. A GET used to be how an idle poll said it had
+					// nothing to send, and it was readable from a long way off:
+					// the method differed, the body was empty, and no padding
+					// rule can smooth a request that has no body to pad. The
+					// one shape that remains is the POST, and an idle one
+					// carries a body of nothing but pad.
+					method := http.MethodPost
 					var bodyReader io.Reader
-					bodyLen := 0
+					// upPad is the length of the pad this body carries, and
+					// it is signed with the request: the reader is told where
+					// the frames start, and it is told in the one place a hop
+					// cannot change it without the request being refused.
 					upPad := 0
+					// body is the exact slice the request will carry, so the
+					// signature can cover it.
+					var body []byte
+					bodyLen := 0
 					if len(upData) > 0 {
-						method = http.MethodPost
-						body := upData
+						body = upData
 						// The session's one answer to "does the transport
 						// pad?". The frame layer reads the same flag to decide
 						// whether to leave its pad field at zero, so the body's
@@ -746,8 +760,9 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						// pad, or a padded body full of padded frames.
 						//
 						// False is the conservative start: a body padded for a
-						// peer that does not read X-Pad lands in its receive
-						// ring as payload. The first echoing response flips it.
+						// peer that does not look for the pad lands in its
+						// receive ring as payload. The first echoing response
+						// flips it.
 						if virtualConn.padInTransport.Load() {
 							padded, pad, padErr := padPollBody(upData)
 							if padErr != nil {
@@ -758,22 +773,47 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 								body, upPad = padded, pad
 							}
 						}
-						bodyLen = len(body)
 						// The transport owns the body until it closes the
 						// body — see pooledBody. Never recycle the send
 						// buffer by hand; a padded copy is collected with it.
 						bodyReader = newPooledBody(body, upBufPtr)
-					} else {
-						method = http.MethodGet
-						bodyReader = http.NoBody
+					} else if virtualConn.padInTransport.Load() {
+						// An idle poll carries a body of nothing but pad, the
+						// same reason the empty response it waits on does:
+						// "nothing to send" and "here are 20 bytes" are then
+						// the same size, and the method never says which.
+						if padded, pad, padErr := padPollBody(nil); padErr != nil {
+							logger.Warn("⚠️ [Pump] could not draw poll padding, sending this body bare", zap.Error(padErr))
+						} else {
+							body, upPad = padded, pad
+						}
+					}
+					bodyLen = len(body)
+					if len(upData) == 0 {
+						// Signed either way, including when it is empty, so a
+						// hop that gives an idle poll a body is as detectable
+						// as one that empties a busy one.
+						//
+						// NoBody rather than a reader over zero bytes: a
+						// reader over nothing is how net/http ends up with an
+						// outgoing length it cannot name, and it then sends the
+						// request chunked — no Content-Length at all, which a
+						// signed request is refused for, because a signature
+						// over a body of unstated length says nothing.
+						if body == nil {
+							body, bodyReader = []byte{}, http.NoBody
+						} else {
+							bodyReader = bytes.NewReader(body)
+						}
 					}
 
-					// Empty polls (GETs) run on a child context the closer can
-					// abort: the server parks them for the full longPollTimeout
-					// when no downlink exists, and they carry no body, so
-					// aborting one at close time is lossless. POSTs stay on
-					// pumpCtx: their body carries uplink bytes the server may
-					// already have consumed, so it has to be allowed to finish.
+					// Idle polls run on a child context the closer can abort:
+					// the server parks them for the full longPollTimeout when
+					// no downlink exists, and the only thing they carry is
+					// padding, so aborting one at close time is lossless. A
+					// poll with data stays on pumpCtx: its body carries uplink
+					// bytes the server may already have consumed, so it has to
+					// be allowed to finish.
 					reqCtx := pumpCtx
 					var handle *pollHandle
 					if len(upData) == 0 {
@@ -812,21 +852,6 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						req.Host = cfg.SNI
 					}
 					req.Header.Set("User-Agent", clientUserAgent)
-					// Signed credentials: the PSK itself is never sent, only its
-					// HMAC over a per-request nonce. The nonce is what makes
-					// replay impossible, so a failure here is fatal rather than
-					// retryable — retrying would just keep drawing the same
-					// broken entropy source and mint predictable nonces.
-					if authErr := setAuthHeaders(req, cfg.Password, sessionID, network, targetAddr); authErr != nil {
-						logger.Error("❌ [Pump] could not draw a nonce, closing the tunnel",
-							zap.String("session", sessionID),
-							zap.Error(authErr),
-						)
-						virtualConn.setCloseErr(fmt.Errorf("tunnel: could not generate a nonce: %w", authErr))
-						virtualConn.Close()
-						pumpCancel()
-						return
-					}
 					req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
 					req.Header.Set("X-Target", targetAddr)
 					req.Header.Set("X-Network", network)
@@ -836,16 +861,41 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					myAck := virtualConn.nextReadSeq
 					virtualConn.readCond.L.Unlock()
 
-					req.Header.Set("X-Seq", strconv.FormatUint(currentSeq, 10))
-					req.Header.Set("X-Ack", strconv.FormatUint(myAck, 10))
-					// Advertise that this side reads a padded poll body. The
-					// server echoes it only when it received the announcement,
-					// so the answer is proof that the header survived the path
-					// in both directions; until it arrives this side sends
-					// bodies the frame layer padded.
-					req.Header.Set(CapsHeader, CapPadBody)
-					if upPad > 0 {
-						req.Header.Set(PadHeader, strconv.Itoa(upPad))
+					// The counters and the body are signed as one, so they are
+					// written as one: a hop that changes either is then refused
+					// instead of being believed. The pad is inside the body, so
+					// it is covered with it. The returned nonce is what the
+					// response will be signed under.
+					//
+					// The PSK itself is never sent, only its HMAC over a
+					// per-request nonce. The nonce is what makes replay
+					// impossible, so a failure here is fatal rather than
+					// retryable — retrying would just keep drawing from the
+					// same broken entropy source and mint predictable nonces.
+					reqNonce, authErr := signRequest(req, cfg.Password, requestAuth{
+						sessionID: sessionID,
+						network:   network,
+						target:    targetAddr,
+						method:    method,
+						proto:     offeredProtoVersion,
+						caps:      CapPadBody,
+						seq:       strconv.FormatUint(currentSeq, 10),
+						ack:       strconv.FormatUint(myAck, 10),
+						// A poll body is bounded, so it is signed whole —
+						// including when there is nothing in it.
+						bodyKind: bodyKindPoll,
+						pad:      strconv.Itoa(upPad),
+						body:     body,
+					})
+					if authErr != nil {
+						logger.Error("❌ [Pump] could not draw a nonce, closing the tunnel",
+							zap.String("session", sessionID),
+							zap.Error(authErr),
+						)
+						virtualConn.setCloseErr(fmt.Errorf("tunnel: could not generate a nonce: %w", authErr))
+						virtualConn.Close()
+						pumpCancel()
+						return
 					}
 					if len(upData) > 0 {
 						req.Header.Set("Content-Type", "application/octet-stream")
@@ -921,9 +971,31 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					}
 					atomic.StoreInt32(&consecutiveErrors, 0)
 
+					// The counters of a response travel masked under the key
+					// that signed the request, and the bytes themselves are
+					// signed under its nonce. Both are recovered here, before
+					// anything downstream acts on either.
+					respWire := counters{
+						seq: resp.Header.Get("X-Seq"),
+						ack: resp.Header.Get("X-Ack"),
+						pad: resp.Header.Get(PadHeader),
+					}
+					wireSeq, wireAck, downPad, padErr := decodeCounters(responseMaskFor(cfg.Password, reqNonce), respWire)
+					if padErr != nil {
+						io.Copy(io.Discard, resp.Body)
+						resp.Body.Close()
+						if handle != nil {
+							handle.cancel()
+						}
+						virtualConn.setCloseErr(padErr)
+						virtualConn.Close()
+						pumpCancel()
+						return
+					}
+
 					var sAck uint64
-					if sAckStr := resp.Header.Get("X-Ack"); sAckStr != "" && resp.StatusCode == http.StatusOK {
-						sAck, _ = strconv.ParseUint(sAckStr, 10, 64)
+					if sAckStr := respWire.ack; sAckStr != "" && resp.StatusCode == http.StatusOK {
+						sAck = wireAck
 						if !virtualConn.writeBuf.validAck(sAck) {
 							resp.Body.Close()
 							virtualConn.setCloseErr(errors.New("tunnel: invalid peer acknowledgement"))
@@ -1044,7 +1116,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						continue
 					}
 
-					sSeqStr := resp.Header.Get("X-Seq")
+					sSeqStr := respWire.seq
 					if sSeqStr == "" {
 						// A 200 without X-Seq cannot be placed in the reassembly
 						// stream: feeding it at seq 0 would be silently dropped as a
@@ -1067,7 +1139,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						}
 						continue
 					}
-					sSeq, _ := strconv.ParseUint(sSeqStr, 10, 64)
+					sSeq := wireSeq
 
 					// The server answers in kind. Echoing the capability means
 					// it drops a leading pad from a request body, so this side
@@ -1095,19 +1167,6 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							logger.Debug("🧩 [Pump] server stopped advertising a padded poll body; padding back in the frame layer", zap.String("session", sessionID))
 						}
 					}
-					downPad, padErr := parsePollPad(resp.Header.Get(PadHeader))
-					if padErr != nil {
-						io.Copy(io.Discard, resp.Body)
-						resp.Body.Close()
-						if handle != nil {
-							handle.cancel()
-						}
-						virtualConn.setCloseErr(padErr)
-						virtualConn.Close()
-						pumpCancel()
-						return
-					}
-
 					// A CDN/WAF that ignores Accept-Encoding: identity and
 					// no-transform will gzip/brotli the octet-stream body anyway.
 					// The sequence numbers still advance, so the tunnel looks alive
@@ -1121,16 +1180,76 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						)
 					}
 
-					// The body's leading pad is not payload and must not reach
-					// the reassembly stream: it is dropped before the first
-					// frame byte, and the sequence starts at sSeq as before.
-					if downPad > 0 {
-						if err := skipPollPad(resp.Body, downPad); err != nil {
+					bufPtr := sendBuf.Get().(*[]byte)
+					readChunk := *bufPtr
+					var totalDownBytes int
+					var errBody error
+					downSeq := sSeq
+
+					// The downlink is the half a tunnelled application
+					// receives, so a response this side signed for is read
+					// whole and checked before a byte of it can reach the ring.
+					// Anything else streams as it arrives, which is what an
+					// unsigned peer gets.
+					respBodyLen := int(resp.ContentLength)
+					tampered := ""
+					if reqNonce != "" {
+						switch {
+						// A signed response made a statement about its pad
+						// and the signature vouches for that statement, not
+						// for a pad of zero. A missing header is a hop that
+						// dropped it, and reading it as "there is no pad"
+						// would hand the padding to the reassembly.
+						case resp.Header.Get(PadHeader) == "":
+							tampered = "response arrived without a pad length to check its signature against"
+						// A response of unknown length cannot have its bytes
+						// checked against a digest of them. A CDN that answers
+						// in chunks leaves Content-Length off, and slicing the
+						// read buffer by -1 would be a panic rather than a
+						// refusal — so say so first.
+						case respBodyLen < 0:
+							tampered = "response arrived without a length to check its signature against"
+						case respBodyLen > len(readChunk):
+							tampered = "response is longer than its signature permits"
+						}
+					}
+					if tampered == "" && reqNonce != "" {
+						n, readErr := io.ReadFull(resp.Body, readChunk[:respBodyLen])
+						if readErr != nil && !errors.Is(readErr, io.EOF) {
+							errBody = readErr
+						}
+						if errBody == nil && tampered == "" {
+							digest := sha256.Sum256(readChunk[:n])
+							if !respMACMatches(cfg.Password, reqNonce, respWire, resp.Header.Get(AuthRespMACHeader), &digest) {
+								tampered = "response does not match its signature"
+							}
+						}
+						if errBody == nil && tampered == "" {
+							// The leading pad is not payload: the length the
+							// signature vouched for says where it ends, so it
+							// is dropped before the first frame byte and the
+							// sequence still starts at sSeq.
+							frames, splitErr := splitPollBody(readChunk[:n], downPad)
+							if splitErr != nil {
+								errBody = splitErr
+							} else {
+								_, errBody = virtualConn.PutReadDataContext(pumpCtx, downSeq, frames)
+								totalDownBytes = len(frames)
+							}
+						}
+					} else if tampered == "" {
+						// The body's leading pad is not payload and must not
+						// reach the reassembly stream: it is dropped before
+						// the first frame byte, and the sequence starts at
+						// sSeq as before.
+						frameReader, skipErr := skipPollPad(resp.Body, downPad)
+						if skipErr != nil {
 							resp.Body.Close()
 							if handle != nil {
 								handle.cancel()
 							}
-							logger.Warn("⚠️ [Pump] could not skip the response's declared padding, triggering a safe retransmit", zap.Error(err))
+							safelyPutSendBuf(bufPtr)
+							logger.Warn("⚠️ [Pump] could not skip the response's leading padding, triggering a safe retransmit", zap.Error(skipErr))
 							windowMu.Lock()
 							dispatchSeq = ackedByServer.Load()
 							windowMu.Unlock()
@@ -1140,29 +1259,23 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							}
 							continue
 						}
-					}
 
-					bufPtr := sendBuf.Get().(*[]byte)
-					readChunk := *bufPtr
-					var totalDownBytes int
-					var errBody error
-					downSeq := sSeq
-
-					for {
-						n, err := resp.Body.Read(readChunk)
-						if n > 0 {
-							_, errBody = virtualConn.PutReadDataContext(pumpCtx, downSeq, readChunk[:n])
-							if errBody != nil {
+						for {
+							n, err := frameReader.Read(readChunk)
+							if n > 0 {
+								_, errBody = virtualConn.PutReadDataContext(pumpCtx, downSeq, readChunk[:n])
+								if errBody != nil {
+									break
+								}
+								downSeq += uint64(n)
+								totalDownBytes += n
+							}
+							if err != nil {
+								if err != io.EOF {
+									errBody = err
+								}
 								break
 							}
-							downSeq += uint64(n)
-							totalDownBytes += n
-						}
-						if err != nil {
-							if err != io.EOF {
-								errBody = err
-							}
-							break
 						}
 					}
 					resp.Body.Close()
@@ -1170,6 +1283,19 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						handle.cancel()
 					}
 					safelyPutSendBuf(bufPtr)
+
+					// A signed response that fails its own signature is not a
+					// transient edge state, so it does not get the retry the
+					// unsigned path falls back on: the hop between the two
+					// ends is rewriting traffic, and the session is closed
+					// rather than reassembled from bytes they disagree on.
+					if tampered != "" {
+						logger.Warn("❌ [Pump] "+tampered+", closing the tunnel", zap.String("session", sessionID))
+						virtualConn.setCloseErr(errResponseBodyTampered)
+						virtualConn.Close()
+						pumpCancel()
+						return
+					}
 
 					if errBody != nil {
 						logger.Warn("⚠️ [Pump] failed to read downlink body or it ended unexpectedly, triggering a safe retransmit", zap.Error(errBody))
@@ -1831,14 +1957,27 @@ func (c *Client) doBwExchange(ctx context.Context) bool {
 	if bc.BWAdvertise > 0 {
 		req.Header.Set(BwHeader, strconv.FormatUint(bc.BWAdvertise, 10))
 	}
-	// The existing signed-nonce auth covers the special target with no change:
-	// the signature binds the target string, and TargetBwExchange is exactly
-	// what the server will read back out of X-Target.
-	if err := setAuthHeaders(req, cfg.Password, sessionID, "tcp", TargetBwExchange); err != nil {
+	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
+	req.Header.Set("X-Target", TargetBwExchange)
+	req.Header.Set("X-Network", "tcp")
+	req.Header.Set("X-Session-ID", sessionID)
+	// The signed-nonce auth covers the special target with no change: the
+	// signature binds the target string, and TargetBwExchange is exactly what
+	// the server will read back out of X-Target. It carries no counters and no
+	// body, and it says the second one in as many words: a body of nothing has
+	// a digest, and it is not the same as no digest at all.
+	if _, err := signRequest(req, cfg.Password, requestAuth{
+		sessionID: sessionID,
+		network:   "tcp",
+		target:    TargetBwExchange,
+		method:    http.MethodPost,
+		proto:     offeredProtoVersion,
+		bodyKind:  bodyKindPoll,
+		body:      []byte{},
+	}); err != nil {
 		logger.Error("❌ [BW] could not draw a nonce for the bandwidth exchange", zap.Error(err))
 		return false
 	}
-	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
 	req.Header.Set("X-Target", TargetBwExchange)
 	req.Header.Set("X-Network", "tcp")
 	req.Header.Set("X-Session-ID", sessionID)

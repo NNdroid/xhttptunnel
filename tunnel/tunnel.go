@@ -247,15 +247,21 @@ const (
 	// carries. Servers advertise it and clients refuse a newer one, so it only
 	// moves when the frame layout changes.
 	tunnelProtoVersion = 1
+	// authProtoVersion is the generation that first required the signed
+	// nonce. It is what min_proto_version gates on, separately from what a
+	// current client offers, so raising offeredProtoVersion below does not
+	// quietly reopen the bare-token path for an operator who pinned 2.
+	authProtoVersion = 2
 	// offeredProtoVersion is the generation a current client announces. It
 	// tracks tunnelProtoVersion and additionally advances for changes that do
-	// not alter frames — the credential scheme in auth.go. MinProtoVersion
-	// gates on it, which is what lets an operator force the whole fleet onto
-	// the signed-nonce scheme by setting min_proto_version to 2. A client
-	// advertising 2 must send X-HTTP-Tunnel-MAC or it is refused outright
-	// (see authorize), so that gate cannot be satisfied by a downgraded
-	// credential.
-	offeredProtoVersion = 2
+	// not alter frames: 2 was the signed-nonce credential scheme and 3 binds
+	// the request metadata and both bodies into that signature, so a request
+	// that a middlebox rewrote is refused instead of being ingested.
+	offeredProtoVersion = 3
+	// bodyProtoVersion is the generation that carries a body signature and
+	// masks the sequence counters. Anything below it is authenticated by
+	// credential alone and keeps the old plaintext metadata.
+	bodyProtoVersion = 3
 )
 
 // errProtoTooNew reports a server speaking a protocol generation this client
@@ -357,6 +363,10 @@ type serverState struct {
 	// "inherit the package logger" (which SetLogger may still replace).
 	customLog *zap.Logger
 
+	// corsOrigin is what responses answer Access-Control-Allow-Origin with.
+	// It is fixed at construction, so the hot path reads a plain string.
+	// Empty means the historical "*".
+	corsOrigin string
 	// allowedTargets restricts which forwarding targets a client may request.
 	// An entry matches when it equals the target exactly, ends with ":port"
 	// (any host on that port), or starts with "host:" (any port on that host).
@@ -407,6 +417,16 @@ func (st *serverState) lg() *zap.Logger {
 		return st.customLog
 	}
 	return logger
+}
+
+// corsAllowOrigin is the value responses answer Access-Control-Allow-Origin
+// with. Empty means the historical wildcard, which is what a browser client
+// behind a CDN needs and what every earlier build sent.
+func (st *serverState) corsAllowOrigin() string {
+	if st.corsOrigin != "" {
+		return st.corsOrigin
+	}
+	return "*"
 }
 
 func newServerState(maxSessions int) *serverState {

@@ -60,7 +60,7 @@ func TestStreamReconnectResetsAfterHealthyRound(t *testing.T) {
 		defer hub.close()
 		round := 0
 		rt := streamTestTransport(func(r *http.Request) (*http.Response, error) {
-			if r.Method == http.MethodPost {
+			if r.Header.Get("Content-Type") == streamContentType {
 				_, err := io.Copy(io.Discard, r.Body)
 				if err != nil {
 					return nil, err

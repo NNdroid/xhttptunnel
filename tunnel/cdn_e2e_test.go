@@ -42,11 +42,16 @@ func TestXHTTPTunnel_E2E_ThroughCDN(t *testing.T) {
 	// be rewound to the server ACK and replayed with X-Retry, or the payload
 	// would be silently skipped.
 	cdn := newCDNTestServer(t, "http://"+origin.Addr().String(), []cdnFault{
-		{method: http.MethodGet, status: http.StatusGatewayTimeout},
-		{method: http.MethodGet, status: 524},
-		{method: http.MethodPost, status: http.StatusTooManyRequests},
+		{phase: cdnPhasePoll, status: http.StatusGatewayTimeout},
+		{phase: cdnPhasePoll, status: 524},
+		{phase: cdnPhaseUpload, status: http.StatusTooManyRequests},
 	})
 	defer cdn.Close()
+	cdn.setPhase(cdnPhaseSetup)
+	// The fixture holds the session key so it can tell a request that moves
+	// the stream from one that does not. It is the only way left to tell, and
+	// a test is entitled to know; an observer is not.
+	cdn.psk = "cdn-test-secret"
 
 	cdnURL, err := url.Parse(cdn.server.URL + "/stream")
 	if err != nil {
@@ -65,9 +70,16 @@ func TestXHTTPTunnel_E2E_ThroughCDN(t *testing.T) {
 		t.Fatalf("dial through CDN: %v", err)
 	}
 	defer conn.Close()
+	// The session is up: from here every request is a long poll, and the two
+	// edge timeouts are aimed at one.
+	cdn.setPhase(cdnPhasePoll)
 	cdn.waitForPollFaults(t)
 
 	payload := bytes.Repeat([]byte("cdn-path-payload-"), 16*1024)
+	// The upload begins: the edge can now tell a request that moves the
+	// stream from one that does not, so the rate limit lands on a request
+	// carrying data rather than on an idle poll that happens to be in flight.
+	cdn.setPhase(cdnPhaseUpload)
 	writeErr := make(chan error, 1)
 	go func() {
 		_, err := conn.Write(payload)
@@ -203,7 +215,15 @@ type cdnTestServer struct {
 	server *httptest.Server
 	proxy  *httputil.ReverseProxy
 
-	mu                 sync.Mutex
+	mu    sync.Mutex
+	phase string
+	// psk lets the fixture read the uplink sequence in the clear. The wire
+	// form is masked per request, which is the point: two requests carrying
+	// the same position do not look alike, and a hop is not meant to be able
+	// to tell whether a request advanced the stream. The test holds the key.
+	psk                string
+	lastSeq            uint64
+	seenRequestSeq     []uint64
 	pendingFaults      []cdnFault
 	injectedStatuses   []int
 	seenRequestHeaders []http.Header
@@ -221,12 +241,27 @@ type cdnTestServer struct {
 	pollFaultsReady     chan struct{}
 	pollFaultsReadyOnce sync.Once
 	rejectedPostIndex   int
-	rejectedPostSeq     string
-	rejectedPostLen     int64
+	rejectedPostSeq     uint64
 }
 
+// The phases of a session the CDN can be told to break. Every request in a
+// session is a POST now, and it is not only the method that is the same: a
+// padded poll body and a padded upload are the same size, on purpose, so
+// there is nothing on the wire left to tell them apart. The fixture is
+// therefore told which phase it is in, which is the thing an observer cannot
+// know and a test is entitled to say.
+const (
+	// cdnPhaseSetup is the dial. Nothing is refused while the session is
+	// still being established.
+	cdnPhaseSetup = "setup"
+	// cdnPhasePoll is the idle phase, where every request carries nothing.
+	cdnPhasePoll = "poll"
+	// cdnPhaseUpload is the phase in which the client has a payload to send.
+	cdnPhaseUpload = "upload"
+)
+
 type cdnFault struct {
-	method string
+	phase  string
 	status int
 }
 
@@ -274,6 +309,31 @@ func newCDNTestServer(t testing.TB, origin string, faults []cdnFault, delays ...
 	return cdn
 }
 
+// setPhase tells the fixture which part of the session it is breaking. It
+// starts in the setup phase so the dial is never the thing that fails.
+func (c *cdnTestServer) setPhase(phase string) {
+	c.mu.Lock()
+	c.phase = phase
+	c.mu.Unlock()
+}
+
+// plainUplinkSeq recovers the uplink position this request reports, in the
+// clear. The wire form is masked with a per-request keystream, so a request
+// that carries the same bytes as the one before it does not look like it:
+// that is what takes the sequence numbers out of the observer's hands, and
+// it is why this fixture has to hold the key to see them.
+func (c *cdnTestServer) plainUplinkSeq(h http.Header) uint64 {
+	nonce, wire := h.Get(AuthNonceHeader), h.Get("X-Seq")
+	if nonce == "" || wire == "" || c.psk == "" {
+		return 0
+	}
+	seq, _, _, err := decodeCounters(maskFor(reqMaskDomain, c.psk, nonce), counters{seq: wire})
+	if err != nil {
+		return 0
+	}
+	return seq
+}
+
 func (c *cdnTestServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	c.seenRequestHeaders = append(c.seenRequestHeaders, r.Header.Clone())
@@ -281,17 +341,25 @@ func (c *cdnTestServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	c.seenRequestMethod = append(c.seenRequestMethod, r.Method)
 	c.seenRequestLength = append(c.seenRequestLength, r.ContentLength)
 	c.seenRequestInfo = append(c.seenRequestInfo, fmt.Sprintf("%s seq=%s ack=%s len=%d", r.Method, r.Header.Get("X-Seq"), r.Header.Get("X-Ack"), r.ContentLength))
+	seq := c.plainUplinkSeq(r.Header)
+	c.seenRequestSeq = append(c.seenRequestSeq, seq)
+	// An upload is a request that reports further along the stream than the
+	// one before it. An idle poll sits still. That is the only difference
+	// left between them, and it is invisible without the key.
+	advanced := seq != c.lastSeq
+	c.lastSeq = seq
+
 	var injected *cdnFault
-	if len(c.pendingFaults) > 0 && r.Method == c.pendingFaults[0].method {
+	if len(c.pendingFaults) > 0 && c.pendingFaults[0].phase == c.phase &&
+		(c.pendingFaults[0].phase != cdnPhaseUpload || advanced) {
 		fault := c.pendingFaults[0]
 		c.pendingFaults = c.pendingFaults[1:]
 		c.injectedStatuses = append(c.injectedStatuses, fault.status)
-		if fault.method == http.MethodPost {
+		if fault.phase == cdnPhaseUpload {
 			c.rejectedPostIndex = len(c.seenRequestMethod) - 1
-			c.rejectedPostSeq = r.Header.Get("X-Seq")
-			c.rejectedPostLen = r.ContentLength
+			c.rejectedPostSeq = seq
 		}
-		if len(c.pendingFaults) == 0 || c.pendingFaults[0].method != http.MethodGet {
+		if len(c.pendingFaults) == 0 || c.pendingFaults[0].phase != cdnPhasePoll {
 			c.pollFaultsReadyOnce.Do(func() { close(c.pollFaultsReady) })
 		}
 		injected = &fault
@@ -433,17 +501,20 @@ func (c *cdnTestServer) assert(t *testing.T) {
 		t.Fatalf("client CDN-bypass headers incomplete: no-store=%t pragma=%t identity=%t end-to-end-auth=%t", sawNoStore, sawPragma, sawIdentity, sawEndToEndAuth)
 	}
 
+	// The replay is recognised by the position it carries, not by the bytes:
+	// it is the same position in the stream, while its pad is a fresh draw
+	// and its counters a fresh mask. The wire forms of two requests at the
+	// same position share nothing an observer could match on, which is why
+	// the fixture needs the key to see the correspondence at all.
 	var sawReplayedPOST bool
 	for i := c.rejectedPostIndex + 1; i < len(c.seenRequestHeaders); i++ {
-		if c.seenRequestMethod[i] == http.MethodPost &&
-			c.seenRequestHeaders[i].Get("X-Seq") == c.rejectedPostSeq &&
-			c.seenRequestLength[i] == c.rejectedPostLen {
+		if c.seenRequestMethod[i] == http.MethodPost && c.seenRequestSeq[i] == c.rejectedPostSeq {
 			sawReplayedPOST = true
 			break
 		}
 	}
 	if c.rejectedPostIndex < 0 || !sawReplayedPOST {
-		t.Fatalf("CDN-rejected POST was not replayed from sequence %q", c.rejectedPostSeq)
+		t.Fatalf("CDN-rejected POST was not replayed from sequence %d", c.rejectedPostSeq)
 	}
 
 	if len(c.seenResponseHeader) == 0 {

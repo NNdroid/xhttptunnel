@@ -4,7 +4,7 @@ High-Performance Bidirectional Split-HTTP / Meek Streaming Tunnel Server & Clien
 
 ## Features
 
-- **Split-HTTP Bidirectional Streaming**: Long-lived uplink POST and downlink GET streams with automatic sequence reconstruction.
+- **Split-HTTP Bidirectional Streaming**: Long-lived uplink POST and a long-lived downlink response — also a POST, carrying `X-Downstream: 1` — with automatic sequence reconstruction.
 - **Reliable Packet Ring Buffer**: Bounded, synchronized retransmission and reassembly buffers with backpressure.
 - **Auto Self-Signed TLS**: Can generate a pinned RSA certificate for direct TLS deployments.
 - **Stun Node Sharing (`gen-uri`)**: One-click encrypted `stun://` share link (plus a plaintext `xhttp://` URI) and terminal ASCII QR code generation for Android & TV.
@@ -202,12 +202,14 @@ default. So the tunnel's protocol headers flow through with no configuration at
 all:
 
 - *Request* — `X-Auth-Token`, `X-HTTP-Tunnel-Nonce`, `X-HTTP-Tunnel-MAC`,
-  `X-XHTTP-Proto`, `X-Target`, `X-Network`, `X-Session-ID`, `X-Seq`, `X-Ack`,
-  `X-Retry`, `X-Downstream`, `X-Stream-Resume`, `X-Stream-Probe-Window`, plus
+  `X-HTTP-Tunnel-Body-MAC`, `X-HTTP-Tunnel-Caps`, `X-XHTTP-Proto`, `X-Target`,
+  `X-Network`, `X-Session-ID`, `X-Seq`, `X-Ack`, `X-Pad`, `X-Retry`,
+  `X-Downstream`, `X-Stream-Resume`, `X-Stream-Probe-Window`, plus
   the camouflage headers `User-Agent`, `Accept`, `Accept-Encoding`,
   `Cache-Control`, `Pragma`, `Content-Type`.
-- *Response* — `X-XHTTP-Proto`, `X-Seq`, `X-Ack`, `X-Session-ID`,
-  `X-Downstream-Accepted`, `X-Stream-Uplink-Sync`, `X-Session-Created`, plus
+- *Response* — `X-XHTTP-Proto`, `X-Seq`, `X-Ack`, `X-Pad`, `X-Session-ID`,
+  `X-HTTP-Tunnel-Caps`, `X-HTTP-Tunnel-Resp-MAC`, `X-Downstream-Accepted`,
+  `X-Stream-Uplink-Sync`, `X-Session-Created`, plus
   `Cache-Control`, `Pragma`, `Expires`, `X-Accel-Buffering`.
 
 `X-HTTP-Tunnel-Nonce` and `X-HTTP-Tunnel-MAC` are the v2 credentials. A request
@@ -217,7 +219,10 @@ nonce that is missing, malformed, or already seen inside the 120-second
 replay window fails validation. If either header is lost in transit the client
 simply cannot connect and nothing in the logs points at nginx, so `gen-nginx`
 declares both explicitly alongside `X-Auth-Token` — the one place where the
-redundancy with `proxy_pass_request_header on` is worth the lines.
+redundancy with `proxy_pass_request_header on` is worth the lines. `X-Pad`
+joins them: a signed request that arrives without it is refused (HTTP 400)
+rather than read as carrying no pad at all, so a hop that does not forward the
+header cannot forward the request either.
 
 Four headers are still the exception that must be set explicitly, because
 nginx's *default* for each is wrong for this tunnel:
@@ -485,12 +490,15 @@ different sinks. Nil inherits the package logger set via `tunnel.SetLogger`.
 ### Transport modes (downlink)
 
 `DialConfig.StreamMode` / `ClientConfig` default (`"auto"`) upgrades the
-downlink from long-poll to a **streaming GET** (SSE-style: the server pushes
-frames into one response body as they arrive) on h1/h2/h3, paired with a
+downlink from long-poll to a **streaming response** (SSE-style: the server
+pushes frames into one response body as they arrive) on h1/h2/h3, paired with a
 long-lived POST uplink — so each direction remains a separate HTTP stream and
-does not require one request to read and write concurrently. CDN/proxy request
-and response streaming must remain enabled. Uplink throughput no longer shares
-a round trip with each downlink chunk.
+does not require one request to read and write concurrently. The downlink
+request is a POST too, named by `X-Downstream: 1` rather than by its method, so
+it is indistinguishable on the wire from the idle polls beside it; a hop that
+drops the header hands the origin an ordinary idle poll and the client falls
+back on its own. CDN/proxy request and response streaming must remain enabled.
+Uplink throughput no longer shares a round trip with each downlink chunk.
 
 Negotiation (three layers, cached per `protocol|host|SNI|fingerprint|TransportKey`,
 TTL 5 min):
@@ -577,8 +585,8 @@ the header's width. So exactly one of them does:
   need — the shape is right, the bytes inside it are wasted.
 - **Negotiated.** Both ends advertise `pad-body` in `X-HTTP-Tunnel-Caps`.
   Padding moves out to the transport — the streaming envelope's own pad field,
-  or a poll body's leading `X-Pad` bytes — and the frame layer leaves its pad
-  field at zero. The wire object then lands inside the band: 400..600 on both
+  or a poll body's leading pad — and the frame layer leaves its pad field at
+  zero. The wire object then lands inside the band: 400..600 on both
   transports, with no header to account for because the pad now counts it. The
   send window benefits too, since the ring carries bare frames.
 
@@ -634,18 +642,37 @@ Things worth knowing before changing it:
   a run of padded frames and its `Content-Length` lands in the band like any
   other frame — which is why `WriteUDPFrame` joins its length prefix to the
   payload instead of issuing two writes, since one frame per `Write` is what
-  makes that hold. Negotiated, the frames go out bare and the body carries
-  `X-Pad` bytes in front; `Content-Length` is the pad plus the frames, so the
-  band still describes the object an observer sees. Both directions of the pad
-  ride on the one capability: the client pads a request body once it has seen the
-  server echo the capability, and the server pads a response once the request has
-  advertised it. The client re-reads the echo on every response rather than
-  latching on the first one, because a session outlives any single node and a
-  fleet mid-upgrade mixes builds — a body padded for a node that does not read
-  `X-Pad` would have its padding delivered as payload. Losing the echo puts the
-  pad back in the frame, which every peer can read. A cleared `X-Pad` on a body
-  that carries padding is a protocol violation the reader refuses rather than a
-  silently misaligned stream.
+  makes that hold. Negotiated, the frames go out bare and the body carries a
+  pad in front, so `Content-Length` — the pad plus the frames — still describes
+  the object an observer sees.
+- **The pad's length travels as a signed, masked header.** It rides in `X-Pad`,
+  but never in the clear: it is XORed with the same per-request keystream as
+  the counters and it is inside the signed message, so an observer holding it
+  cannot subtract it from `Content-Length` to learn the payload exactly, and a
+  hop that moves or deletes it also destroys the request's credentials. The
+  reader then drops a known number of bytes instead of guessing where the
+  padding ended. A signed request must state its pad, including when the
+  answer is none: a request that leaves it unsaid — even one signed correctly
+  over an absent pad — is refused (HTTP 400) rather than read as carrying no
+  pad, because that reading is the one that hands the padding to the
+  reassembly as payload. Making the pad self-delimiting in its own bytes was
+  the first design tried here and it does not hold: a poll body is a slice of
+  the send window, so it can begin at any byte of a frame, and the length in
+  front of it is whatever payload happened to be there.
+- **Idle polls are POSTs, not GETs.** Every request in a session now has a body
+  and the same method, including the ones with nothing to send: an idle poll
+  carries a body of nothing but pad, the same way the empty response it waits
+  on does. A GET was readable from a long way off — the method differed from
+  every other request, and its zero-byte body was the one size no padding rule
+  can smooth, because there was nothing there to pad.
+- **Both directions of the pad ride on the one capability**: the client pads a
+  request body once it has seen the server echo the capability, and the server
+  pads a response once the request has advertised it. The client re-reads the
+  echo on every response rather than latching on the first one, because a
+  session outlives any single node and a fleet mid-upgrade mixes builds — a
+  body padded for a node that does not look for the pad would have its padding
+  delivered as payload. Losing the echo puts the pad back in the frame, which
+  every peer can read.
 
 `gen-config` exposes it as `-padding`. Embedders have two ways in, both landing
 on the same process-wide policy:
@@ -776,13 +803,14 @@ release.
 
 ### Protocol versioning & operational hardening
 
-- **Wire-protocol generation.** Every tunnel response carries
-  `X-XHTTP-Proto: 1`. A client refuses to speak to a server advertising a
-  *newer* generation (a hard error, not a poll fallback — a changed frame
-  layout must not be polled by an older reader). An operator can force the
-  fleet off a retired generation with `min_proto_version`: requests whose
-  advertised version is lower (including header-less legacy clients) get
-  HTTP 426. Bumping the generation is a single constant in the SDK.
+- **Wire-protocol generation.** Every tunnel request carries
+  `X-XHTTP-Proto`; the current generation is 3. A client refuses to speak to a
+  server advertising a *newer* generation (a hard error, not a poll fallback —
+  a changed frame layout must not be polled by an older reader). An operator
+  can force the fleet off a retired generation with `min_proto_version`:
+  requests whose advertised version is lower (including header-less legacy
+  clients) get HTTP 426. Bumping the generation is a single constant in the
+  SDK.
 - **Signed credentials.** The PSK never crosses the wire. Each request carries
   a fresh nonce plus its HMAC-SHA256 over the nonce, the session id, the
   network and the target. A captured request therefore leaks nothing and
@@ -797,6 +825,33 @@ release.
   admitted only by signature, which is what makes `min_proto_version: 2` a real
   switch for retiring the bare-token path. Both credential headers are scrubbed
   before fallback camouflage forwards a request to the disguise target.
+- **Signed metadata and signed bytes.** Generation 3 binds the rest of the
+  request into the signature: the sequence numbers that place a body in the
+  stream, the length of the pad in front of it, and a digest of the body
+  itself. A hop that rewrites any of them is refused instead of being believed
+  — it used to be able to move a body within the stream or change the bytes,
+  and the request still authenticated, because the counters and the body were
+  outside the signed message. The downlink gets the same treatment: a response
+  is signed under the nonce of the request that asked for it, so one cannot be
+  lifted onto another request. A body that is a continuous stream rather than a
+  bounded object says so in the signed message too, and does not sign a digest
+  it has no end to take: the kind is drawn by both ends from the same header,
+  so a mismatch between them is a refusal rather than a misread.
+- **The counters travel masked.** They are XORed with a per-request keystream
+  derived from the PSK and the nonce, so an observer holding the nonce and a
+  year of traffic has no counters to difference. The mask is applied per
+  field: a counter the sender left off the wire is not one, rather than being
+  unmasked into the mask bytes.
+- **A tampered body closes the session.** A body that does not match its
+  signature is not a client bug, and it is not retried: the two ends disagree
+  about what was sent, so the session ends and the `body.tampered` event is
+  emitted for the operator.
+- **CORS is narrowed on request.** Responses answer
+  `Access-Control-Allow-Origin: *` by default, because that is what a
+  browser-based client behind a CDN needs and what every earlier build sent.
+  Set `ServerConfig.CORSOrigin` to one origin when the endpoint is reachable
+  from pages you do not control: a wildcard answers a cross-origin fetch from
+  anywhere, and the counters in that response are readable without the PSK.
 - **Per-IP session cap.** `max_sessions_per_ip` bounds how many live sessions
   one client address may hold, so a single leaked PSK or a compromised host
   cannot exhaust the global `max_sessions` and starve everyone else. Off by
