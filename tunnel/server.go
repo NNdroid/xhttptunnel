@@ -248,6 +248,9 @@ var tunnelRequestHeaders = []string{
 	AuthNonceHeader,
 	AuthMACHeader,
 	AuthBodyMACHeader,
+	PadHeader,
+	CapsHeader,
+	BwHeader,
 	"X-Target",
 	"X-Network",
 	"X-Session-ID",
@@ -1202,7 +1205,7 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 // open mode — never expose that publicly).
 type ServerConfig struct {
 	// WindowSizeMB sets the per-session reliable send window in MiB.
-	// 0 preserves the 4 MiB default; valid explicit sizes are 1-64.
+	// 0 preserves the 8 MiB default; valid explicit sizes are 1-64.
 	WindowSizeMB int
 	// BufferBudgetMB caps reserved active tunnel buffer capacity per server.
 	// 0 preserves admission by MaxSessions alone. Excludes HTTP/TLS/QUIC,
@@ -1215,7 +1218,9 @@ type ServerConfig struct {
 	// Path is the Split-HTTP endpoint path requests must hit.
 	Path string
 	// PSK is the pre-shared key. A current client never sends it: it sends a
-	// fresh nonce plus its HMAC over the nonce, session id and target. A
+	// fresh nonce plus its HMAC over a message that binds the nonce, the
+	// session id, the network, the target and, from protocol generation 3,
+	// the request metadata and a digest of the body. A
 	// legacy client presents the key itself as "Proxy-Authorization: Bearer
 	// <token>" or "X-Auth-Token"; that path is still accepted so a fleet can
 	// be upgraded in place (servers first, clients after), and it is closed to

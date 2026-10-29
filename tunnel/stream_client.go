@@ -28,8 +28,9 @@ const (
 	// frame when deciding whether the path streams, and how long the server
 	// waits for the companion POST before concluding the path cannot stream.
 	// Both sides share this constant: the client measures from when it sends
-	// the GET, the server from when the GET arrives, so a round trip longer
-	// than half this window fails the first probe and falls back to polling.
+	// the downlink request, the server from when that request arrives, so a
+	// round trip longer than half this window fails the first probe and falls
+	// back to polling.
 	// Once a prior probe has succeeded the client widens to max(this,
 	// 3x the measured TTFB).
 	streamProbeMinWindow = 5 * time.Second

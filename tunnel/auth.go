@@ -203,11 +203,6 @@ func responseMaskFor(password, nonce string) []byte {
 // the signature, turning a rewrite from silent corruption into a refusal, and
 // it masks the counters, which takes away the edge's ability to read exact
 // payload lengths off the headers even when it touches nothing.
-//
-// The pad is not among the bound metadata, and does not need to be. It says
-// where it ends inside the signed bytes, so a hop that changes it has to change
-// the bytes the digest covers — the pad is protected by being part of the
-// object rather than by being a field beside it.
 
 const (
 	// AuthBodyMACHeader carries the hex HMAC-SHA256 of a request body. The

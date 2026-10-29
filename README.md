@@ -67,16 +67,17 @@ curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/main/scripts/in
   the config reference for the full grammar. The installer validates the list
   with the same rules as `gen-config`, so a typo fails before the service boots.
 
-The wizard prompts for six things — public host, port, `selfsign_cn`,
-`fallback`, PSK and the target policy — then prints a table of every resolved
-value and asks for confirmation. The target-policy question is a three-way
-choice: `n` for loopback only (the default), `y` for unrestricted, or `t` to
-type an exact `allowed_targets` list. In client mode the PSK question defaults
-to typing it rather than generating one, since a freshly generated secret could
-never authenticate. `--non-interactive` skips the prompts, and it is also
-selected automatically when stdin is not a terminal, so piped installs never
-hang. `--yes` skips just the confirmation prompt. `install.sh --help` lists all
-flags.
+The wizard prompts for six things in server mode — public host, port,
+`selfsign_cn`, `fallback`, PSK and the target policy — then prints a table of
+every resolved value and asks for confirmation. A client install asks for only
+three: the public host, the local listen port and the PSK. The target-policy
+question is a three-way choice: `n` for loopback only (the default), `y` for
+unrestricted, or `t` to type an exact `allowed_targets` list. In client mode the
+PSK question defaults to typing it rather than generating one, since a freshly
+generated secret could never authenticate. `--non-interactive` skips the
+prompts, and it is also selected automatically when stdin is not a terminal, so
+piped installs never hang. `--yes` skips just the confirmation prompt.
+`install.sh --help` lists all flags.
 
 Other actions: `reconfig [server|client]` re-runs the wizard without touching
 the binary or the systemd unit; `uri` / `qr` prints the Stun share URI and QR
@@ -133,11 +134,12 @@ xhttptunnel gen-config -mode server -docs=false                              # d
 
 `-psk-mode` selects the secret: `auto` (default) generates one for a server and
 keeps the placeholder for a client; `random` always generates; `placeholder`
-emits a template for either; `open` writes an empty PSK. An explicit `-psk`
-wins over `-psk-mode`, and `-psk ""` opts into open mode. Publishing an example
-token as an explicit `-psk` is a hard error; the placeholder is only an error
-when *you* type it — a generator-substituted one warns instead, because the
-binary's own check is the hard refusal.
+emits a template for either; `open` writes an empty PSK. The precedence is
+`-psk` / `-psk-file` first — a file keeps the secret off the command line and
+out of `ps` — then `-psk-mode`, and `-psk ""` opts into open mode. Publishing an
+example token as an explicit `-psk` is a hard error; the placeholder is only an
+error when *you* type it — a generator-substituted one warns instead, because
+the binary's own check is the hard refusal.
 
 Validation runs before anything is written: `listen`/`target` ports must be
 1–65535, `path` and `health_path` must start with `/`, `chunk_size_kb` must be
@@ -178,7 +180,8 @@ SIGHUP handler, so the directive would be a lie.
 
 **`gen-nginx`** writes the origin-side proxy. The default is an `upstream` block
 plus a `location` snippet for inside an existing `server{}`; `-server-block`
-adds the wrapper and `-tls` adds the `ssl` listen line.
+adds the wrapper, and `-tls` adds the `ssl` listen line — which needs that
+wrapper, so `-tls` on its own emits one too.
 
 ```bash
 xhttptunnel gen-nginx -domain tunnel.example.com -backend 127.0.0.1:8443 \
@@ -218,11 +221,12 @@ path is closed to it, so it is refused outright rather than downgraded; a
 nonce that is missing, malformed, or already seen inside the 120-second
 replay window fails validation. If either header is lost in transit the client
 simply cannot connect and nothing in the logs points at nginx, so `gen-nginx`
-declares both explicitly alongside `X-Auth-Token` — the one place where the
+declares it explicitly alongside `X-Auth-Token` — the one place where the
 redundancy with `proxy_pass_request_header on` is worth the lines. `X-Pad`
-joins them: a signed request that arrives without it is refused (HTTP 400)
+makes a third: a signed request that arrives without it is refused (HTTP 400)
 rather than read as carrying no pad at all, so a hop that does not forward the
-header cannot forward the request either.
+header cannot forward the request either, and the operator gets a bare 400 with
+nothing naming the proxy.
 
 Four headers are still the exception that must be set explicitly, because
 nginx's *default* for each is wrong for this tunnel:
@@ -282,7 +286,7 @@ journalctl -u xhttptunnel -f   # View live logs
 | `host` | `string` | server host | HTTP `Host` header disguise (client). |
 | `alpn` | `string` | `"auto"` | Transport selection: `h3`, `h2`, `h1`, or `auto` (probe HTTP/3, fall back). |
 | `stream_mode` | `string` | `"auto"` | Client downlink transport: `auto` (negotiate), `poll` (legacy long-poll), or `stream` (force streaming downlink). |
-| `window_size_mb` | `int` | `0` | Reliable send window per session in MiB: `0` preserves 4 MiB; explicit sizes are 1–64. Available on client and server; the peers do not need matching windows. |
+| `window_size_mb` | `int` | `0` | Reliable send window per session in MiB: `0` preserves 8 MiB; explicit sizes are 1–64. Available on client and server; the peers do not need matching windows. |
 | `buffer_budget_mb` | `int` | `0` | Server admission budget in MiB for active tunnel buffers. `0` preserves the existing session-count limit. A nonzero value reserves each send window, conservative receive capacity and frame scratch before admitting a session; insufficient capacity returns HTTP 503. Excludes HTTP/TLS/QUIC buffers, stacks and total process RSS. |
 | `fingerprint` | `string` | `""` | SHA-256 certificate pin, required for self-signed TLS. Empty uses the system CA roots plus SNI hostname verification, which is appropriate for ordinary CDN HTTPS. `gen-uri` reads this field when building a share URI, or derives it from `cert` when the field is empty. |
 | `log_level` | `string` | `"info"` | Logging output level: `debug`, `info`, `warn`, `error`. |
@@ -296,7 +300,7 @@ journalctl -u xhttptunnel -f   # View live logs
 | `allowed_targets` | `[]string` | `[]` | Server: restrict client-requested targets. Each entry is `host:port`, `:port`, `host:`, `[host]` or `*` — an unbracketed IPv6 literal is rejected because its colons are ambiguous, so write `[::1]:22` or `[::1]` — optionally prefixed `tcp://` / `udp://` to admit only that protocol (`udp://:53` = UDP DNS on any host; `tcp://192.168.1.10:` = TCP on any port of that host; a scheme-less `127.0.0.1:` admits either; the prefix is a protocol gate only and is never part of the address that gets dialed). An entry that cannot be parsed matches nothing rather than widening the policy. Enforcement runs at session creation, so a custom `Handler` sees only allowlisted targets too. Empty = allow all. |
 | `trust_proxy_headers` | `bool` | `false` | Server: honour `CF-Connecting-IP`/`X-Forwarded-For`/`X-Real-IP` for client-address logging. Enable only behind a trusted proxy that strips them. |
 | `health_path` | `string` | `""` | Server: when set (e.g. `/healthz`), expose an unauthenticated JSON stats snapshot (`Server.Stats`) on the tunnel listener. Empty = disabled. Intended for localhost / operator listeners. |
-| `min_proto_version` | `int` | `0` | Server: reject (HTTP 426) clients advertising an `X-XHTTP-Proto` below this, to retire an old wire generation or the legacy credential scheme fleet-wide. `0` accepts all clients, including header-less legacy ones. Setting it to `2` forces the signed-nonce scheme: a client advertising version 2 is admitted only by signature, which closes the bare-token fallback. |
+| `min_proto_version` | `int` | `0` | Server: reject (HTTP 426) clients advertising an `X-XHTTP-Proto` below this, to retire an old wire generation or the legacy credential scheme fleet-wide. `0` accepts all clients, including header-less legacy ones. Setting it to `2` forces the signed-nonce scheme: a client advertising version 2 is admitted only by signature, which closes the bare-token fallback. Setting it to `3` additionally retires every generation whose metadata and bodies are outside the signature. |
 | `brutal` | object | `{enabled: false}` | Cap the send rate of the tunnel's **TCP** sockets with [TCP Brutal](https://github.com/beef92/tcp-brutal) (a Linux kernel module; inert on other platforms). See [TCP Brutal & bandwidth exchange](#tcp-brutal--bandwidth-exchange). |
 
 For a direct TLS deployment, `:8443` (or `tcp+udp://:8443`) starts HTTPS and HTTP/3 on the same port. Use `tcp://127.0.0.1:8443` for a cleartext CDN origin; without a certificate/key the server intentionally does not bind UDP or advertise HTTP/3.
@@ -314,13 +318,14 @@ reservations even for idle sessions, and is released when the session closes.
 `buffer_budget_bytes` when a budget is configured.
 
 Streaming ACKs are coalesced by bytes (32 KiB) and time (10 ms), independently
-of keepalives. The GET headers are flushed first; the initial hello follows
-admission of the companion POST, so successful Dial proves both directions
-were admitted. Active stream I/O deadlines are refreshed rather than inheriting
-the HTTP server's absolute request timeout. Reconnects use exponential backoff
-with jitter capped at 30 seconds and reset their failure count after 30 seconds
-of healthy streaming. A server restart that loses session state still requires
-a new application connection; transport resume preserves an existing session.
+of keepalives. The downlink response's headers are flushed first; the initial
+hello follows admission of the companion POST, so successful Dial proves both
+directions were admitted. Active stream I/O deadlines are refreshed rather than
+inheriting the HTTP server's absolute request timeout. Reconnects use
+exponential backoff with jitter capped at 30 seconds and reset their failure
+count after 30 seconds of healthy streaming. A server restart that loses
+session state still requires a new application connection; transport resume
+preserves an existing session.
 
 `XHTTPConn.SetDeadline`, `SetReadDeadline` and `SetWriteDeadline` apply to
 application I/O, including already blocked operations. Clear a deadline with
@@ -603,20 +608,23 @@ The rule is a short ordered band list; the first matching band wins:
 | `BELOW:MIN-MAX` | The same with an explicit threshold, e.g. `512:600-1199` for the old shape. |
 | `A,B,...` | Several bands, matched in increasing threshold order. |
 
-`23:120-200,400:400-600`, for instance, keeps empty keepalive and ack-only
-objects at 120..200 bytes and everything else under 400 in the main band, so the
-control channel is not the only traffic on the wire shorter than the band.
+`23:120-200,400:400-600`, for instance, lifts the frame layer's control
+objects — a bare 6-byte ack or keepalive — into 120..200 bytes and puts
+everything else under 400 into the main band, so the control channel is not the
+only traffic on the wire shorter than it.
 
-Thresholds are wire sizes, so they have to clear the header of the object they
-are meant to catch. 23 is the 22-byte streaming envelope plus a byte of payload;
-the inner frame carries a 6-byte header, so the same control band starts at `7`
-there. A threshold at or below the header size matches only objects that cannot
-exist — `1:120-200` pads nothing, because the smallest frame is already 6 bytes
-— and a spec is rejected only when the numbers contradict each other, not when a
-band is simply unreachable. Thresholds must increase, and a band's lower bound
-must be at least `threshold-1` (otherwise its longest object already exceeds its
-own target and the pad would be negative); a spec that breaks either rule fails
-startup naming the band.
+A threshold is exclusive: a band with threshold `T` catches objects of at most
+`T-1` bytes. That is why the numbers read one past the object they are meant to
+catch, and why they have to clear its header — `7` catches a 6-byte frame, and
+`23` catches a bare 22-byte streaming envelope. A streamed control object is
+that envelope plus a frame, so 28 bytes and up: covering it at the transport
+layer needs a threshold of `29`, not `23`. A threshold at or below the header
+size matches only objects that cannot exist — `1:120-200` pads nothing, because
+the smallest frame is already 6 bytes — and a spec is rejected only when the
+numbers contradict each other, not when a band is simply unreachable. Thresholds
+must increase, and a band's lower bound must be at least `threshold-1`
+(otherwise its longest object already exceeds its own target and the pad would
+be negative); a spec that breaks either rule fails startup naming the band.
 
 Things worth knowing before changing it:
 
@@ -804,17 +812,25 @@ release.
 ### Protocol versioning & operational hardening
 
 - **Wire-protocol generation.** Every tunnel request carries
-  `X-XHTTP-Proto`; the current generation is 3. A client refuses to speak to a
-  server advertising a *newer* generation (a hard error, not a poll fallback —
-  a changed frame layout must not be polled by an older reader). An operator
-  can force the fleet off a retired generation with `min_proto_version`:
-  requests whose advertised version is lower (including header-less legacy
-  clients) get HTTP 426. Bumping the generation is a single constant in the
-  SDK.
+  `X-XHTTP-Proto`; the generation a current client announces is 3. A client
+  refuses to speak to a server advertising a *newer* generation (a hard error,
+  not a poll fallback — a changed frame layout must not be polled by an older
+  reader). An operator can force the fleet off a retired generation with
+  `min_proto_version`: requests whose advertised version is lower (including
+  header-less legacy clients) get HTTP 426. Bumping is deliberately not one
+  constant: `tunnelProtoVersion` is what the frame layout and the response
+  header track, `authProtoVersion` is the generation that first required a
+  signed nonce — the one `min_proto_version` is compared against, so raising the
+  offered generation cannot quietly reopen the bare-token path for an operator
+  who pinned 2 — and `bodyProtoVersion` marks the generation that signs its
+  metadata and bodies. A client announces `offeredProtoVersion`, the highest of
+  them.
 - **Signed credentials.** The PSK never crosses the wire. Each request carries
-  a fresh nonce plus its HMAC-SHA256 over the nonce, the session id, the
-  network and the target. A captured request therefore leaks nothing and
-  cannot be replayed or retargeted: the nonce is consumed in a 120 s replay
+  a fresh nonce plus its HMAC-SHA256 over a message that binds the nonce, the
+  session id, the network and the target — and, from generation 3, everything
+  else the dispatcher acts on (see the next bullet). A captured request
+  therefore leaks nothing and cannot be replayed or retargeted: the nonce is
+  consumed in a 120 s replay
   window keyed per server, and the session id, network and target are bound
   into the signature, so a signature cannot be lifted onto another session,
   aimed at a different address, or switched to a different transport protocol.
@@ -858,7 +874,10 @@ release.
   default; the global cap always still applies.
 - **Stats & health endpoint.** `Server.Stats()` returns monotonic counters
   (sessions created / rejected / kicked / reaped, request total, live gauge,
-  protocol version). Setting `health_path` (e.g. `/healthz`) serves them as
+  and `proto_version` — the frame-layout generation the server advertises,
+  `tunnelProtoVersion`, which is `1` and not the `X-XHTTP-Proto` generation a
+  client announces). Setting
+  `health_path` (e.g. `/healthz`) serves them as
   JSON on the tunnel listener — unauthenticated, so point it at a
   localhost/operator address, not the public one.
 - **Connection-slot reclamation.** A client `MaxConns` slot is released when

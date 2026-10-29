@@ -1450,7 +1450,7 @@ func (c *idleRefresher) Write(p []byte) (int, error) {
 type QUICDialFunc func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error)
 
 type DialConfig struct {
-	// WindowSizeMB sets the reliable send window (0 = 4 MiB, explicit 1-64).
+	// WindowSizeMB sets the reliable send window (0 = 8 MiB, explicit 1-64).
 	WindowSizeMB int
 	// Path is the Split-HTTP endpoint path on the server (e.g. "/stream").
 	Path string
@@ -1534,15 +1534,17 @@ func (c *DialConfig) lg() *zap.Logger {
 // everything else has a sensible default.
 type ClientConfig struct {
 	// WindowSizeMB sets each session's reliable send window in MiB.
-	// 0 preserves the 4 MiB default; valid explicit sizes are 1-64.
+	// 0 preserves the 8 MiB default; valid explicit sizes are 1-64.
 	WindowSizeMB int
 	// ServerURL is the xhttptunnel server endpoint, e.g.
 	// "https://cdn.example.com:8443/stream".
 	ServerURL string
 	// PSK is the pre-shared key. It is never sent: each request carries a
-	// fresh nonce plus its HMAC-SHA256 over the nonce, session id and target,
-	// so a captured request leaks nothing and cannot be replayed. Empty
-	// disables authentication.
+	// fresh nonce plus its HMAC-SHA256 over a message that binds the nonce,
+	// the session id, the network, the target, the request metadata and a
+	// digest of the body, so a captured request leaks nothing, cannot be
+	// replayed, and cannot be rewritten in flight. Empty disables
+	// authentication.
 	PSK string
 	// SNI overrides the TLS SNI. Empty derives it from ServerURL's host.
 	SNI string

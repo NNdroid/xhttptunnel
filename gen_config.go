@@ -746,7 +746,7 @@ func serverFieldDocs() []stringDoc {
 		{"listen", "Server address. Plain address or tcp+udp:// enables H3 only with TLS; tcp:// disables H3 for a CDN HTTP origin."},
 		{"path", "Custom Split-HTTP endpoint path (e.g. /stream)"},
 		{"target", "Default backend service to forward tunnel traffic to (e.g. tcp://127.0.0.1:22 or udp://127.0.0.1:51820). Alias: default_target"},
-		{"psk", "Pre-shared key for authentication. Never sent over the wire: each request carries a fresh nonce plus its HMAC-SHA256 over the nonce, session id and target, so a captured request leaks nothing and cannot be replayed or retargeted. Legacy clients that still send the bare token are accepted during the migration window (upgrade servers first, then clients). Aliases: token, auth_token. Empty = open mode."},
+		{"psk", "Pre-shared key for authentication. Never sent over the wire: each request carries a fresh nonce plus its HMAC-SHA256 over the nonce, session id, network and target — and from protocol generation 3 also the request metadata (including the masked sequence counters and the pad length) and a digest of the body — so a captured request leaks nothing, cannot be replayed or retargeted, and cannot be rewritten in flight. Legacy clients that still send the bare token are accepted during the migration window (upgrade servers first, then clients). Aliases: token, auth_token. Empty = open mode."},
 		{"selfsign", "Automatically generate simulated Amazon/Bing CDN self-signed TLS certificate if cert/key omitted (set false for plain HTTP behind CDN)"},
 		{"selfsign_cn", "Common Name for auto self-signed certificate (e.g. www.bing.com)"},
 		{"cert", "Optional path to custom TLS certificate file"},
@@ -758,7 +758,7 @@ func serverFieldDocs() []stringDoc {
 		{"max_sessions_per_ip", "Cap concurrent sessions from a single client address (0 = unlimited). Bounds one PSK holder's blast radius; counts the TCP peer address unless trust_proxy_headers is on."},
 		{"health_path", "When set (e.g. /healthz), expose an unauthenticated JSON stats endpoint on the tunnel listener. Empty = disabled. Keep off on a public listener."},
 		{"min_proto_version", "Reject (HTTP 426) clients advertising an X-XHTTP-Proto below this. 0 (default) accepts all clients, including legacy header-less ones. Set 2 to force the signed-nonce scheme: a client advertising v2 is admitted only by signature, which closes the bare-token fallback."},
-		{"window_size_mb", "Reliable send window per session in MiB (0 = 4; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
+		{"window_size_mb", "Reliable send window per session in MiB (0 = 8; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
 		{"chunk_size_kb", "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must be raised on BOTH ends together."},
 		{"padding", paddingFieldDoc},
 		{"trust_proxy_headers", "Honour CF-Connecting-IP / X-Forwarded-For / X-Real-IP for client-address logging. Those headers are spoofable; enable only behind a trusted proxy that strips them."},
@@ -774,7 +774,7 @@ func clientFieldDocs() []stringDoc {
 		{"listen", "Local TCP listening address for applications to connect to (e.g. tcp://127.0.0.1:1080)"},
 		{"server", "Remote xhttptunnel server streaming URL (e.g. https://example.com:8443/stream)"},
 		{"target", "Target backend service to connect through the tunnel (e.g. 127.0.0.1:22). Alias: forward"},
-		{"psk", "Pre-shared key matching the server. It is never sent: each request carries a fresh nonce plus its HMAC-SHA256 over the nonce, session id and target, so a captured request leaks nothing and cannot be replayed or retargeted. Aliases: token, auth_token. Empty = connect unauthenticated."},
+		{"psk", "Pre-shared key matching the server. It is never sent: each request carries a fresh nonce plus its HMAC-SHA256 over the nonce, session id, network and target — and from protocol generation 3 also the request metadata (including the masked sequence counters and the pad length) and a digest of the body — so a captured request leaks nothing and cannot be replayed, retargeted or rewritten in flight. Aliases: token, auth_token. Empty = connect unauthenticated."},
 		{"sni", "Optional TLS SNI disguise/domain (default: inherited from the server URL domain. Required if the server URL uses a CDN IP)"},
 		{"host", "Optional HTTP Host disguise/domain (default: inherited from the server URL domain. Required if the server URL uses a CDN IP)"},
 		{"alpn", "HTTP protocol selection: 'auto' (probe HTTP/3, fall back), 'h3', 'h2', or 'h1'"},
@@ -782,7 +782,7 @@ func clientFieldDocs() []stringDoc {
 		{"fingerprint", "SHA256 certificate pin of the server certificate (required for self-signed TLS; empty uses the system CA roots plus SNI hostname verification, which is appropriate for ordinary CDN HTTPS)"},
 		{"cert", "Optional path to the server's TLS certificate. Client mode does not read it; it is used only by the gen-uri command to derive the fingerprint pin above."},
 		{"key", "Optional path to the server's TLS private key. Not used by the client at all."},
-		{"window_size_mb", "Reliable send window per session in MiB (0 = 4; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
+		{"window_size_mb", "Reliable send window per session in MiB (0 = 8; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
 		{"chunk_size_kb", "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must match the server value; raise on BOTH ends together."},
 		{"padding", paddingFieldDoc},
 		{"idle_timeout", "Drop a local connection after this many seconds without traffic (default 900). Idle SSH sessions need a keepalive below it."},
@@ -868,7 +868,7 @@ func bindGenConfigFlags(cmd *flag.FlagSet, s *genSpec) {
 	cmd.IntVar(&s.MinProtoVersion, "min-proto-version", 0, "Reject clients advertising an older X-XHTTP-Proto (0 = accept all)")
 	cmd.IntVar(&s.ChunkSizeKB, "chunk-size-kb", 0, "Upstream payload per poll request, 16-900 (0 = 256)")
 	cmd.StringVar(&s.Padding, "padding", "", `Frame padding rule: "off", "MIN-MAX" or "BELOW:MIN-MAX" bands (default 400-600)`)
-	cmd.IntVar(&s.WindowSizeMB, "window-size-mb", 0, "Reliable send window per session in MiB, 1-64 (0 = 4)")
+	cmd.IntVar(&s.WindowSizeMB, "window-size-mb", 0, "Reliable send window per session in MiB, 1-64 (0 = 8)")
 	cmd.IntVar(&s.BufferBudgetMB, "buffer-budget-mb", 0, "Server admission budget for tunnel buffers in MiB (0 = disabled)")
 	cmd.IntVar(&s.MaxConns, "max-conns", 0, "Client max concurrent connections (0 = 512)")
 	cmd.IntVar(&s.IdleTimeout, "idle-timeout", 0, "Client seconds of silence before dropping a connection (0 = 900)")
@@ -1318,10 +1318,13 @@ func locationBlock(path, upstreamName, scheme string, bodyKB int, tokenHeader st
 	b.WriteString(pad + "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
 	fmt.Fprintf(&b, "%sproxy_set_header %s $http_%s;\n", pad, tokenHeader, httpArg(tokenHeader))
 	// Declared explicitly rather than left to the default pass-through: a
-	// missing nonce or MAC fails authentication with no error pointing at nginx,
-	// so this is the one case where the redundancy pays for the two lines.
+	// missing nonce, MAC or pad length fails the request with no error pointing
+	// at nginx, so this is the one case where the redundancy pays for the
+	// lines. X-Pad carries the signed pad length, and a signed request that
+	// arrives without it is refused outright.
 	b.WriteString(pad + "proxy_set_header X-HTTP-Tunnel-Nonce $http_x_http_tunnel_nonce;\n")
 	b.WriteString(pad + "proxy_set_header X-HTTP-Tunnel-MAC $http_x_http_tunnel_mac;\n")
+	b.WriteString(pad + "proxy_set_header X-Pad $http_x_pad;\n")
 	b.WriteString(pad + "# trust_proxy_headers must be on server-side for these to be trusted.\n\n")
 	b.WriteString(pad + "proxy_connect_timeout 10s;\n")
 	b.WriteString(pad + "proxy_read_timeout 86400s;\n")
