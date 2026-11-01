@@ -392,10 +392,16 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 			announce(err)
 			elapsed := time.Since(t0)
 
-			if virtualConn.isClosed() || virtualConn.closePending() || pumpCtx.Err() != nil {
-				a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "local close"})
-				return
-			}
+			// Classify the round error before any local-close check. The dial
+			// that owns this negotiation is woken by announce() and, on the
+			// failure path, calls pumpCancel() and virtualConn.Close() as it
+			// tears down (see dialXHTTPStream). Both make the checks below
+			// fire, and if they ran first the errStreamUnavailable branch
+			// would be skipped and the poll verdict never recorded — the
+			// fallback would then hand the caller a connection with no
+			// cached verdict, so a concurrent dial would probe again. The
+			// verdict branches below therefore run before those checks, and
+			// the checks only guard the reconnect loop.
 			if errors.Is(err, errProbeAborted) {
 				// Local close raced the negotiation — the tunnel is going
 				// away, so this is neither a path verdict nor a failure.
@@ -454,6 +460,16 @@ func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 					zap.Error(err),
 				)
 				a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "invalid peer ack", Detail: err.Error()})
+				return
+			}
+
+			// The verdict branches above ran, so a local close that raced them
+			// has still recorded what the path said. Now the round is over: if
+			// the session was closed from here, or the owning dial cancelled the
+			// pump while tearing down, there is nothing to reconnect — the
+			// tunnel is going away.
+			if virtualConn.isClosed() || virtualConn.closePending() || pumpCtx.Err() != nil {
+				a.events.emit(TunnelDied{SessionID: a.sessionID, Target: a.targetAddr, Network: a.network, Reason: "local close"})
 				return
 			}
 			if err != nil {
