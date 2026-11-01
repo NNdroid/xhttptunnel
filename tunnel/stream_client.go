@@ -34,6 +34,11 @@ const (
 	// Once a prior probe has succeeded the client widens to max(this,
 	// 3x the measured TTFB).
 	streamProbeMinWindow = 5 * time.Second
+	// streamProbeSetupBudget is how long the first probe may spend building
+	// the connection before the attempt is abandoned without a verdict. It is
+	// generous enough for a TLS handshake on a high-RTT link and short enough
+	// that a dead endpoint does not hold the dial open.
+	streamProbeSetupBudget = 15 * time.Second
 	// streamWatchdogTimeout is the no-frame stall threshold for an
 	// established stream; the server keepalives every 5s so a healthy path
 	// never trips it. 30s = 6× keepalive, leaving headroom for a slow
@@ -118,6 +123,13 @@ var errInvalidPeerAck = errors.New("tunnel: invalid peer acknowledgement")
 // from two separate sessions is the threshold.
 const streamPollDowngradeAfter = 2
 
+// streamPollDowngradeTTL is how long a downgrade to long polling holds before
+// the endpoint is probed again. It is shorter than the TTL a successful
+// negotiation gets, because the verdict it holds is about the path's current
+// state rather than about a property of the path, and a path that was
+// congested a minute ago may not be now.
+const streamPollDowngradeTTL = 60 * time.Second
+
 type streamModeEntry struct {
 	mode     string // "stream", "poll", or "" while failures accumulate
 	expiry   time.Time
@@ -183,11 +195,27 @@ func recordStreamPollVerdict(key, reason string, lg *zap.Logger) {
 	e.failures++
 	downgrade := e.failures >= streamPollDowngradeAfter
 	e.mode = ""
+	expiry := now.Add(streamModeCacheTTL)
 	if downgrade {
 		e.mode = "poll"
-		e.ttfbBase = 0
+		// The TTFB baseline is deliberately kept. It is a measurement of the
+		// path, not a property of the verdict: clearing it takes away the
+		// only thing that lets the next probe widen its window, so a path
+		// whose first probe was too short fails again for the same reason,
+		// and the endpoint is pinned to polling for as long as the entry
+		// lives. That is the worst possible outcome on a high-RTT link,
+		// because polling is the mode that recovers slowest.
+		//
+		// The downgrade is also given a shorter life than a full TTL. A
+		// verdict that says "this path cannot stream" is worth acting on, but
+		// not for as long as a successful negotiation is: the condition it
+		// describes is a property of the path right now, and paths change.
+		// Locking the endpoint to polling for the full TTL would mean one bad
+		// minute on a congested link costs the next half hour of the slowest
+		// mode available.
+		expiry = now.Add(streamPollDowngradeTTL)
 	}
-	e.expiry = now.Add(streamModeCacheTTL)
+	e.expiry = expiry
 	streamModeCache[key] = e
 	streamModeMu.Unlock()
 
@@ -557,12 +585,33 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	if probeWindow > 30*time.Second {
 		probeWindow = 30 * time.Second
 	}
-	deadline := roundStart.Add(probeWindow)
+	// The window measures the path, and the path only starts being measured
+	// once the request is on the wire. Before that, the time goes into
+	// building the connection — a TLS handshake on a 2s-RTT link costs more
+	// than the whole window, and charging that to the path would fail every
+	// probe on a high-latency link before it had a chance to answer.
+	//
+	// So the budget has two phases. The first is the setup, bounded by the
+	// transport's own dial timeout and ending in no verdict at all: a link
+	// that could not even be built says nothing about whether it can stream.
+	// The second starts when the request is written, and that is the one that
+	// answers the question.
+	//
 	// probeExpired records that the window itself ended the round, as opposed
 	// to our own upload plumbing cancelling it. The two are indistinguishable
 	// from roundCtx after the fact, and only the first is a path verdict.
+	//
+	// setupPhase tells the timer which budget it is expiring: the setup one
+	// ends the attempt without a verdict, the path one ends it with one.
 	var probeExpired atomic.Bool
-	probeTimer := time.AfterFunc(time.Until(deadline), func() {
+	var setupPhase atomic.Bool
+	setupPhase.Store(true)
+	probeTimer := time.AfterFunc(streamProbeSetupBudget, func() {
+		if setupPhase.Load() {
+			// The connection was never built. Say nothing about the path.
+			cancelRound()
+			return
+		}
 		probeExpired.Store(true)
 		cancelRound()
 	})
@@ -603,18 +652,38 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	// request never left the socket, the budget was spent on connection setup —
 	// no verdict. If it did, the origin (or an intermediary) is holding back the
 	// response headers, which is exactly the "this path buffers" verdict.
+	//
+	// The same hook starts the path measurement: from here the request is on
+	// the wire, so this is where the path's own latency begins and where the
+	// probe window starts counting.
 	var wroteRequest atomic.Bool
 	req = req.WithContext(httptrace.WithClientTrace(roundCtx, &httptrace.ClientTrace{
-		WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest.Store(true) },
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			wroteRequest.Store(true)
+			// The setup phase is over; the path phase begins now. The timer
+			// is switched over rather than restarted from scratch, so the
+			// setup budget and the path budget cannot overlap or leave a gap.
+			//
+			// Stop before Reset: Reset on an already-fired AfterFunc timer
+			// schedules the callback again, and this callback would then
+			// cancel a round that has already moved on. Stop reports whether
+			// the timer had already fired, and that is exactly the case in
+			// which the setup budget ran out and there is nothing left to
+			// measure.
+			setupPhase.Store(false)
+			if probeTimer.Stop() {
+				probeTimer.Reset(probeWindow)
+			}
+		},
 	}))
 
 	resp, err := client.Do(req)
 	if err != nil {
 		if pumpCtx.Err() == nil && roundCtx.Err() != nil {
 			if !wroteRequest.Load() {
-				return false, fmt.Errorf("%w (connection setup exceeded %v)", errProbeInconclusive, probeWindow)
+				return false, fmt.Errorf("%w (connection setup exceeded %v)", errProbeInconclusive, streamProbeSetupBudget)
 			}
-			return false, fmt.Errorf("%w (no response headers within %v: the path buffers responses)", errStreamUnavailable, probeWindow)
+			return false, fmt.Errorf("%w (no response headers within %v of the request reaching the wire: the path buffers responses)", errStreamUnavailable, probeWindow)
 		}
 		return false, err
 	}
@@ -674,18 +743,10 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		return false, err
 	}
 
-	// Reset the probe timer: the window should cover the hello wait, not the
-	// connection setup that has already completed. Without this, a high-RTT
-	// handshake consumes most of the window and the hello — which the server
-	// sends only after POST admission — arrives after the deadline.
-	if roundCtx.Err() == nil {
-		probeTimer.Stop()
-		deadline = time.Now().Add(probeWindow)
-		probeTimer = time.AfterFunc(time.Until(deadline), func() {
-			probeExpired.Store(true)
-			cancelRound()
-		})
-	}
+	// The probe timer was already restarted when the request reached the
+	// wire, so the window now covers exactly the hello wait: the server
+	// emits that frame only after the companion POST is admitted, and that
+	// is the part of the handshake the path is being judged on.
 
 	// Start the companion POST before waiting for the hello frame. A current
 	// origin emits that frame only after this request has passed auth and the

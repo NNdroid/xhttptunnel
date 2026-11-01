@@ -41,6 +41,17 @@ type wireProxy struct {
 	// observer holding them holds nothing, and this is what pins that.
 	padHeaders []string
 	methods    []string
+	// silent makes the proxy stop answering altogether: it accepts the
+	// request, forwards nothing, and never writes a response — not a byte,
+	// not a status, not a FIN. This is what a NAT that drops a flow looks
+	// like from the client's side, and it is the one failure the client
+	// cannot detect by reading.
+	silent bool
+	// requestSpans records how long each request took, in the order they
+	// arrived. A request the client abandons shows up here as a span that
+	// ends at the client's own deadline, which is the only way to observe
+	// that deadline from outside the client.
+	requestSpans []time.Duration
 }
 
 func newWireProxy(t *testing.T, originURL *url.URL) *wireProxy {
@@ -72,6 +83,24 @@ func newWireProxy(t *testing.T, originURL *url.URL) *wireProxy {
 		}
 		if reqHeaderEdit != nil {
 			reqHeaderEdit(r.Header)
+		}
+
+		p.mu.Lock()
+		silent := p.silent
+		p.mu.Unlock()
+		if silent {
+			// Hold the request open and answer nothing. The client's read
+			// side has to notice on its own.
+			//
+			// The span is recorded when the request finally ends, which for
+			// a silent hop is when the client gives up on it. That is the
+			// only externally visible trace of the client's own deadline.
+			started := time.Now()
+			<-r.Context().Done()
+			p.mu.Lock()
+			p.requestSpans = append(p.requestSpans, time.Since(started))
+			p.mu.Unlock()
+			return
 		}
 
 		p.mu.Lock()

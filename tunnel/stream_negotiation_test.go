@@ -73,6 +73,70 @@ func TestStreamPollVerdictNeedsTwoConsecutiveFailures(t *testing.T) {
 	}
 }
 
+// TestStreamDowngradeKeepsTheTTFBBaseline pins the rule that a downgrade must
+// not throw away what the path was measured at.
+//
+// The baseline is the only thing that lets the next probe widen its window
+// past the fixed minimum, and the fixed minimum is what a high-RTT path
+// cannot meet. Clearing it on a downgrade therefore made the next probe fail
+// for exactly the same reason, which made the next downgrade, and the
+// endpoint stayed pinned to polling — the mode that recovers slowest — for
+// as long as the entry lived.
+//
+// The measurement belongs to the path. A verdict about the path does not
+// change what the path measures.
+func TestStreamDowngradeKeepsTheTTFBBaseline(t *testing.T) {
+	resetStreamVerdicts()
+	defer resetStreamVerdicts()
+	lg := zap.NewNop()
+	const key = "h1|example:443|sni|fp|tk"
+
+	// A successful negotiation publishes the measured time-to-first-byte.
+	const measured = 2 * time.Second
+	cacheStreamMode(key, "stream", measured)
+
+	// Two failures downgrade the endpoint.
+	recordStreamPollVerdict(key, "first", lg)
+	recordStreamPollVerdict(key, "second", lg)
+	if mode, _ := streamVerdict(key); mode != "poll" {
+		t.Fatalf("the endpoint did not downgrade: mode=%q", mode)
+	}
+
+	// The baseline survives the downgrade.
+	if _, ttfb := cachedStreamMode(key); ttfb != measured {
+		t.Fatalf("the downgrade discarded the TTFB baseline: got %v, want %v", ttfb, measured)
+	}
+}
+
+// TestStreamDowngradeExpiresSoonerThanASuccess pins the other half of the
+// downgrade rule: the verdict is about the path as it is now, and paths
+// change.
+//
+// A downgrade used to live as long as a successful negotiation — the full
+// TTL — which meant one bad minute on a congested link cost the next half
+// hour of the slowest mode available. The probe that would have discovered
+// the path was fine again never ran.
+func TestStreamDowngradeExpiresSoonerThanASuccess(t *testing.T) {
+	resetStreamVerdicts()
+	defer resetStreamVerdicts()
+	lg := zap.NewNop()
+	const key = "h1|example:443|sni|fp|tk"
+
+	recordStreamPollVerdict(key, "first", lg)
+	recordStreamPollVerdict(key, "second", lg)
+
+	streamModeMu.Lock()
+	downgradeExpiry := streamModeCache[key].expiry
+	streamModeMu.Unlock()
+
+	if !downgradeExpiry.Before(time.Now().Add(streamModeCacheTTL)) {
+		t.Fatalf("a downgrade expires at %v, which is not sooner than the success TTL %v", downgradeExpiry, streamModeCacheTTL)
+	}
+	if !downgradeExpiry.After(time.Now()) {
+		t.Fatalf("a downgrade expired at %v, which is already in the past", downgradeExpiry)
+	}
+}
+
 // stalledStreamWriter is an http.ResponseWriter whose second Write blocks, which
 // parks a streaming downlink handler while it still owns the dispatch cursor
 // (its first Write is the hello frame).

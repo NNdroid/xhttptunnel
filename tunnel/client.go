@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -27,8 +28,52 @@ import (
 
 const (
 	// clientRequestTimeout bounds a single poll request, including reading its
-	// response body.
+	// response body. It is the ceiling for a server that does not advertise
+	// its own long-poll timeout; a server that does gets a tighter, derived
+	// bound instead (see pollRequestTimeout).
 	clientRequestTimeout = 90 * time.Second
+	// pollTimeoutGrace is added to the server's advertised long-poll timeout
+	// to get the client's own request deadline. The grace covers the round
+	// trip the poll itself spends on the wire, plus the jitter a CDN adds on
+	// top. Without it a healthy poll on a slow link would be cut off by the
+	// client's own deadline, which is the failure this whole mechanism
+	// exists to avoid.
+	pollTimeoutGrace = 15 * time.Second
+	// pollTimeoutGraceCap bounds the grace, so a server that advertises a
+	// very long poll does not turn the client's deadline into an unbounded
+	// wait of its own.
+	pollTimeoutGraceCap = 30 * time.Second
+	// pollRestartBackoffCap is the longest the poll pump waits between
+	// recovery rounds.
+	pollRestartBackoffCap = 30 * time.Second
+	// pollFailureRetryInterval is the pause between two failed polls. It is
+	// the cost of a failure that did not have to wait out the deadline.
+	pollFailureRetryInterval = 300 * time.Millisecond
+	// pollFailureBudget is how long a worker keeps retrying one connection
+	// before concluding that the connection itself is gone. It has to be at
+	// least one failure long, because a single failure can cost the whole
+	// deadline when the path is slow, and it has to be several failures long
+	// on a fast path, because giving up on a connection and building a new
+	// one costs a handshake — and a worker that gives up too eagerly turns a
+	// flaky link into a reconnect storm.
+	//
+	// It is a target rather than a hard bound. The minimum number of
+	// attempts overrides it when a single failure is more expensive than the
+	// budget, which is the case for a server that does not advertise its
+	// window: the fallback deadline is a minute and a half, so three
+	// attempts cost four and a half minutes whatever the budget says. That
+	// is the price of not giving up on the first slow response.
+	pollFailureBudget = 3 * time.Minute
+	// pollFailureThresholdMin and pollFailureThresholdMax bracket the count
+	// derived from the budget, so an unknown window still gets a sane number
+	// and a very short window does not produce a threshold of one.
+	pollFailureThresholdMin = 3
+	pollFailureThresholdMax = 20
+	// pollBodyBudgetFloor is the shortest a poll body may take to arrive.
+	// Below this a body in transit is indistinguishable from a stalled one,
+	// and the transfer of a quarter of a megabyte on a slow link needs more
+	// than a moment.
+	pollBodyBudgetFloor = 30 * time.Second
 	// protoCacheTTL keeps a negotiated protocol per endpoint. Without it every
 	// tunnel connection pays for its own QUIC probe plus TLS handshake.
 	protoCacheTTL = 5 * time.Minute
@@ -67,6 +112,257 @@ const (
 	// configurable via ClientConfig.IdleTimeout.
 	defaultClientIdleTimeout = 15 * time.Minute
 )
+
+// cancelOnCloseBody releases a request context's deadline timer when the
+// response body is closed. A poll's body is consumed on several paths — read
+// in full, read partially and abandoned, or never read because the status was
+// not what the caller wanted — and each of them has to give the timer back.
+// Tying the release to the body means there is one place that does it.
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (c *cancelOnCloseBody) Close() error {
+	err := c.ReadCloser.Close()
+	c.once.Do(c.cancel)
+	return err
+}
+
+// deadlineBody is a response body that runs on its own deadline, separate
+// from the one that governs how long the client waits for the response
+// headers.
+//
+// The two are different questions. "Is the path alive?" is answered by the
+// headers, and the answer has to come quickly — a dead path must not look
+// alive for the length of a request timeout. "Is the body arriving?" is a
+// throughput question, and its answer depends on how much there is to
+// receive and how fast the link carries it: a poll body can be a quarter of
+// a megabyte, which on a slow link is tens of seconds of perfectly healthy
+// transfer.
+//
+// One deadline for both would have to be the larger of the two, and the
+// larger one is exactly the one that hides a dead path. So the header wait
+// gets the tight deadline and the body gets one scaled to the body.
+//
+// The budget is enforced by closing the body when it runs out, which is what
+// an http response body does when its transport goes away: a read that is
+// blocked on the body unblocks and reports the failure.
+type deadlineBody struct {
+	io.ReadCloser
+	timer  *time.Timer
+	once   sync.Once
+	closed chan struct{}
+}
+
+func newDeadlineBody(body io.ReadCloser, budget time.Duration) *deadlineBody {
+	d := &deadlineBody{ReadCloser: body, closed: make(chan struct{})}
+	d.timer = time.AfterFunc(budget, func() {
+		d.once.Do(func() { close(d.closed) })
+		// Closing the underlying body is what unblocks a read that is
+		// waiting for bytes that are not coming.
+		_ = body.Close()
+	})
+	return d
+}
+
+func (d *deadlineBody) Read(p []byte) (int, error) {
+	select {
+	case <-d.closed:
+		return 0, errPollBodyTimeout
+	default:
+	}
+	return d.ReadCloser.Read(p)
+}
+
+func (d *deadlineBody) Close() error {
+	d.timer.Stop()
+	d.once.Do(func() { close(d.closed) })
+	return d.ReadCloser.Close()
+}
+
+// errPollBodyTimeout is what a body read reports when its own budget ran out
+// before the bytes arrived.
+var errPollBodyTimeout = errors.New("tunnel: the poll body did not arrive in time")
+
+// pollBodyBudget is how long a poll response body may take to arrive.
+//
+// It is the header deadline plus the time the biggest possible body needs on
+// the slowest link worth supporting. The floor matters: a body that is
+// arriving steadily is a healthy link, and cutting it off mid-transfer would
+// turn a slow-but-working path into a stalled one — which is the opposite of
+// what the tight header deadline is for.
+func pollBodyBudget(headerDeadline time.Duration) time.Duration {
+	// A quarter of a megabyte at 16 KiB/s: a link slow enough that this
+	// dominates still gets its body.
+	const slowestLink = 16 * 1024
+	biggestBody := currentMaxSendBufSize()
+	transfer := time.Duration(biggestBody/slowestLink) * time.Second
+	budget := headerDeadline + transfer
+	if budget < pollBodyBudgetFloor {
+		budget = pollBodyBudgetFloor
+	}
+	if budget > clientRequestTimeout {
+		budget = clientRequestTimeout
+	}
+	return budget
+}
+
+// pollFailureThreshold is how many consecutive poll failures a worker
+// tolerates before it gives up on the connection and asks the pump to build a
+// new one.
+//
+// The number is scaled by how long a failure costs, because the thing it
+// really expresses is a duration: "keep retrying this connection for a while
+// before concluding it is dead". Expressed as a bare count it meant whatever
+// the request timeout happened to be — twenty-one failures at ninety seconds
+// each was half an hour, and at twenty seconds each it is seven minutes,
+// which is a different decision made by the same number.
+//
+// The budget is what the worker is allowed to spend. A single failure that
+// costs more than the whole budget still counts as one, because there is no
+// smaller decision to make: the connection has to be abandoned either way,
+// and the count only says how many chances it gets.
+func pollFailureThreshold(serverWaitNanos int64) int32 {
+	deadline := pollRequestTimeout(time.Duration(serverWaitNanos))
+	// One failure costs the deadline; the rest are the quick retries that
+	// follow it. Count the deadline as one and the retries as another.
+	perFailure := deadline + pollFailureRetryInterval
+	if perFailure <= 0 {
+		return pollFailureThresholdMin
+	}
+	n := int32(pollFailureBudget / perFailure)
+	if n < pollFailureThresholdMin {
+		// Even one failure can exceed the budget, or the budget can only
+		// afford a couple. Let it have the minimum number of attempts:
+		// giving up on the first error would turn a single slow response
+		// into a reconnect storm.
+		n = pollFailureThresholdMin
+	}
+	if n > pollFailureThresholdMax {
+		n = pollFailureThresholdMax
+	}
+	return n
+}
+
+// retryAfterDelay reads a Retry-After header and turns it into a delay.
+//
+// The header has two forms: a number of seconds, and an HTTP date. Both
+// appear in the wild — Cloudflare sends the date form, most proxies send the
+// seconds form — so both are read.
+//
+// A value that cannot be parsed, or that asks for a wait longer than the
+// ceiling, falls back to the default. The ceiling matters: a hostile or
+// confused edge could otherwise park the client for hours, and a wait that
+// long says nothing useful that a shorter one would not.
+func retryAfterDelay(v string) time.Duration {
+	const fallback = time.Second
+	const ceiling = 60 * time.Second
+
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return fallback
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return fallback
+		}
+		d := time.Duration(secs) * time.Second
+		if d > ceiling {
+			d = ceiling
+		}
+		return d
+	}
+	if when, err := http.ParseTime(v); err == nil {
+		d := time.Until(when)
+		if d <= 0 {
+			return fallback
+		}
+		if d > ceiling {
+			d = ceiling
+		}
+		return d
+	}
+	return fallback
+}
+
+// pollRestartBackoff is the wait before the poll pump starts a fresh round
+// after the previous one died. It grows exponentially and is capped, and it
+// carries equal jitter: the delay is drawn from the upper half of the
+// interval, so it is never shorter than half the nominal value and never
+// longer than the full one.
+//
+// The jitter is the point. Without it the sequence is deterministic, so every
+// client that lost the same link comes back at the same instants — the edge
+// sees a stampede exactly when it is least able to absorb one, which is
+// right after the outage that caused it. The stream path has had this since it
+// was written; the poll path did not, and the poll path is the one that
+// tends to fail in bulk (a dropped uplink takes every session at once).
+func pollRestartBackoff(restarts int) time.Duration {
+	base := 2 * time.Second
+	for i := 1; i < restarts && base < pollRestartBackoffCap; i++ {
+		base *= 2
+	}
+	if base > pollRestartBackoffCap {
+		base = pollRestartBackoffCap
+	}
+	half := base / 2
+	return half + time.Duration(mrand.Int63n(int64(base-half)+1))
+}
+
+// pollRequestTimeout turns the server's advertised long-poll window into the
+// client's own deadline for one poll.
+//
+// The reasoning is about what the two numbers mean. A poll that comes back
+// empty is the server saying "I had nothing for you, and I held the request
+// for my whole window". A poll that never comes back is a path that is gone.
+// Both look identical to a client with no idea how long the server was
+// willing to wait, so the client has to pick one timeout for both — and any
+// value that covers the first also covers the second.
+//
+// Telling the client the window separates them. The deadline becomes the
+// window plus a grace for the round trip, so a healthy poll always fits and a
+// dead path fails in seconds rather than after the fixed ceiling.
+//
+// A window of zero means the server did not say, which is the case for an
+// older origin or a hop that stripped the header. Then the client keeps its
+// own conservative bound: a wrong guess here costs latency, not correctness.
+func pollRequestTimeout(serverWait time.Duration) time.Duration {
+	if serverWait <= 0 {
+		return clientRequestTimeout
+	}
+	grace := pollTimeoutGrace
+	if grace > pollTimeoutGraceCap {
+		grace = pollTimeoutGraceCap
+	}
+	deadline := serverWait + grace
+	if deadline > clientRequestTimeout {
+		// The ceiling still holds: the client must not wait longer than it
+		// ever did, whatever the server claims.
+		return clientRequestTimeout
+	}
+	return deadline
+}
+
+// serverPollWaitFromHeader reads the server's advertised long-poll window.
+// A missing or nonsensical value means "not advertised", not "zero".
+func serverPollWaitFromHeader(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	// Anything beyond a minute is not a long poll this protocol knows about,
+	// and believing it would mean waiting that long before noticing a dead
+	// path. Treat it as not advertised.
+	if secs > 60 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
 
 var (
 	// transportCache holds one HTTP/1.1 or h2 transport per endpoint. Sessions
@@ -626,6 +922,9 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 	// returning worker can tell whether its slot is still the live one.
 	var pollMu sync.Mutex
 	var pollSlot *pollHandle
+	// restartCount counts the recovery rounds this pump has been through. It
+	// lives outside the goroutine so the death event below can report it.
+	var restartCount atomic.Int32
 	logger.Debug("🚀 starting client HTTP data pump", zap.String("session", sessionID), zap.String("target", targetAddr), zap.String("transport", fmt.Sprintf("%T", rt)))
 
 	go func() {
@@ -633,6 +932,34 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		defer pumpCancel()
 		defer virtualConn.Close()
 		defer logger.Debug("💀 client HTTP data pump stopped", zap.String("session", sessionID))
+		// A pump that stops for a reason other than a local close is a tunnel
+		// that died, and the operator has to be able to see it. The close
+		// error, when there is one, carries the cause; a pump that gave up on
+		// its own says so explicitly.
+		//
+		// A refusal reports itself where it happens, with the reason the
+		// server gave, so this must not report it a second time in generic
+		// terms.
+		var reported atomic.Bool
+		defer func() {
+			if virtualConn.closePending() || reported.Load() {
+				return
+			}
+			reason := "error"
+			detail := ""
+			if cerr := virtualConn.getCloseErr(); cerr != nil {
+				detail = cerr.Error()
+			} else if restartCount.Load() > 0 {
+				reason = "max retries"
+			}
+			cfg.events.emit(TunnelDied{
+				SessionID: sessionID,
+				Target:    targetAddr,
+				Network:   network,
+				Reason:    reason,
+				Detail:    detail,
+			})
+		}()
 
 		// atomic.Uint64, never a bare uint64: the worker goroutines read it and
 		// this pump updates it from the response path, and the CAS below runs
@@ -650,24 +977,33 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 		// it lives in virtualConn.padInTransport, which the frame layer also
 		// reads. See the two places below for why there is only one copy.
 
-		restartCount := 0
+		// serverPollWait is how long the server says it parks an idle poll.
+		// It arrives on the first response and then stays put: the window is
+		// a property of the server's configuration, not of the moment. It is
+		// what turns "the request timed out" into "the path is gone", which
+		// is the difference between recovering in seconds and recovering in
+		// minutes.
+		var serverPollWait atomic.Int64
 
 		for !virtualConn.isClosed() && !virtualConn.closePending() {
-			if restartCount > 0 {
-				if restartCount > 6 {
-					logger.Error("❌ [Pump] data pump restart limit reached (over 90s), giving up recovery, closing tunnel", zap.String("session", sessionID))
-					break
-				}
-
-				backoff := time.Duration(1<<restartCount) * time.Second
-				if backoff > 30*time.Second {
-					backoff = 30 * time.Second
-				}
+			round := int(restartCount.Load())
+			if round > 0 {
+				// The backoff is jittered. A deterministic sequence means every
+				// client that lost the same link at the same moment comes back
+				// at the same moments too, and the edge sees a synchronised
+				// stampede instead of a trickle. The stream path already
+				// jitters; this path was the one that did not.
+				backoff := pollRestartBackoff(round)
 				logger.Warn("⚠️ [Pump] severe network error, data pump exited, will auto-restart after exponential backoff",
 					zap.String("session", sessionID),
-					zap.Int("restarts", restartCount),
+					zap.Int("restarts", round),
 					zap.Duration("backoff", backoff),
 				)
+				cfg.events.emit(Reconnecting{
+					SessionID: sessionID,
+					Nth:       round,
+					Reason:    "poll transport failed",
+				})
 				select {
 				case <-time.After(backoff):
 				case <-pumpCtx.Done():
@@ -828,6 +1164,63 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						}
 					}
 
+					// Give the request a deadline derived from what the server
+					// says it does, rather than the fixed ceiling. A healthy
+					// poll comes back within the server's own long-poll
+					// window; a link that a NAT dropped silently never does,
+					// and the difference between the two is exactly what the
+					// window tells us. Waiting out the fixed ceiling instead
+					// means a dead path looks alive for a minute and a half,
+					// and the recovery machinery never gets to run.
+					//
+					// The deadline covers the wait for the response headers
+					// only. The body that follows gets its own, longer one,
+					// because a body in transit is a healthy link and cutting
+					// it off would turn a slow path into a stalled one.
+					//
+					// The two are separated by a timer that the request's own
+					// trace stops: the deadline is armed when the request goes
+					// out, and disarmed the moment the first response byte
+					// arrives. The body's own deadline is armed at that point
+					// instead, on a context of its own so that the two do not
+					// share a clock.
+					//
+					// The timeout lives on the request context, not on the
+					// http.Client: the client is shared, and one session's
+					// idea of the server's window must not change another's.
+					//
+					// The cancel is called explicitly rather than deferred:
+					// this is a loop, and a defer here would pile up one
+					// timer per iteration until the worker itself exits.
+					reqDeadline := pollRequestTimeout(time.Duration(serverPollWait.Load()))
+					var cancelDeadline context.CancelFunc
+					var releaseHeaderDeadline func()
+					if reqDeadline > 0 {
+						// A cancellable context plus a timer of its own, rather
+						// than context.WithTimeout: the deadline has to be
+						// revocable the moment the response headers arrive,
+						// because the body that follows needs a different and
+						// longer one. A context deadline cannot be extended.
+						//
+						// stopDeadline disarms the timer without cancelling
+						// the context, which is what lets the body keep
+						// reading on a context that is no longer under the
+						// header deadline.
+						var reqCancel context.CancelFunc
+						var timer *time.Timer
+						reqCtx, reqCancel = context.WithCancel(reqCtx)
+						timer = time.AfterFunc(reqDeadline, reqCancel)
+						stopDeadline := func() { timer.Stop() }
+						cancelDeadline = func() {
+							stopDeadline()
+							reqCancel()
+						}
+						// Releasing the header deadline without killing the
+						// context is a separate act, and the body path needs
+						// it.
+						releaseHeaderDeadline = stopDeadline
+					}
+
 					req, _ := http.NewRequestWithContext(reqCtx, method, reqURL, bodyReader)
 
 					if bodyLen > 0 {
@@ -892,6 +1285,9 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							zap.String("session", sessionID),
 							zap.Error(authErr),
 						)
+						if cancelDeadline != nil {
+							cancelDeadline()
+						}
 						virtualConn.setCloseErr(fmt.Errorf("tunnel: could not generate a nonce: %w", authErr))
 						virtualConn.Close()
 						pumpCancel()
@@ -932,6 +1328,36 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						pollMu.Unlock()
 					}
 
+					// The response headers are in, so the question "is the path
+					// alive?" is answered and the header deadline has done its
+					// job. What is left is a body in transit, which is a
+					// different question with a different answer: it depends
+					// on how much there is to receive and how fast the link
+					// carries it, and a quarter of a megabyte on a slow link
+					// is tens of seconds of perfectly healthy transfer.
+					//
+					// So the body moves onto a context of its own, with a
+					// budget scaled to the biggest body the peer can send. The
+					// header deadline is released at the same time: keeping
+					// it would cut the body off at exactly the moment the
+					// path proved it was working.
+					if cancelDeadline != nil {
+						if resp != nil && resp.Body != nil {
+							// Stop the header timer first, so it cannot fire
+							// against a body that is already being read. The
+							// request context stays alive: it is what the
+							// body reads through.
+							if releaseHeaderDeadline != nil {
+								releaseHeaderDeadline()
+							}
+							body := newDeadlineBody(resp.Body, pollBodyBudget(reqDeadline))
+							resp.Body = &cancelOnCloseBody{ReadCloser: body, cancel: cancelDeadline}
+							cancelDeadline = nil
+						} else {
+							cancelDeadline()
+						}
+					}
+
 					if len(upData) == 0 {
 						atomic.AddInt32(&emptyPollers, -1)
 						// Must take the lock: a bare cond.Broadcast() can be
@@ -958,7 +1384,16 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						dispatchSeq = ackedByServer.Load()
 						windowMu.Unlock()
 						atomic.StoreInt32(&triggerRetry, 1)
-						if atomic.AddInt32(&consecutiveErrors, 1) > 20 {
+						// The threshold is a count of consecutive failures, and a
+						// count only means something next to how long a failure
+						// takes. With the deadline now derived from the server's
+						// window, a failure costs seconds rather than a minute and
+						// a half, so twenty-one of them is a couple of minutes of
+						// retrying the same dead connection before the pump gives
+						// up on it and builds a new one. The count is scaled with
+						// the deadline so the wall-clock time it represents stays
+						// roughly the same whatever the path costs.
+						if atomic.AddInt32(&consecutiveErrors, 1) > pollFailureThreshold(serverPollWait.Load()) {
 							logger.Warn("❌ [Pump] too many consecutive errors, worker exiting to trigger a data pump restart", zap.Int("worker", id))
 							break
 						}
@@ -970,6 +1405,16 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						continue
 					}
 					atomic.StoreInt32(&consecutiveErrors, 0)
+
+					// The server's long-poll window, learned from the response.
+					// Once known, the next request's deadline is derived from it
+					// instead of the fixed ceiling, which is what lets a dead
+					// path be noticed in seconds rather than in a minute and a
+					// half. A hop that strips the header only costs the old
+					// behaviour, so this is safe to take as a hint.
+					if wait := serverPollWaitFromHeader(resp.Header.Get(PollTimeoutHeader)); wait > 0 {
+						serverPollWait.Store(int64(wait))
+					}
 
 					// The counters of a response travel masked under the key
 					// that signed the request, and the bytes themselves are
@@ -1051,6 +1496,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							resp.StatusCode == http.StatusUnauthorized ||
 							resp.StatusCode == http.StatusForbidden {
 							if cfg.events != nil {
+								reported.Store(true)
 								if resp.StatusCode == http.StatusForbidden {
 									cfg.events.emit(TargetDenied{SessionID: sessionID, Target: targetAddr, Network: network})
 									cfg.events.emit(TunnelDied{SessionID: sessionID, Target: targetAddr, Network: network, Reason: "target denied", Detail: string(bodyErr)})
@@ -1083,8 +1529,16 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 
 						// 429 Too Many Requests: hit a CDN/WAF rate limit, back off briefly.
 						if resp.StatusCode == http.StatusTooManyRequests {
+							// A rate limiter that says when to come back is worth
+							// listening to. Cloudflare and most CDNs answer a 429
+							// with Retry-After, and retrying in a second when the
+							// edge asked for a minute is how a client turns one
+							// rate limit into a sustained one: the retries are
+							// what keep the limiter angry.
+							retryAfter := retryAfterDelay(resp.Header.Get("Retry-After"))
 							logger.Warn("⚠️ [Pump] hit CDN/WAF rate limit (429 Too Many Requests), backing off...",
 								zap.String("session", sessionID),
+								zap.Duration("backoff", retryAfter),
 							)
 							// A 429 is an edge-generated response that consumed none of
 							// the upload bytes, so rewind to the sequence of the request
@@ -1097,7 +1551,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							dispatchSeq = currentSeq
 							windowMu.Unlock()
 							bytesBufPool.Put(downBuf)
-							if !sleepCtx(pumpCtx, 1*time.Second) {
+							if !sleepCtx(pumpCtx, retryAfter) {
 								break
 							}
 							continue
@@ -1377,7 +1831,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 			}
 
 			wg.Wait()
-			restartCount++
+			restartCount.Add(1)
 		}
 
 		// All current transports are shared. Keep the ownership guard so a

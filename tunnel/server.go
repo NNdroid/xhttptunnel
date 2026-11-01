@@ -538,6 +538,19 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// Advertise this server's protocol generation and, when configured,
 		// refuse clients that announced an older one than the operator allows.
 		w.Header().Set(ProtoHeader, strconv.Itoa(tunnelProtoVersion))
+		// How long this server parks an idle poll. The client needs this to
+		// know how long a healthy request may take: without it the client
+		// can only pick a request timeout for itself, and any value large
+		// enough to cover a long poll is also large enough to cover a link
+		// that has been silently dropped by a NAT. Telling the client the
+		// server's own bound lets it fail fast on a dead path instead of
+		// waiting out a timeout it chose for a different reason.
+		//
+		// It goes on every response, including the refusals below: a client
+		// that is being turned away is exactly the one that will dial again,
+		// and it should not have to learn the window from a successful
+		// session first.
+		w.Header().Set(PollTimeoutHeader, strconv.Itoa(int(st.longPollTimeout.Seconds())))
 		if st.minProto > 0 {
 			if v, err := strconv.Atoi(r.Header.Get(ProtoHeader)); err != nil || v < st.minProto {
 				logger.Warn("❌ [HTTP] rejected request: protocol version too old",
@@ -954,7 +967,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		if caps != "" {
 			w.Header().Set(CapsHeader, caps)
 		}
-		w.Header().Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Pad, X-HTTP-Tunnel-Caps, X-HTTP-Tunnel-Resp-MAC, Content-Length")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Pad, X-HTTP-Tunnel-Caps, X-HTTP-Tunnel-Resp-MAC, X-HTTP-Tunnel-Poll-Timeout, Content-Length")
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Server", "nginx")
 		w.WriteHeader(http.StatusOK)

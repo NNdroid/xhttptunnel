@@ -211,9 +211,20 @@ all:
   the camouflage headers `User-Agent`, `Accept`, `Accept-Encoding`,
   `Cache-Control`, `Pragma`, `Content-Type`.
 - *Response* — `X-XHTTP-Proto`, `X-Seq`, `X-Ack`, `X-Pad`, `X-Session-ID`,
-  `X-HTTP-Tunnel-Caps`, `X-HTTP-Tunnel-Resp-MAC`, `X-Downstream-Accepted`,
-  `X-Stream-Uplink-Sync`, `X-Session-Created`, plus
+  `X-HTTP-Tunnel-Caps`, `X-HTTP-Tunnel-Resp-MAC`, `X-HTTP-Tunnel-Poll-Timeout`,
+  `X-Downstream-Accepted`, `X-Stream-Uplink-Sync`, `X-Session-Created`, plus
   `Cache-Control`, `Pragma`, `Expires`, `X-Accel-Buffering`.
+
+`X-HTTP-Tunnel-Poll-Timeout` tells the client how long this server parks an
+idle poll, in seconds. It is a hint, not a credential: a client that never
+sees it falls back to its own conservative bound, and a hop that tampers with
+it can cost that client a timeout and nothing else. It earns its place
+because the client cannot otherwise tell a poll that is coming back empty
+from a link that has gone silent — the two look identical to a client with no
+idea how long the server was willing to wait, so any request timeout large
+enough to cover the first also covers the second, and a dead path looks alive
+for as long as that timeout is. With the number, the client fails fast on a
+dead path and recovers in seconds instead of minutes.
 
 `X-HTTP-Tunnel-Nonce` and `X-HTTP-Tunnel-MAC` are the v2 credentials. A request
 that advertises `X-XHTTP-Proto: 2` commits to the signature and the bare-token
@@ -514,6 +525,12 @@ TTL 5 min):
    authentication and the per-session admission limit, the server flushes a
    hello frame. If it arrives within `max(5s, 3× measured TTFB)` (capped at
    30 s), both directions are usable and the path does not buffer responses.
+   The window is measured from the moment the request reaches the wire, not
+   from the start of the round: building the connection is the transport's
+   business, and charging a TLS handshake to the path would fail every probe
+   on a high-RTT link before the path had a chance to answer. Connection setup
+   gets its own budget (15 s) and ends the attempt with *no verdict* when it
+   runs out.
 3. **Watchdog** — an established stream must see a frame (data or keepalive,
    emitted every 5 s) within 30 s, otherwise it is re-established with resume
    (`X-Ack`), indefinitely and with capped exponential backoff. An established
@@ -525,7 +542,13 @@ A failed negotiation downgrades the endpoint for the TTL only after **two
 consecutive conclusive** failures. A single sample is not enough, because one
 probe can be tripped by a transient edge state (a 429/503 from a CDN, an origin
 restarting mid-probe) and every session dialed during the TTL would inherit that
-verdict. Two outcomes are explicitly *not* conclusive and never cache anything:
+verdict. The downgrade itself lasts a minute rather than the full TTL: it
+describes the path as it is now, and paths change. The measured TTFB survives
+the downgrade, because it is a measurement of the path and the verdict is not —
+discarding it would take away the only way the next probe can widen its window,
+and the endpoint would fail the same way twice for the same reason.
+
+Two outcomes are explicitly *not* conclusive and never cache anything:
 
 - **Connection setup exceeded the probe window** — a cold TCP/TLS handshake on a
   slow link costs the same seconds a buffering path does, and elapsed time
@@ -553,6 +576,39 @@ transport-only interruption resumes the same server session; if the origin
 restarts, reaps, or kicks that session, the client closes the old application
 connection explicitly because its acknowledged sequence space cannot be
 safely rebased. The application can then open a fresh tunnel.
+
+### Recovering from a bad link
+
+Both transports recover, and they recover on the same terms: a link that goes
+away does not end the tunnel. The client rebuilds its transport and keeps the
+session, indefinitely, with a capped exponential backoff — the stream path
+resumes the acknowledged sequence space, and the poll path replays from the
+sequence the peer last acknowledged.
+
+What makes the recovery fast is knowing how long a *healthy* request should
+take. The server advertises its long-poll window in
+`X-HTTP-Tunnel-Poll-Timeout`, and the client derives its request deadline
+from that window plus a grace, rather than from a fixed ceiling of its own.
+The difference is the whole point: a fixed ceiling has to be large enough to
+cover a long poll that comes back empty, and that makes it large enough to
+cover a link that a NAT dropped silently. With the window, a silent link is
+noticed in the server's window plus the grace — seconds, not minutes — and
+the recovery machinery gets to run.
+
+The number of attempts before the worker abandons one connection and asks for
+a new one is derived from the same deadline. A count only means something next
+to what a failure costs: twenty-one failures at ninety seconds each is half an
+hour, and at twenty seconds each it is seven minutes — a different decision
+made by the same number. The threshold is scaled so the *time* it represents
+stays roughly constant.
+
+Two smaller rules matter on a congested path. A rate limiter that says when
+to come back is believed: `Retry-After` is read (both the seconds and the
+HTTP-date form) and honoured, because retrying in a second when the edge
+asked for a minute is how one rate limit becomes a sustained one. And the
+recovery backoff is jittered, because a deterministic sequence means every
+client that lost the same link comes back at the same instants, and the edge
+sees a synchronised stampede exactly when it can least absorb one.
 
 ### Frame padding
 

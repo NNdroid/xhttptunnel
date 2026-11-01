@@ -57,6 +57,18 @@ const (
 	// nothing about the payload inside the body, and a hop that drops or
 	// alters it is refused rather than being believed.
 	PadHeader = "X-Pad"
+	// PollTimeoutHeader tells the client how long this server parks an idle
+	// poll, in seconds. The client needs it for one reason: its own request
+	// timeout has to cover a long poll that comes back empty, but it must not
+	// be so long that a link silently dropped by a NAT looks healthy until the
+	// timeout expires. Without the number the client can only pick a timeout
+	// for itself, and every value that covers a long poll also covers a dead
+	// path.
+	//
+	// It is a hint, not a promise the client depends on for correctness: a
+	// client that never saw it falls back to its own conservative bound. That
+	// makes it safe to leave unsigned — it costs a timeout, never data.
+	PollTimeoutHeader = "X-HTTP-Tunnel-Poll-Timeout"
 	// CapPadBody advertises that this side reads a poll body with a leading
 	// pad in it, and can tell one from a body that has none. Both directions
 	// are gated on it: a body padded for a peer that does not look for the pad

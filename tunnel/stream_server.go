@@ -214,7 +214,7 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	h.Set("Expires", "0")
 	h.Set("X-Accel-Buffering", "no")
 	h.Set("Access-Control-Allow-Origin", st.corsAllowOrigin())
-	h.Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Downstream-Accepted, X-HTTP-Tunnel-Caps")
+	h.Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Downstream-Accepted, X-HTTP-Tunnel-Caps, X-HTTP-Tunnel-Poll-Timeout")
 	h.Set("X-Downstream-Accepted", "1")
 	h.Set("X-Stream-Uplink-Sync", "1")
 	// Echo the pad-body capability the client announced. It means this side
@@ -236,6 +236,10 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	}
 	h.Set("Content-Type", "application/octet-stream")
 	h.Set("Server", "nginx")
+	// The same long-poll window the poll path advertises. The streaming
+	// client runs the same recovery machinery, so it needs the same way to
+	// tell "the path is gone" from "the server had nothing to say".
+	h.Set(PollTimeoutHeader, strconv.Itoa(int(st.longPollTimeout.Seconds())))
 	w.WriteHeader(http.StatusOK)
 
 	rc := http.NewResponseController(w)
