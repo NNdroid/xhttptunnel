@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -159,19 +158,13 @@ func TestServerEvents_AuthAndTarget(t *testing.T) {
 	}
 	serverURL, _ := url.Parse("http://" + addr.String() + "/stream")
 
-	// 1. Bad credentials → auth.rejected (HTTP layer). The request must carry
-	// a session ID to reach the auth check at all.
-	badReq, err := http.NewRequest(http.MethodPost, serverURL.String(), strings.NewReader("x"))
-	if err != nil {
-		t.Fatal(err)
+	// 1. Bad credentials → auth.rejected (HTTP layer). Under strict mode the
+	// request must reach the auth check at all: a request signed under the
+	// wrong key derives the wrong header names, so the server finds no
+	// signature to verify and refuses — which is what fires the event.
+	if got := authTestStatus(t, serverURL, signedRequestFor(t, "attacker-key", http.MethodPost, "no-auth-session", "tcp", "127.0.0.1:22", nil)); got != http.StatusProxyAuthRequired {
+		t.Fatalf("bad-credential request: status = %d, want %d", got, http.StatusProxyAuthRequired)
 	}
-	badReq.Header.Set("X-Session-ID", "no-auth-session")
-	badReq.Header.Set("Content-Type", "application/octet-stream")
-	badResp, err := http.DefaultClient.Do(badReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	badResp.Body.Close()
 
 	// 2. Denied target → target.denied (session layer). The dial itself is
 	// asynchronous (the 403 arrives on the first poll/GET), so we only wait
@@ -262,7 +255,7 @@ func TestXHTTPConnDoneFires(t *testing.T) {
 // client that registered a handler must not leave its dispatch goroutine
 // behind (it ranges over the hub channel and only exits when the hub closes).
 func TestClientCloseStopsEventDispatcher(t *testing.T) {
-	client, err := NewClient(ClientConfig{ServerURL: "http://127.0.0.1:1/stream"})
+	client, err := NewClient(ClientConfig{ServerURL: "http://127.0.0.1:1/stream", PSK: "events-close-psk"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,6 +271,7 @@ func TestServerCloseStopsSessionEventDispatcher(t *testing.T) {
 	srv, err := NewServer(ServerConfig{
 		Listen:       "tcp://127.0.0.1:0",
 		Path:         "/stream",
+		PSK:          "events-close-psk",
 		EventHandler: func(SessionEvent) {},
 	})
 	if err != nil {
@@ -296,6 +290,7 @@ func TestServerSetEventHandlerClosesPreviousHub(t *testing.T) {
 	srv, err := NewServer(ServerConfig{
 		Listen:       "tcp://127.0.0.1:0",
 		Path:         "/stream",
+		PSK:          "events-close-psk",
 		EventHandler: func(SessionEvent) {},
 	})
 	if err != nil {

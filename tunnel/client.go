@@ -866,6 +866,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 	remoteAddr := stringAddr(hostPort)
 
 	sessionID := generateRandomHex(16)
+	namer := deriveHeaderNamer(cfg.Password, sessionID)
 
 	rt, ownTransport := selectTransport(protocol, cfg, nextProtos, isTLS, hostPort)
 
@@ -885,7 +886,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 			targetAddr: targetAddr, network: network,
 			localAddr: localAddr, remoteAddr: remoteAddr,
 			uploadChunk: uploadChunk, logger: logger,
-			events: cfg.events,
+			events: cfg.events, namer: namer,
 		})
 		if serr == nil {
 			return conn, nil
@@ -908,6 +909,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 
 	client := &http.Client{Transport: rt, Timeout: clientRequestTimeout}
 	virtualConn := newMeekVirtualConn(sessionID, localAddr, remoteAddr, logger)
+	virtualConn.namer = namer
 	virtualConn.writeBuf = newReliableBuffer(window)
 	uploadChunkSize := currentMaxSendBufSize()
 	if cfg.ChunkSizeKB != 0 {
@@ -1223,11 +1225,20 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 
 					req, _ := http.NewRequestWithContext(reqCtx, method, reqURL, bodyReader)
 
+					namer := virtualConn.namer
 					if bodyLen > 0 {
 						req.ContentLength = int64(bodyLen)
 					} else {
 						q := req.URL.Query()
 						q.Set("t", strconv.FormatInt(time.Now().UnixNano(), 36))
+						req.URL.RawQuery = q.Encode()
+					}
+					// In derived mode the session id is the salt the header names
+					// are derived from, so it rides the URL rather than a header
+					// the server cannot read before it derives them.
+					if namer.sessionIDInURL {
+						q := req.URL.Query()
+						q.Set(saltParam, sessionID)
 						req.URL.RawQuery = q.Encode()
 					}
 
@@ -1245,10 +1256,12 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						req.Host = cfg.SNI
 					}
 					req.Header.Set("User-Agent", clientUserAgent)
-					req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
-					req.Header.Set("X-Target", targetAddr)
-					req.Header.Set("X-Network", network)
-					req.Header.Set("X-Session-ID", sessionID)
+					req.Header.Set(namer.name(slotProto), strconv.Itoa(offeredProtoVersion))
+					req.Header.Set(namer.name(slotTarget), targetAddr)
+					req.Header.Set(namer.name(slotNetwork), network)
+					if !namer.sessionIDInURL {
+						req.Header.Set(namer.name(slotSessionID), sessionID)
+					}
 
 					virtualConn.readCond.L.Lock()
 					myAck := virtualConn.nextReadSeq
@@ -1279,7 +1292,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						bodyKind: bodyKindPoll,
 						pad:      strconv.Itoa(upPad),
 						body:     body,
-					})
+					}, namer)
 					if authErr != nil {
 						logger.Error("❌ [Pump] could not draw a nonce, closing the tunnel",
 							zap.String("session", sessionID),
@@ -1297,7 +1310,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						req.Header.Set("Content-Type", "application/octet-stream")
 					}
 					if atomic.CompareAndSwapInt32(&triggerRetry, 1, 0) {
-						req.Header.Set("X-Retry", "1")
+						req.Header.Set(namer.name(slotRetry), "1")
 					}
 
 					// Hot path: this runs once per poll. Checking the level
@@ -1412,7 +1425,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					// path be noticed in seconds rather than in a minute and a
 					// half. A hop that strips the header only costs the old
 					// behaviour, so this is safe to take as a hint.
-					if wait := serverPollWaitFromHeader(resp.Header.Get(PollTimeoutHeader)); wait > 0 {
+					if wait := serverPollWaitFromHeader(resp.Header.Get(virtualConn.namer.name(slotPollTimeout))); wait > 0 {
 						serverPollWait.Store(int64(wait))
 					}
 
@@ -1421,9 +1434,9 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					// signed under its nonce. Both are recovered here, before
 					// anything downstream acts on either.
 					respWire := counters{
-						seq: resp.Header.Get("X-Seq"),
-						ack: resp.Header.Get("X-Ack"),
-						pad: resp.Header.Get(PadHeader),
+						seq: resp.Header.Get(virtualConn.namer.name(slotSeq)),
+						ack: resp.Header.Get(virtualConn.namer.name(slotAck)),
+						pad: resp.Header.Get(virtualConn.namer.name(slotPad)),
 					}
 					wireSeq, wireAck, downPad, padErr := decodeCounters(responseMaskFor(cfg.Password, reqNonce), respWire)
 					if padErr != nil {
@@ -1613,7 +1626,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					// padding, which every peer can read — the alternative is
 					// prefixing bodies with a pad that peer feeds to its
 					// reassembly as payload.
-					echoed := hasCapValue(resp.Header.Get(CapsHeader), CapPadBody)
+					echoed := hasCapValue(resp.Header.Get(virtualConn.namer.name(slotCaps)), CapPadBody)
 					if was := virtualConn.padInTransport.Swap(echoed); echoed != was {
 						if echoed {
 							logger.Debug("🧩 [Pump] server reads a padded poll body; frame-level padding handed to the transport", zap.String("session", sessionID))
@@ -1654,7 +1667,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						// for a pad of zero. A missing header is a hop that
 						// dropped it, and reading it as "there is no pad"
 						// would hand the padding to the reassembly.
-						case resp.Header.Get(PadHeader) == "":
+						case resp.Header.Get(virtualConn.namer.name(slotPad)) == "":
 							tampered = "response arrived without a pad length to check its signature against"
 						// A response of unknown length cannot have its bytes
 						// checked against a digest of them. A CDN that answers
@@ -1674,7 +1687,7 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						}
 						if errBody == nil && tampered == "" {
 							digest := sha256.Sum256(readChunk[:n])
-							if !respMACMatches(cfg.Password, reqNonce, respWire, resp.Header.Get(AuthRespMACHeader), &digest) {
+							if !respMACMatches(cfg.Password, reqNonce, respWire, resp.Header.Get(virtualConn.namer.name(slotAuthRespMAC)), &digest) {
 								tampered = "response does not match its signature"
 							}
 						}
@@ -2120,6 +2133,12 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if _, err := windowBytes(cfg.WindowSizeMB); err != nil {
 		return nil, err
 	}
+	// No open mode: the tunnel is authenticated, and the header names are
+	// derived from the PSK, so an empty one would leave nothing to derive from
+	// and nothing to authenticate against.
+	if cfg.PSK == "" {
+		return nil, fmt.Errorf("tunnel: a PSK is required (open/unauthenticated mode is not allowed)")
+	}
 	switch strings.ToLower(strings.TrimSpace(cfg.StreamMode)) {
 	case "", "auto", "poll", "stream":
 	default:
@@ -2393,6 +2412,7 @@ func (c *Client) doBwExchange(ctx context.Context) bool {
 	}
 
 	sessionID := generateRandomHex(16)
+	namer := deriveHeaderNamer(cfg.Password, sessionID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, http.NoBody)
 	if err != nil {
 		return false
@@ -2410,13 +2430,20 @@ func (c *Client) doBwExchange(ctx context.Context) bool {
 		req.Host = cfg.SNI
 	}
 	req.Header.Set("User-Agent", clientUserAgent)
-	if bc.BWAdvertise > 0 {
-		req.Header.Set(BwHeader, strconv.FormatUint(bc.BWAdvertise, 10))
+	if namer.sessionIDInURL {
+		q := req.URL.Query()
+		q.Set(saltParam, sessionID)
+		req.URL.RawQuery = q.Encode()
 	}
-	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
-	req.Header.Set("X-Target", TargetBwExchange)
-	req.Header.Set("X-Network", "tcp")
-	req.Header.Set("X-Session-ID", sessionID)
+	if bc.BWAdvertise > 0 {
+		req.Header.Set(namer.name(slotBw), strconv.FormatUint(bc.BWAdvertise, 10))
+	}
+	req.Header.Set(namer.name(slotProto), strconv.Itoa(offeredProtoVersion))
+	req.Header.Set(namer.name(slotTarget), TargetBwExchange)
+	req.Header.Set(namer.name(slotNetwork), "tcp")
+	if !namer.sessionIDInURL {
+		req.Header.Set(namer.name(slotSessionID), sessionID)
+	}
 	// The signed-nonce auth covers the special target with no change: the
 	// signature binds the target string, and TargetBwExchange is exactly what
 	// the server will read back out of X-Target. It carries no counters and no
@@ -2430,13 +2457,15 @@ func (c *Client) doBwExchange(ctx context.Context) bool {
 		proto:     offeredProtoVersion,
 		bodyKind:  bodyKindPoll,
 		body:      []byte{},
-	}); err != nil {
+	}, namer); err != nil {
 		logger.Error("❌ [BW] could not draw a nonce for the bandwidth exchange", zap.Error(err))
 		return false
 	}
-	req.Header.Set("X-Target", TargetBwExchange)
-	req.Header.Set("X-Network", "tcp")
-	req.Header.Set("X-Session-ID", sessionID)
+	req.Header.Set(namer.name(slotTarget), TargetBwExchange)
+	req.Header.Set(namer.name(slotNetwork), "tcp")
+	if !namer.sessionIDInURL {
+		req.Header.Set(namer.name(slotSessionID), sessionID)
+	}
 
 	resp, err := (&http.Client{Transport: rt, Timeout: bwExchangeTimeout}).Do(req)
 	if err != nil {
@@ -2452,12 +2481,12 @@ func (c *Client) doBwExchange(ctx context.Context) bool {
 			zap.Int("status", resp.StatusCode))
 		return false
 	}
-	if !hasBrutalBwCap(resp.Header.Get(CapsHeader)) {
+	if !hasBrutalBwCap(resp.Header.Get(namer.name(slotCaps))) {
 		logger.Warn("⚠️ [BW] the server answered an exchange request without advertising the capability; not retrying",
 			zap.Int("status", resp.StatusCode))
 		return false
 	}
-	advertised := resp.Header.Get(BwHeader)
+	advertised := resp.Header.Get(namer.name(slotBw))
 	if advertised == "" {
 		// The server implemented the protocol but declined to advertise.
 		// Nothing to apply; the exchange itself succeeded.

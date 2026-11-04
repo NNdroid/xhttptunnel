@@ -588,6 +588,12 @@ func TestBrutalConfigValidate(t *testing.T) {
 
 const bwTestPSK = "bw-exchange-secret"
 
+// bwNamer derives the header namer a BW-exchange test request was written
+// under, from its URL salt (a PSK client writes derived names).
+func bwNamer(r *http.Request) headerNamer {
+	return deriveHeaderNamer(bwTestPSK, r.URL.Query().Get(saltParam))
+}
+
 func bwTestState(cfg BrutalConfig) *serverState {
 	st := newServerState(1)
 	st.brutalCfg = cfg
@@ -625,25 +631,31 @@ func bwTestServer(t *testing.T, ctx context.Context, cfg ServerConfig) *url.URL 
 	return &url.URL{Scheme: "http", Host: srv.Addr().String(), Path: "/t"}
 }
 
-func bwSignedHeaders(t *testing.T, key, target, advertised string) map[string]string {
-	t.Helper()
-	const session = "bw-exchange-sid"
-	extra := map[string]string{}
-	if advertised != "" {
-		extra[BwHeader] = advertised
-	}
-	return signedHeadersFor(t, key, http.MethodPost, session, "tcp", target, extra)
+// bwTestSession is the fixed session the exchange tests sign for. It is the
+// URL salt in derived mode, and what the header names are derived from.
+const bwTestSession = "bw-exchange-sid"
+
+// bwTestNamer returns the namer a request under the fixed session derives
+// when signed with the given key — the names the client writes and the server
+// answers under.
+func bwTestNamer(signingKey string) headerNamer {
+	return deriveHeaderNamer(signingKey, bwTestSession)
 }
 
-func bwPost(t *testing.T, base *url.URL, headers map[string]string) *http.Response {
+func bwSignedRequest(t *testing.T, key, target, advertised string) *http.Request {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, base.String(), http.NoBody)
-	if err != nil {
-		t.Fatal(err)
+	extra := map[string]string{}
+	if advertised != "" {
+		extra[bwTestNamer(key).name(slotBw)] = advertised
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
+	return signedRequestFor(t, key, http.MethodPost, bwTestSession, "tcp", target, extra)
+}
+
+func bwPost(t *testing.T, base *url.URL, req *http.Request) *http.Response {
+	t.Helper()
+	u := *base
+	u.RawQuery = req.URL.RawQuery
+	req.URL = &u
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request: %v", err)
@@ -662,15 +674,16 @@ func TestBwExchangeServerServesExchange(t *testing.T) {
 		},
 	})
 
-	resp := bwPost(t, base, bwSignedHeaders(t, bwTestPSK, TargetBwExchange, "8000000"))
+	resp := bwPost(t, base, bwSignedRequest(t, bwTestPSK, TargetBwExchange, "8000000"))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("exchange status = %d, want 200", resp.StatusCode)
 	}
-	if got := resp.Header.Get(CapsHeader); got != CapBrutalBw {
+	n := bwTestNamer(bwTestPSK)
+	if got := resp.Header.Get(n.name(slotCaps)); got != CapBrutalBw {
 		t.Errorf("capability header = %q, want %q", got, CapBrutalBw)
 	}
-	if got := resp.Header.Get(BwHeader); got != "5000000" {
+	if got := resp.Header.Get(n.name(slotBw)); got != "5000000" {
 		t.Errorf("advertised bandwidth = %q, want the server's 5000000", got)
 	}
 	// The handler also sends "Connection: close" (see the direct assertions
@@ -687,17 +700,24 @@ func TestBwExchangeRequiresAuth(t *testing.T) {
 		Brutal: BrutalConfig{Enabled: true, Rate: 1_000_000, BWExchange: true},
 	})
 
-	// No credentials at all.
-	plain := map[string]string{"X-Session-ID": "bw-exchange-sid", "X-Target": TargetBwExchange, ProtoHeader: "1"}
-	if got := bwPost(t, base, plain).StatusCode; got != http.StatusProxyAuthRequired {
-		t.Errorf("unauthenticated exchange = %d, want %d", got, http.StatusProxyAuthRequired)
+	// Constant names with no salt: refused at the gate, before auth.
+	plain := constantNameRequest(t, map[string]string{TargetHeader: TargetBwExchange})
+	if got := bwPost(t, base, plain).StatusCode; got != http.StatusBadRequest {
+		t.Errorf("constant-name exchange = %d, want %d", got, http.StatusBadRequest)
 	}
-	// A wrong key.
-	if got := bwPost(t, base, bwSignedHeaders(t, "wrong-key", TargetBwExchange, "")).StatusCode; got != http.StatusProxyAuthRequired {
+	// Derived names with no signature: the gate passes, auth refuses.
+	unsigned := bwSignedRequest(t, bwTestPSK, TargetBwExchange, "")
+	unsigned.Header.Del(bwTestNamer(bwTestPSK).name(slotAuthMAC))
+	unsigned.Header.Del(bwTestNamer(bwTestPSK).name(slotAuthNonce))
+	if got := bwPost(t, base, unsigned).StatusCode; got != http.StatusProxyAuthRequired {
+		t.Errorf("unsigned exchange = %d, want %d", got, http.StatusProxyAuthRequired)
+	}
+	// A wrong key derives the wrong names, so no signature is found.
+	if got := bwPost(t, base, bwSignedRequest(t, "wrong-key", TargetBwExchange, "")).StatusCode; got != http.StatusProxyAuthRequired {
 		t.Errorf("bad-key exchange = %d, want %d", got, http.StatusProxyAuthRequired)
 	}
 	// A valid signature.
-	if got := bwPost(t, base, bwSignedHeaders(t, bwTestPSK, TargetBwExchange, "")).StatusCode; got != http.StatusOK {
+	if got := bwPost(t, base, bwSignedRequest(t, bwTestPSK, TargetBwExchange, "")).StatusCode; got != http.StatusOK {
 		t.Errorf("authenticated exchange = %d, want 200", got)
 	}
 }
@@ -722,9 +742,9 @@ func TestBwExchangeSignedNonceBindsSpecialTarget(t *testing.T) {
 		{"an exchange signature cannot be retargeted", TargetBwExchange, "127.0.0.1:22"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := bwSignedHeaders(t, bwTestPSK, tc.signFor, "")
-			h["X-Target"] = tc.sendTarget
-			if got := bwPost(t, base, h).StatusCode; got != http.StatusProxyAuthRequired {
+			req := bwSignedRequest(t, bwTestPSK, tc.signFor, "")
+			req.Header.Set(bwTestNamer(bwTestPSK).name(slotTarget), tc.sendTarget)
+			if got := bwPost(t, base, req).StatusCode; got != http.StatusProxyAuthRequired {
 				t.Errorf("retargeted request = %d, want %d", got, http.StatusProxyAuthRequired)
 			}
 		})
@@ -740,7 +760,7 @@ func TestBwExchangeRejectedWhenServerOptedOut(t *testing.T) {
 	base := bwTestServer(t, ctx, ServerConfig{
 		Brutal: BrutalConfig{Enabled: true, Rate: 1_000_000, BWExchange: false},
 	})
-	resp := bwPost(t, base, bwSignedHeaders(t, bwTestPSK, TargetBwExchange, "1000000"))
+	resp := bwPost(t, base, bwSignedRequest(t, bwTestPSK, TargetBwExchange, "1000000"))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("an opted-out server answered %d, want %d", resp.StatusCode, http.StatusNotFound)
@@ -758,13 +778,13 @@ func TestBwExchangeBypassesTheAllowlist(t *testing.T) {
 		Brutal:         BrutalConfig{Enabled: true, Rate: 1_000_000, BWExchange: true},
 	})
 
-	if got := bwPost(t, base, bwSignedHeaders(t, bwTestPSK, TargetBwExchange, "")).StatusCode; got != http.StatusOK {
+	if got := bwPost(t, base, bwSignedRequest(t, bwTestPSK, TargetBwExchange, "")).StatusCode; got != http.StatusOK {
 		t.Errorf("exchange = %d, want 200: the special target must not be subject to the allowlist", got)
 	}
-	if got := bwPost(t, base, bwSignedHeaders(t, bwTestPSK, "127.0.0.1:22", "")).StatusCode; got != http.StatusForbidden {
+	if got := bwPost(t, base, bwSignedRequest(t, bwTestPSK, "127.0.0.1:22", "")).StatusCode; got != http.StatusForbidden {
 		t.Errorf("an ordinary denied target = %d, want %d", got, http.StatusForbidden)
 	}
-	if got := bwPost(t, base, bwSignedHeaders(t, bwTestPSK, "127.0.0.1:9", "")).StatusCode; got != http.StatusOK {
+	if got := bwPost(t, base, bwSignedRequest(t, bwTestPSK, "127.0.0.1:9", "")).StatusCode; got != http.StatusOK {
 		t.Errorf("an allowlisted target = %d, want 200", got)
 	}
 }
@@ -791,7 +811,7 @@ func TestBwExchangeRegistersNoSession(t *testing.T) {
 	base := &url.URL{Scheme: "http", Host: srv.Addr().String(), Path: "/t"}
 
 	for i := 0; i < 10; i++ {
-		resp := bwPost(t, base, bwSignedHeaders(t, bwTestPSK, TargetBwExchange, strconv.Itoa(1000000+i)))
+		resp := bwPost(t, base, bwSignedRequest(t, bwTestPSK, TargetBwExchange, strconv.Itoa(1000000+i)))
 		resp.Body.Close()
 	}
 	if got := srv.ActiveSessions(); got != 0 {
@@ -836,7 +856,7 @@ func TestBwExchangeUpdatesTheGroupRate(t *testing.T) {
 			if tc.advertised != "" {
 				r.Header.Set(BwHeader, tc.advertised)
 			}
-			st.handleBwExchange(httptest.NewRecorder(), r, "10.0.0.7")
+			st.handleBwExchange(httptest.NewRecorder(), r, "10.0.0.7", defaultHeaderNamer())
 			gid := groupIDFromRemote(r.RemoteAddr)
 			if got := st.groupRate(gid, 20_000_000); got != tc.want {
 				t.Errorf("group rate = %d, want %d", got, tc.want)
@@ -855,7 +875,7 @@ func TestBwExchangeRejectsMalformedAdvertise(t *testing.T) {
 			r.RemoteAddr = "10.0.0.7:51000"
 			r.Header.Set(BwHeader, raw)
 			rr := httptest.NewRecorder()
-			st.handleBwExchange(rr, r, "10.0.0.7")
+			st.handleBwExchange(rr, r, "10.0.0.7", defaultHeaderNamer())
 			if rr.Code != http.StatusOK {
 				t.Errorf("status = %d, want 200: an invalid advertisement is not an error", rr.Code)
 			}
@@ -870,7 +890,7 @@ func TestBwExchangeRejectsMalformedAdvertise(t *testing.T) {
 func TestBwExchangeDoesNotAdvertiseWhenConfiguredAsZero(t *testing.T) {
 	st := bwTestState(BrutalConfig{Enabled: true, Rate: 1_000_000, BWExchange: true, BWAdvertise: 0})
 	rr := httptest.NewRecorder()
-	st.handleBwExchange(rr, httptest.NewRequest(http.MethodPost, "/t", http.NoBody), "10.0.0.7")
+	st.handleBwExchange(rr, httptest.NewRequest(http.MethodPost, "/t", http.NoBody), "10.0.0.7", defaultHeaderNamer())
 	if got := rr.Header().Get(BwHeader); got != "" {
 		t.Errorf("an unset bw_advertise still advertised %q", got)
 	}
@@ -890,7 +910,7 @@ func TestBwExchangeHandlerHeaders(t *testing.T) {
 		Enabled: true, Rate: 1_000_000, BWExchange: true, BWAdvertise: 2_500_000,
 	})
 	rr := httptest.NewRecorder()
-	st.handleBwExchange(rr, httptest.NewRequest(http.MethodPost, "/t", http.NoBody), "10.0.0.7")
+	st.handleBwExchange(rr, httptest.NewRequest(http.MethodPost, "/t", http.NoBody), "10.0.0.7", defaultHeaderNamer())
 
 	if got := rr.Code; got != http.StatusOK {
 		t.Errorf("status = %d, want 200", got)
@@ -1004,12 +1024,13 @@ func bwExchangeClient(t *testing.T, url string, cfg BrutalConfig) *Client {
 func TestBwExchangeClientAppliesAdvertised(t *testing.T) {
 	var sawTarget, sawCaps, sawBW, sawAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawTarget = r.Header.Get("X-Target")
-		sawCaps = r.Header.Get(CapsHeader)
-		sawBW = r.Header.Get(BwHeader)
-		sawAuth = r.Header.Get(AuthNonceHeader)
-		w.Header().Set(CapsHeader, CapBrutalBw)
-		w.Header().Set(BwHeader, "5000000")
+		namer := bwNamer(r)
+		sawTarget = r.Header.Get(namer.name(slotTarget))
+		sawCaps = r.Header.Get(namer.name(slotCaps))
+		sawBW = r.Header.Get(namer.name(slotBw))
+		sawAuth = r.Header.Get(namer.name(slotAuthNonce))
+		w.Header().Set(namer.name(slotCaps), CapBrutalBw)
+		w.Header().Set(namer.name(slotBw), "5000000")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -1069,7 +1090,7 @@ func TestBwExchangeClientClassifiesFailure(t *testing.T) {
 	// And a server that answers the protocol but declines to advertise has
 	// nothing to apply: still a success, still enabled.
 	silent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(CapsHeader, CapBrutalBw)
+		w.Header().Set(bwNamer(r).name(slotCaps), CapBrutalBw)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer silent.Close()
@@ -1086,8 +1107,9 @@ func TestBwExchangeClientClassifiesFailure(t *testing.T) {
 	// A server that implements the protocol but sends a malformed value keeps
 	// the loop enabled and keeps the rate it had.
 	badValue := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(CapsHeader, CapBrutalBw)
-		w.Header().Set(BwHeader, "not-a-rate")
+		namer := bwNamer(r)
+		w.Header().Set(namer.name(slotCaps), CapBrutalBw)
+		w.Header().Set(namer.name(slotBw), "not-a-rate")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer badValue.Close()
@@ -1151,8 +1173,9 @@ func TestBwExchangeClientHonoursTheInterval(t *testing.T) {
 	var hits int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&hits, 1)
-		w.Header().Set(CapsHeader, CapBrutalBw)
-		w.Header().Set(BwHeader, "1000000")
+		namer := bwNamer(r)
+		w.Header().Set(namer.name(slotCaps), CapBrutalBw)
+		w.Header().Set(namer.name(slotBw), "1000000")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()

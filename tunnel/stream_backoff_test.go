@@ -80,7 +80,7 @@ func TestStreamReconnectResetsAfterHealthyRound(t *testing.T) {
 				return nil, err
 			}
 			body := &timedStreamBody{ctx: r.Context(), hello: bytes.NewReader(hello), timer: time.NewTimer(life), closed: make(chan struct{})}
-			return &http.Response{StatusCode: 200, Header: http.Header{"X-Downstream-Accepted": {"1"}, "X-Stream-Uplink-Sync": {"1"}}, Body: body, Request: r}, nil
+			return &http.Response{StatusCode: 200, Header: http.Header{DownstreamAcceptedHeader: {"1"}, StreamUplinkSyncHeader: {"1"}}, Body: body, Request: r}, nil
 		})
 		conn, err := dialXHTTPStream(streamDialArgs{ctx: ctx, cfg: &DialConfig{StreamMode: "stream"}, rt: rt, client: &http.Client{Transport: rt}, reqURL: "http://fixture/stream", sessionID: "healthy-reset", key: "healthy-reset", logger: zap.NewNop(), events: hub})
 		if err != nil {
@@ -111,7 +111,7 @@ func TestStreamReadTimeoutKeepsResumableSession(t *testing.T) {
 	vc := newMeekVirtualConn("timeout-resume", nil, nil, nil)
 	defer vc.Close()
 	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(timeoutStreamReader{}))
-	r.Header.Set("X-Stream-Resume", "1")
+	r.Header.Set(StreamResumeHeader, "1")
 	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "timeout-resume")
 	if vc.isClosed() {
 		t.Fatal("transport read timeout destroyed resumable application state")
@@ -152,7 +152,7 @@ func TestStreamSlowReadProgressRefreshesDeadline(t *testing.T) {
 		frame := streamFrameStorage(nil, 0, 0, 5, 0)
 		body := &slowProgressBody{data: frame, w: w}
 		r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(body))
-		r.Header.Set("X-Stream-Resume", "1")
+		r.Header.Set(StreamResumeHeader, "1")
 		vc := newMeekVirtualConn("slow-progress", nil, nil, nil)
 		defer vc.Close()
 		start := time.Now()
@@ -196,7 +196,7 @@ func TestStreamCorruptFrameClosesResumableSession(t *testing.T) {
 	vc := newMeekVirtualConn("corrupt-resume", nil, nil, nil)
 	defer vc.Close()
 	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(&fakeUplinkReader{data: meta}))
-	r.Header.Set("X-Stream-Resume", "1")
+	r.Header.Set(StreamResumeHeader, "1")
 	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "corrupt-resume")
 	if !vc.isClosed() {
 		t.Fatal("corrupt frame on a resumable POST did not close the session")
@@ -212,7 +212,7 @@ func TestStreamTransportErrorKeepsResumableSession(t *testing.T) {
 	vc := newMeekVirtualConn("transport-resume", nil, nil, nil)
 	defer vc.Close()
 	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(&fakeUplinkReader{err: errors.New("connection reset by peer")}))
-	r.Header.Set("X-Stream-Resume", "1")
+	r.Header.Set(StreamResumeHeader, "1")
 	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "transport-resume")
 	if vc.isClosed() {
 		t.Fatal("transport error destroyed resumable application state")

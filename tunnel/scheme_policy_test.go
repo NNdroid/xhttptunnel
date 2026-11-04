@@ -14,7 +14,7 @@ import (
 // TestTargetAllowlistPolicyByProtocol proves that a scheme prefix on an
 // allowed_targets entry takes effect over a real listener, not only inside the
 // matcher: the same address is reachable over TCP and refused over UDP, because
-// the client's X-Network header is what the entry is compared against.
+// the client's X-Net header is what the entry is compared against.
 func TestTargetAllowlistPolicyByProtocol(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -108,7 +108,7 @@ func TestTargetAllowlistPolicyByProtocol(t *testing.T) {
 // passes a scheme-less loopback allowlist and the bridge carries bytes. Left
 // unstripped the dialer would receive "tcp://host:port" and fail with "too many
 // colons in address". gen-config still refuses the prefix, because it is
-// decoration -- the client's protocol comes from X-Network.
+// decoration -- the client's protocol comes from X-Net.
 func TestClientTargetSchemeIsStripped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

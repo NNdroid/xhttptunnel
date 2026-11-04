@@ -96,39 +96,53 @@ func TestPerIPSessionCap(t *testing.T) {
 
 // TestProtoVersionEchoAndMin confirms the server advertises its protocol
 // generation on every tunnel response, and that MinProtoVersion turns an
-// under-version request into HTTP 426 before session handling.
+// under-version request into HTTP 426. Under strict mode the gates run in
+// order: the salt gate (400), then authentication (407), and only then the
+// version gate — so 426 is reachable only from a request that already
+// authenticated.
 func TestProtoVersionEchoAndMin(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	srv, url, _ := newHardenedServer(t, ctx, ServerConfig{MinProtoVersion: 1})
+	srv, serverURL, _ := newHardenedServer(t, ctx, ServerConfig{
+		MinProtoVersion: 1,
+		AllowedTargets:  []string{"127.0.0.1:9"},
+	})
 	defer srv.Close()
 
-	// A request with no proto header is below the minimum → 426, and the
-	// response still carries the server's advertised version.
-	resp, err := http.Get(url.String())
+	// A request with no salt is refused at the salt gate, which runs before
+	// the version gate. The response still carries the server's advertised
+	// version under the default names — all an unauthenticated client can
+	// read.
+	resp, err := http.Get(serverURL.String())
 	if err != nil {
 		t.Fatalf("GET /stream: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUpgradeRequired {
-		t.Fatalf("status = %d with MinProto=1 and no client header, want 426", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d with no salt, want %d (the salt gate answers first)", resp.StatusCode, http.StatusBadRequest)
 	}
-	if got := resp.Header.Get(ProtoHeader); got != "1" {
+	if got := resp.Header.Get(defaultNamer.name(slotProto)); got != "1" {
 		t.Fatalf("proto echo = %q, want 1", got)
 	}
 
-	// A correctly-versioned request passes the gate and reaches the (still
-	// unsatisfied) session-id check → 400, proving 426 was about version.
-	req, _ := http.NewRequest(http.MethodGet, url.String(), nil)
-	req.Header.Set(ProtoHeader, "1")
-	resp2, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET /stream v1: %v", err)
+	// A correctly-versioned signed request passes both gates and reaches
+	// session handling — the allowlist's 403 here, not 426.
+	req := signedRequestFor(t, "harden-secret", http.MethodGet, "hardening-sid", "tcp", "127.0.0.1:7", nil)
+	if got := authTestStatus(t, serverURL, req); got != http.StatusForbidden {
+		t.Fatalf("signed request: status = %d, want %d (past the version gate)", got, http.StatusForbidden)
 	}
-	resp2.Body.Close()
-	if resp2.StatusCode == http.StatusUpgradeRequired {
-		t.Fatal("correctly-versioned request was still refused with 426")
+
+	// MinProto above the offered generation: the version gate is live. The
+	// request authenticates first, then is refused with 426.
+	srv2, serverURL2, _ := newHardenedServer(t, ctx, ServerConfig{
+		MinProtoVersion: offeredProtoVersion + 1,
+		AllowedTargets:  []string{"127.0.0.1:9"},
+	})
+	defer srv2.Close()
+	req2 := signedRequestFor(t, "harden-secret", http.MethodGet, "hardening-sid", "tcp", "127.0.0.1:7", nil)
+	if got := authTestStatus(t, serverURL2, req2); got != http.StatusUpgradeRequired {
+		t.Fatalf("under-version signed request: status = %d, want %d", got, http.StatusUpgradeRequired)
 	}
 }
 

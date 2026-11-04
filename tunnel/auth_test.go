@@ -252,7 +252,7 @@ func TestSignRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nonce, err := signRequest(req, "psk", testAuth)
+	nonce, err := signRequest(req, "psk", testAuth, defaultHeaderNamer())
 	if err != nil {
 		t.Fatalf("signRequest: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestSignRequest(t *testing.T) {
 
 	// Two requests from the same PSK must carry different nonces.
 	req2, _ := http.NewRequest(http.MethodGet, "http://example/", nil)
-	nonce2, err := signRequest(req2, "psk", testAuth)
+	nonce2, err := signRequest(req2, "psk", testAuth, defaultHeaderNamer())
 	if err != nil {
 		t.Fatalf("signRequest: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestSignRequest(t *testing.T) {
 
 func TestSignRequestEmptyPassword(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "http://example/", nil)
-	nonce, err := signRequest(req, "", requestAuth{sessionID: "session-A"})
+	nonce, err := signRequest(req, "", requestAuth{sessionID: "session-A"}, defaultHeaderNamer())
 	if err != nil {
 		t.Fatalf("signRequest with an empty password: %v", err)
 	}
@@ -333,34 +333,54 @@ func authTestServer(t *testing.T, ctx context.Context, cfg ServerConfig) *url.UR
 	return &url.URL{Scheme: "http", Host: srv.Addr().String(), Path: "/t"}
 }
 
-// authHeaders builds a signed v2 request against the fixed session, network
-// and target. signingKey lets a case mint a digest under the wrong PSK.
-// authHeaders signs a request the way the client does and hands back its
-// headers. Building it through signRequest rather than assembling the MAC by
-// hand is what keeps a test honest: a request that advertises the current
-// generation has to be signed the way that generation signs, or the test is
-// only pinning that the server rejects its own forgery.
-func authHeaders(t *testing.T, signingKey string) map[string]string {
-	t.Helper()
-	const session, network, target = "auth-test-sid", "tcp", "127.0.0.1:7"
-	return signedHeadersFor(t, signingKey, http.MethodGet, session, network, target, nil)
+// authTestSession is the fixed session the matrix signs for. In derived mode
+// it is the URL salt every request carries; it is also what the header names
+// are derived from, so a case that rewrites one of them has to derive the
+// names the same way the helper did.
+const authTestSession = "auth-test-sid"
+
+// authTestNamer returns the namer a request under the fixed session derives
+// when signed with the given key. A case that mangles a header of a request
+// built by authRequest gets the header name from here, the same way the
+// client would have written it.
+func authTestNamer(signingKey string) headerNamer {
+	return deriveHeaderNamer(signingKey, authTestSession)
 }
 
-// signedHeadersFor signs the given request description and returns its headers.
-// The counters and the pad are left out, as the bandwidth exchange and a
-// session's first request leave them out.
-func signedHeadersFor(t *testing.T, signingKey, method, session, network, target string, extra map[string]string) map[string]string {
+// authRequest builds a signed request the way a current client does: derived
+// header names, the session id as the ?s= URL salt, and the signature under
+// the same namer. signingKey lets a case mint a request under the wrong PSK —
+// which derives the wrong names too, exactly as a client configured with the
+// wrong key would, so the server cannot even find the signature to reject.
+func authRequest(t *testing.T, signingKey string) *http.Request {
 	t.Helper()
+	return signedRequestFor(t, signingKey, http.MethodGet, authTestSession, "tcp", "127.0.0.1:7", nil)
+}
+
+// signedRequestFor signs the given request description the way the client
+// does and returns the request it would have sent. Building it through
+// signRequest rather than assembling the MAC by hand is what keeps a test
+// honest: a request that advertises the current generation has to be signed
+// the way that generation signs, or the test is only pinning that the server
+// rejects its own forgery.
+//
+// The request is built under derived names — the strict mode the server runs
+// in — with the session id riding the URL salt rather than a header.
+func signedRequestFor(t *testing.T, signingKey, method, session, network, target string, extra map[string]string) *http.Request {
+	t.Helper()
+	namer := deriveHeaderNamer(signingKey, session)
 	req, err := http.NewRequest(method, "http://tunnel.invalid/stream", http.NoBody)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	req.Header.Set("X-Session-ID", session)
-	req.Header.Set("X-Network", network)
-	req.Header.Set("X-Target", target)
+	q := req.URL.Query()
+	q.Set(saltParam, session)
+	req.URL.RawQuery = q.Encode()
+	req.Header.Set(namer.name(slotNetwork), network)
+	req.Header.Set(namer.name(slotTarget), target)
 	// The generation this request advertises, which is what decides whether
 	// the server holds it to its signature at all.
-	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
+	req.Header.Set(namer.name(slotProto), strconv.Itoa(offeredProtoVersion))
 	for k, v := range extra {
 		req.Header.Set(k, v)
 	}
@@ -374,40 +394,41 @@ func signedHeadersFor(t *testing.T, signingKey, method, session, network, target
 		// Signed as carrying nothing: an empty body has a digest, and it is
 		// not the same as no digest at all.
 		body: []byte{},
-	}); err != nil {
+	}, namer); err != nil {
 		t.Fatalf("signRequest: %v", err)
 	}
-	// Copied out by name rather than ranging over req.Header: Header
-	// canonicalises the keys it is given, so a range would hand back
-	// "X-Http-Tunnel-Mac" where every caller — and the server — spells it
-	// AuthMACHeader. Get canonicalises the name it is asked for, so the
-	// constants still key into it correctly.
-	h := map[string]string{}
-	for _, name := range []string{
-		"X-Session-ID", "X-Network", "X-Target", ProtoHeader,
-		AuthNonceHeader, AuthMACHeader, AuthBodyMACHeader, CapsHeader, PadHeader,
-	} {
-		if v := req.Header.Get(name); v != "" {
-			h[name] = v
-		}
-	}
-	for k, v := range extra {
-		if v != "" {
-			h[k] = v
-		}
-	}
-	return h
+	return req
 }
 
-func authTestStatus(t *testing.T, base *url.URL, headers map[string]string) int {
+// constantNameRequest builds the request a legacy client sends: constant
+// header names, the session id in a header rather than the URL salt, and no
+// signature unless extra adds one. Strict mode refuses every one of these,
+// which is what makes the mode a real cutover rather than a preference.
+func constantNameRequest(t *testing.T, extra map[string]string) *http.Request {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, base.String(), nil)
+	req, err := http.NewRequest(http.MethodGet, "http://tunnel.invalid/stream", http.NoBody)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("new request: %v", err)
 	}
-	for k, v := range headers {
+	req.Header.Set(SessionIDHeader, authTestSession)
+	req.Header.Set(NetworkHeader, "tcp")
+	req.Header.Set(TargetHeader, "127.0.0.1:7")
+	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
+	for k, v := range extra {
 		req.Header.Set(k, v)
 	}
+	return req
+}
+
+// authTestStatus replays a built request against the test server and returns
+// the status. The request keeps its query (the derived mode's ?s= salt) and
+// gets the server's host and path; everything else travels as the helper or
+// the case built it.
+func authTestStatus(t *testing.T, base *url.URL, req *http.Request) int {
+	t.Helper()
+	u := *base
+	u.RawQuery = req.URL.RawQuery
+	req.URL = &u
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request: %v", err)
@@ -422,50 +443,94 @@ func TestServerAuthorizeMatrix(t *testing.T) {
 	base := authTestServer(t, ctx, ServerConfig{})
 
 	for _, tc := range []struct {
-		name    string
-		headers map[string]string
-		want    int
+		name string
+		req  *http.Request
+		want int
 	}{
-		{"signed v2 accepted", authHeaders(t, authTestPSK), http.StatusForbidden},
+		{"signed v2 accepted", authRequest(t, authTestPSK), http.StatusForbidden},
+		// Strict mode refuses a constant-name request before it looks at any
+		// credential: without the URL salt there is no session id to derive
+		// names from, and that is the answer that closes the legacy path.
 		{
-			"legacy bare token accepted",
-			map[string]string{"X-Session-ID": "auth-test-sid", "X-Target": "127.0.0.1:7", "X-Auth-Token": authTestPSK},
-			http.StatusForbidden,
+			"constant-name bare token rejected at the salt gate",
+			constantNameRequest(t, map[string]string{"X-Auth-Token": authTestPSK}),
+			http.StatusBadRequest,
 		},
 		{
-			"legacy bearer accepted",
-			map[string]string{"X-Session-ID": "auth-test-sid", "X-Target": "127.0.0.1:7", "Proxy-Authorization": "Bearer " + authTestPSK},
-			http.StatusForbidden,
+			"constant-name bearer rejected at the salt gate",
+			constantNameRequest(t, map[string]string{"Proxy-Authorization": "Bearer " + authTestPSK}),
+			http.StatusBadRequest,
 		},
-		{"wrong PSK rejected", authHeaders(t, "attacker-key"), http.StatusProxyAuthRequired},
+		{"wrong PSK rejected", authRequest(t, "attacker-key"), http.StatusProxyAuthRequired},
 		{
 			"v2 with no credentials rejected",
-			map[string]string{"X-Session-ID": "auth-test-sid", "X-Target": "127.0.0.1:7", ProtoHeader: "2"},
+			func() *http.Request {
+				req := authRequest(t, authTestPSK)
+				req.Header.Del(authTestNamer(authTestPSK).name(slotAuthMAC))
+				return req
+			}(),
 			http.StatusProxyAuthRequired,
 		},
 		// A v2 client may not keep replayable credentials: this is what makes
-		// min_proto_version=2 a real switch instead of a label.
+		// min_proto_version=2 a real switch instead of a label. Strict mode
+		// has no bare-token path at all, so the token does not rescue an
+		// unsigned request.
 		{
 			"v2 advertising a bare token rejected",
-			map[string]string{"X-Session-ID": "auth-test-sid", "X-Target": "127.0.0.1:7", ProtoHeader: "2", "X-Auth-Token": authTestPSK},
+			func() *http.Request {
+				req := authRequest(t, authTestPSK)
+				n := authTestNamer(authTestPSK)
+				req.Header.Del(n.name(slotAuthMAC))
+				req.Header.Del(n.name(slotAuthNonce))
+				req.Header.Set("X-Auth-Token", authTestPSK)
+				return req
+			}(),
 			http.StatusProxyAuthRequired,
 		},
 		{
-			"legacy client with a bad signature still falls back",
-			func() map[string]string {
-				h := authHeaders(t, "wrong")
-				h[ProtoHeader] = "1"
-				h["X-Auth-Token"] = authTestPSK
-				return h
-			}(),
-			http.StatusForbidden,
+			"constant-name request with a bad signature still rejected",
+			constantNameRequest(t, map[string]string{
+				ProtoHeader:    "1",
+				"X-Auth-Token": authTestPSK,
+				AuthMACHeader:  "deadbeef",
+			}),
+			http.StatusBadRequest,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := authTestStatus(t, base, tc.headers); got != tc.want {
+			if got := authTestStatus(t, base, tc.req); got != tc.want {
 				t.Fatalf("status = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestStrictModeRefusesConstantNames pins the cutover itself: whatever the
+// credential, a request written under the constant names is not a request
+// this build speaks. With the salt it fails authentication (the names do not
+// resolve to a signature); without it, it never gets that far.
+func TestStrictModeRefusesConstantNames(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	base := authTestServer(t, ctx, ServerConfig{})
+
+	// Constant names carrying a valid signature minted the old way: the salt
+	// is present, so the request reaches authentication — where the derived
+	// names the server reads find no signature at all.
+	req := constantNameRequest(t, map[string]string{"X-Auth-Token": authTestPSK})
+	q := req.URL.Query()
+	q.Set(saltParam, authTestSession)
+	req.URL.RawQuery = q.Encode()
+	if got := authTestStatus(t, base, req); got != http.StatusProxyAuthRequired {
+		t.Fatalf("constant names with a salt: status = %d, want %d", got, http.StatusProxyAuthRequired)
+	}
+
+	// Derived names without the salt: the session id cannot be recovered, and
+	// the request is refused before authentication is attempted.
+	req = authRequest(t, authTestPSK)
+	req.URL.RawQuery = ""
+	if got := authTestStatus(t, base, req); got != http.StatusBadRequest {
+		t.Fatalf("derived names without a salt: status = %d, want %d", got, http.StatusBadRequest)
 	}
 }
 
@@ -474,19 +539,19 @@ func TestServerReplayRejectedEndToEnd(t *testing.T) {
 	defer cancel()
 	base := authTestServer(t, ctx, ServerConfig{})
 
-	h := authHeaders(t, authTestPSK)
-	if got := authTestStatus(t, base, h); got != http.StatusForbidden {
+	req := authRequest(t, authTestPSK)
+	if got := authTestStatus(t, base, req); got != http.StatusForbidden {
 		t.Fatalf("original request: status = %d, want %d (auth passes)", got, http.StatusForbidden)
 	}
-	if got := authTestStatus(t, base, h); got != http.StatusProxyAuthRequired {
+	if got := authTestStatus(t, base, req); got != http.StatusProxyAuthRequired {
 		t.Fatalf("replayed request: status = %d, want %d", got, http.StatusProxyAuthRequired)
 	}
-	if got := authTestStatus(t, base, h); got != http.StatusProxyAuthRequired {
+	if got := authTestStatus(t, base, req); got != http.StatusProxyAuthRequired {
 		t.Fatalf("third replay: status = %d, want %d", got, http.StatusProxyAuthRequired)
 	}
 	// A freshly signed request still works, so the rejection is about the
 	// nonce and not a tripwire on the whole server.
-	if got := authTestStatus(t, base, authHeaders(t, authTestPSK)); got != http.StatusForbidden {
+	if got := authTestStatus(t, base, authRequest(t, authTestPSK)); got != http.StatusForbidden {
 		t.Fatalf("fresh request after replay: status = %d, want %d", got, http.StatusForbidden)
 	}
 }
@@ -496,32 +561,30 @@ func TestServerRejectsResignedAndRetargeted(t *testing.T) {
 	defer cancel()
 	base := authTestServer(t, ctx, ServerConfig{})
 
-	h := authHeaders(t, authTestPSK)
-	if got := authTestStatus(t, base, h); got != http.StatusForbidden {
+	req := authRequest(t, authTestPSK)
+	if got := authTestStatus(t, base, req); got != http.StatusForbidden {
 		t.Fatalf("original: status = %d, want %d", got, http.StatusForbidden)
 	}
 
 	// Aim the same signature at an address the sender also has access to. The
 	// target is bound into the digest, so this must not authenticate.
-	retargeted := map[string]string{
-		"X-Session-ID":  h["X-Session-ID"],
-		"X-Target":      "127.0.0.1:80",
-		ProtoHeader:     h[ProtoHeader],
-		AuthNonceHeader: h[AuthNonceHeader],
-		AuthMACHeader:   h[AuthMACHeader],
-	}
+	n := authTestNamer(authTestPSK)
+	retargeted := authRequest(t, authTestPSK)
+	retargeted.Header.Set(n.name(slotTarget), "127.0.0.1:80")
+	retargeted.Header.Set(n.name(slotAuthNonce), req.Header.Get(n.name(slotAuthNonce)))
+	retargeted.Header.Set(n.name(slotAuthMAC), req.Header.Get(n.name(slotAuthMAC)))
 	if got := authTestStatus(t, base, retargeted); got != http.StatusProxyAuthRequired {
 		t.Fatalf("retargeted request: status = %d, want %d", got, http.StatusProxyAuthRequired)
 	}
 
-	// The same signature presented for a different session id.
-	resession := map[string]string{
-		"X-Session-ID":  "someone-elses-session",
-		"X-Target":      h["X-Target"],
-		ProtoHeader:     h[ProtoHeader],
-		AuthNonceHeader: h[AuthNonceHeader],
-		AuthMACHeader:   h[AuthMACHeader],
-	}
+	// The same signature presented for a different session id. In derived
+	// mode the session id is the salt, so this also derives different header
+	// names — the request arrives as an unsigned one under names the server
+	// generates from the new salt.
+	resession := authRequest(t, authTestPSK)
+	q := resession.URL.Query()
+	q.Set(saltParam, "someone-elses-session")
+	resession.URL.RawQuery = q.Encode()
 	if got := authTestStatus(t, base, resession); got != http.StatusProxyAuthRequired {
 		t.Fatalf("re-sessoned request: status = %d, want %d", got, http.StatusProxyAuthRequired)
 	}
@@ -532,40 +595,43 @@ func TestServerRejectsMalformedSignature(t *testing.T) {
 	defer cancel()
 	base := authTestServer(t, ctx, ServerConfig{})
 
-	cases := map[string]map[string]string{
-		"no nonce": func() map[string]string {
-			h := authHeaders(t, authTestPSK)
-			delete(h, AuthNonceHeader)
-			return h
-		}(),
-		"non-hex nonce": func() map[string]string {
-			h := authHeaders(t, authTestPSK)
-			h[AuthNonceHeader] = "not-a-nonce"
-			return h
-		}(),
-		"short nonce": func() map[string]string {
-			h := authHeaders(t, authTestPSK)
-			h[AuthNonceHeader] = "0123456789abcdef"
-			return h
-		}(),
-		"no MAC": func() map[string]string {
-			h := authHeaders(t, authTestPSK)
-			delete(h, AuthMACHeader)
-			return h
-		}(),
-		"garbled MAC": func() map[string]string {
-			h := authHeaders(t, authTestPSK)
-			h[AuthMACHeader] = "zz" + h[AuthMACHeader][2:]
-			return h
-		}(),
-		"truncated MAC": func() map[string]string {
-			h := authHeaders(t, authTestPSK)
-			h[AuthMACHeader] = h[AuthMACHeader][:63]
-			return h
-		}(),
+	n := authTestNamer(authTestPSK)
+	cases := map[string]func() *http.Request{
+		"no nonce": func() *http.Request {
+			req := authRequest(t, authTestPSK)
+			req.Header.Del(n.name(slotAuthNonce))
+			return req
+		},
+		"non-hex nonce": func() *http.Request {
+			req := authRequest(t, authTestPSK)
+			req.Header.Set(n.name(slotAuthNonce), "not-a-nonce")
+			return req
+		},
+		"short nonce": func() *http.Request {
+			req := authRequest(t, authTestPSK)
+			req.Header.Set(n.name(slotAuthNonce), "0123456789abcdef")
+			return req
+		},
+		"no MAC": func() *http.Request {
+			req := authRequest(t, authTestPSK)
+			req.Header.Del(n.name(slotAuthMAC))
+			return req
+		},
+		"garbled MAC": func() *http.Request {
+			req := authRequest(t, authTestPSK)
+			mac := req.Header.Get(n.name(slotAuthMAC))
+			req.Header.Set(n.name(slotAuthMAC), "zz"+mac[2:])
+			return req
+		},
+		"truncated MAC": func() *http.Request {
+			req := authRequest(t, authTestPSK)
+			mac := req.Header.Get(n.name(slotAuthMAC))
+			req.Header.Set(n.name(slotAuthMAC), mac[:63])
+			return req
+		},
 	}
-	for name, h := range cases {
-		if got := authTestStatus(t, base, h); got != http.StatusProxyAuthRequired {
+	for name, build := range cases {
+		if got := authTestStatus(t, base, build()); got != http.StatusProxyAuthRequired {
 			t.Errorf("%s: status = %d, want %d", name, got, http.StatusProxyAuthRequired)
 		}
 	}
@@ -576,14 +642,15 @@ func TestServerMinProtoTwoClosesLegacy(t *testing.T) {
 	defer cancel()
 	base := authTestServer(t, ctx, ServerConfig{MinProtoVersion: 2})
 
-	// A legacy client sends no version at all, so it is below the minimum.
-	if got := authTestStatus(t, base, map[string]string{
-		"X-Session-ID": "auth-test-sid", "X-Target": "127.0.0.1:7", "X-Auth-Token": authTestPSK,
-	}); got != http.StatusUpgradeRequired {
-		t.Fatalf("legacy client: status = %d, want %d", got, http.StatusUpgradeRequired)
+	// A constant-name request is refused at the salt gate, before the version
+	// gate ever sees it: that is what "legacy closed" means under strict mode.
+	if got := authTestStatus(t, base, constantNameRequest(t, map[string]string{
+		"X-Auth-Token": authTestPSK,
+	})); got != http.StatusBadRequest {
+		t.Fatalf("constant-name client: status = %d, want %d", got, http.StatusBadRequest)
 	}
-	// A signed client satisfies it.
-	if got := authTestStatus(t, base, authHeaders(t, authTestPSK)); got != http.StatusForbidden {
+	// A signed client satisfies the version gate.
+	if got := authTestStatus(t, base, authRequest(t, authTestPSK)); got != http.StatusForbidden {
 		t.Fatalf("signed client: status = %d, want %d", got, http.StatusForbidden)
 	}
 }
@@ -593,12 +660,16 @@ func TestMinProtoTwoIsEnforcedAfterLegacyIsClosed(t *testing.T) {
 	defer cancel()
 	base := authTestServer(t, ctx, ServerConfig{MinProtoVersion: 2})
 
-	// The only way past the version gate without signing is a v2 announcement,
-	// and a v2 announcement must sign. Together those two rules close the
-	// bare-token path entirely.
-	if got := authTestStatus(t, base, map[string]string{
-		"X-Session-ID": "auth-test-sid", "X-Target": "127.0.0.1:7", ProtoHeader: "2", "X-Auth-Token": authTestPSK,
-	}); got != http.StatusProxyAuthRequired {
+	// The only way past the salt gate is a derived-name request, and the only
+	// way past authentication is a v2+ signature. Together those two rules
+	// close the bare-token path entirely: a token rides along on a request
+	// that signs, or the request does not get in.
+	req := authRequest(t, authTestPSK)
+	n := authTestNamer(authTestPSK)
+	req.Header.Del(n.name(slotAuthMAC))
+	req.Header.Del(n.name(slotAuthNonce))
+	req.Header.Set("X-Auth-Token", authTestPSK)
+	if got := authTestStatus(t, base, req); got != http.StatusProxyAuthRequired {
 		t.Fatalf("v2 without a signature: status = %d, want %d", got, http.StatusProxyAuthRequired)
 	}
 }
@@ -618,7 +689,7 @@ func TestScrubStripsSignedHeaders(t *testing.T) {
 	req.Header.Set(AuthNonceHeader, "0123456789abcdef0123456789abcdef")
 	req.Header.Set(AuthMACHeader, "ab")
 	req.Header.Set("X-Auth-Token", authTestPSK)
-	scrubTunnelRequest(req)
+	scrubTunnelRequest(req, "")
 
 	for _, h := range []string{AuthNonceHeader, AuthMACHeader, "X-Auth-Token"} {
 		if v := req.Header.Get(h); v != "" {

@@ -19,12 +19,6 @@ import (
 	"time"
 )
 
-// AuthNonceHeader carries a 32-hex-char nonce, fresh for every request.
-const AuthNonceHeader = "X-HTTP-Tunnel-Nonce"
-
-// AuthMACHeader carries the hex HMAC-SHA256 of authMessage under the PSK.
-const AuthMACHeader = "X-HTTP-Tunnel-MAC"
-
 const (
 	// authNonceBytes is the entropy per request. It only needs to resist
 	// guessing within the replay window, not to be a general secret.
@@ -169,7 +163,7 @@ func newAuthNonce() (string, error) {
 //
 // An empty password leaves the request unauthenticated: an open tunnel has no
 // credential scheme to sign, and the server must be refusing auth too.
-func signRequest(req *http.Request, password string, a requestAuth) (string, error) {
+func signRequest(req *http.Request, password string, a requestAuth, namer headerNamer) (string, error) {
 	if password == "" {
 		return "", nil
 	}
@@ -177,7 +171,7 @@ func signRequest(req *http.Request, password string, a requestAuth) (string, err
 	if err != nil {
 		return "", err
 	}
-	return nonce, setRequestAuth(req, password, nonce, a)
+	return nonce, setRequestAuth(req, password, nonce, a, namer)
 }
 
 // responseMaskFor derives the mask a response's counters were masked with,
@@ -203,18 +197,6 @@ func responseMaskFor(password, nonce string) []byte {
 // the signature, turning a rewrite from silent corruption into a refusal, and
 // it masks the counters, which takes away the edge's ability to read exact
 // payload lengths off the headers even when it touches nothing.
-
-const (
-	// AuthBodyMACHeader carries the hex HMAC-SHA256 of a request body. The
-	// body is verified in the session handler rather than in the auth path,
-	// because the credential has to be checked before a byte of it is read.
-	AuthBodyMACHeader = "X-HTTP-Tunnel-Body-MAC"
-	// AuthRespMACHeader carries the hex HMAC-SHA256 of a response: its
-	// counters and a digest of its body, keyed to the nonce of the request
-	// that asked for it. The downlink is the half a tunnelled application
-	// receives, so it gets the same protection as the uplink.
-	AuthRespMACHeader = "X-HTTP-Tunnel-Resp-MAC"
-)
 
 const (
 	authDomainV3   = "xhttptunnel/auth/v3"
@@ -288,7 +270,7 @@ var errResponseBodyTampered = errors.New("tunnel: response body does not match i
 // setRequestAuth writes the nonce, the counters and the two signatures. It is
 // the one place a request's secret material is produced, so the masked values
 // on the wire and the plaintext they mask cannot drift apart.
-func setRequestAuth(req *http.Request, password, nonce string, a requestAuth) error {
+func setRequestAuth(req *http.Request, password, nonce string, a requestAuth, namer headerNamer) error {
 	if password == "" {
 		return nil
 	}
@@ -299,29 +281,29 @@ func setRequestAuth(req *http.Request, password, nonce string, a requestAuth) er
 	if a.pad == "" {
 		a.pad = "0"
 	}
-	req.Header.Set(AuthNonceHeader, nonce)
+	req.Header.Set(namer.name(slotAuthNonce), nonce)
 	wire := a.onTheWire(password, nonce)
 	if wire.seq != "" {
-		req.Header.Set("X-Seq", wire.seq)
+		req.Header.Set(namer.name(slotSeq), wire.seq)
 	}
 	if wire.ack != "" {
-		req.Header.Set("X-Ack", wire.ack)
+		req.Header.Set(namer.name(slotAck), wire.ack)
 	}
 	if wire.pad != "" {
-		req.Header.Set(PadHeader, wire.pad)
+		req.Header.Set(namer.name(slotPad), wire.pad)
 	}
 	// The capability is signed as it stands, not masked: it is a public
 	// announcement, and the signature is what stops it being added or removed.
 	if a.caps != "" {
-		req.Header.Set(CapsHeader, a.caps)
+		req.Header.Set(namer.name(slotCaps), a.caps)
 	}
-	req.Header.Set(AuthMACHeader, authMAC(password, v3Message(nonce, a, wire)))
+	req.Header.Set(namer.name(slotAuthMAC), authMAC(password, v3Message(nonce, a, wire)))
 	if a.bodyKind == bodyKindPoll {
 		// An idle poll signs the digest of nothing, which is not the same as
 		// signing nothing: a hop that gives it a body is then as detectable
 		// as one that empties a busy one.
 		digest := sha256.Sum256(a.body)
-		req.Header.Set(AuthBodyMACHeader, bodyMAC(password, nonce, &digest))
+		req.Header.Set(namer.name(slotAuthBodyMAC), bodyMAC(password, nonce, &digest))
 	}
 	return nil
 }

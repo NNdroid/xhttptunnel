@@ -11,7 +11,7 @@ import (
 // the pad that shapes a poll body goes in front of that run, and the reader has
 // to be told where the run starts.
 //
-// It is told in X-Pad, and that used to be the whole of it: a plaintext byte
+// It is told in X-Offset, and that used to be the whole of it: a plaintext byte
 // count in a header. That is a length oracle for anyone reading the wire — it
 // turns a padded body into an exact statement of the payload inside it — and it
 // is a second channel beside the bytes it describes, with its own ways to go

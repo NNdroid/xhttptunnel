@@ -23,7 +23,7 @@ func TestWindowValidationAndClientIsolation(t *testing.T) {
 		}
 	}
 	for _, mb := range []int{0, 1, 16, 64} {
-		c, err := NewClient(ClientConfig{ServerURL: "http://example.com/stream", WindowSizeMB: mb})
+		c, err := NewClient(ClientConfig{ServerURL: "http://example.com/stream", PSK: "window-test-psk", WindowSizeMB: mb})
 		if err != nil {
 			t.Fatal(err)
 		}

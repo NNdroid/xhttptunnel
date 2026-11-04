@@ -4,7 +4,7 @@ High-Performance Bidirectional Split-HTTP / Meek Streaming Tunnel Server & Clien
 
 ## Features
 
-- **Split-HTTP Bidirectional Streaming**: Long-lived uplink POST and a long-lived downlink response — also a POST, carrying `X-Downstream: 1` — with automatic sequence reconstruction.
+- **Split-HTTP Bidirectional Streaming**: Long-lived uplink POST and a long-lived downlink response — also a POST, carrying `X-Mode: 1` — with automatic sequence reconstruction.
 - **Reliable Packet Ring Buffer**: Bounded, synchronized retransmission and reassembly buffers with backpressure.
 - **Auto Self-Signed TLS**: Can generate a pinned RSA certificate for direct TLS deployments.
 - **Stun Node Sharing (`gen-uri`)**: One-click encrypted `stun://` share link (plus a plaintext `xhttp://` URI) and terminal ASCII QR code generation for Android & TV.
@@ -150,10 +150,10 @@ An unbracketed IPv6 literal is rejected, so write `[::1]:22` or `[::1]`. That
 check is deliberately stricter than the runtime matcher, which drops an
 unparseable entry fail-closed: a typo surfaces at generation time rather than
 becoming a rule that looks active but never fires. On a *client* config `target`
-must stay bare `host:port` — it travels to the server verbatim as `X-Target`,
+must stay bare `host:port` — it travels to the server verbatim as `X-Route`,
 and the client selects its protocol from `listen` (`udp://…` opens a UDP
 forwarder), not from the target. The server resolves any scheme away from an
-incoming `X-Target` before both the allowlist check and the dial, so
+incoming `X-Route` before both the allowlist check and the dial, so
 `tcp://127.0.0.1:22` from a client would pass a loopback policy and connect
 just fine: the prefix you typed is silently ignored, not honoured, so a config
 that reads like a protocol selector would be one that does nothing. That is why
@@ -198,24 +198,24 @@ biggest throughput hit on this path. `-scheme auto` picks `https` for a
 non-loopback backend or port 443, otherwise `http`; IPv6 backends are bracketed
 with or without existing brackets.
 
-**nginx header requirements.** nginx has no `proxy_pass_header` directive.
-Request headers are governed by `proxy_pass_request_header`, which is `on` by
-default, and response headers by `proxy_hide_header`, which hides nothing by
-default. So the tunnel's protocol headers flow through with no configuration at
-all:
+**nginx header requirements.** Request headers are governed by
+`proxy_pass_request_header`, which is `on` by default, so the tunnel's request
+headers flow through with no configuration at all. Responses flow through too:
+none of the protocol header names are in nginx's `proxy_hide_header` default
+list (which strips `Date`, `Server`, `X-Pad` and every `X-Accel-*` header from
+the upstream response), so no `proxy_pass_header` directive is needed in either
+direction.
 
-- *Request* — `X-Auth-Token`, `X-HTTP-Tunnel-Nonce`, `X-HTTP-Tunnel-MAC`,
-  `X-HTTP-Tunnel-Body-MAC`, `X-HTTP-Tunnel-Caps`, `X-XHTTP-Proto`, `X-Target`,
-  `X-Network`, `X-Session-ID`, `X-Seq`, `X-Ack`, `X-Pad`, `X-Retry`,
-  `X-Downstream`, `X-Stream-Resume`, `X-Stream-Probe-Window`, plus
+- *Request* — `X-Auth-Token`, `X-Req-Id`, `X-Req-Sig`, `X-Body-Sig`,
+  `X-Features`, `X-Ver`, `X-Route`, `X-Net`, `X-Trace`, `X-Pos`, `X-Cursor`,
+  `X-Offset`, `X-Retries`, `X-Mode`, `X-Resume`, `X-Probe`, plus
   the camouflage headers `User-Agent`, `Accept`, `Accept-Encoding`,
   `Cache-Control`, `Pragma`, `Content-Type`.
-- *Response* — `X-XHTTP-Proto`, `X-Seq`, `X-Ack`, `X-Pad`, `X-Session-ID`,
-  `X-HTTP-Tunnel-Caps`, `X-HTTP-Tunnel-Resp-MAC`, `X-HTTP-Tunnel-Poll-Timeout`,
-  `X-Downstream-Accepted`, `X-Stream-Uplink-Sync`, `X-Session-Created`, plus
-  `Cache-Control`, `Pragma`, `Expires`, `X-Accel-Buffering`.
+- *Response* — `X-Ver`, `X-Pos`, `X-Cursor`, `X-Offset`, `X-Trace`,
+  `X-Features`, `X-Resp-Sig`, `X-Wait`, `X-Mode-Accepted`, `X-Sync`,
+  `X-Fresh`, plus `Cache-Control`, `Pragma`, `Expires`, `X-Accel-Buffering`.
 
-`X-HTTP-Tunnel-Poll-Timeout` tells the client how long this server parks an
+`X-Wait` tells the client how long this server parks an
 idle poll, in seconds. It is a hint, not a credential: a client that never
 sees it falls back to its own conservative bound, and a hop that tampers with
 it can cost that client a timeout and nothing else. It earns its place
@@ -226,18 +226,58 @@ enough to cover the first also covers the second, and a dead path looks alive
 for as long as that timeout is. With the number, the client fails fast on a
 dead path and recovers in seconds instead of minutes.
 
-`X-HTTP-Tunnel-Nonce` and `X-HTTP-Tunnel-MAC` are the v2 credentials. A request
-that advertises `X-XHTTP-Proto: 2` commits to the signature and the bare-token
+`X-Req-Id` and `X-Req-Sig` are the v2 credentials. A request
+that advertises `X-Ver: 2` commits to the signature and the bare-token
 path is closed to it, so it is refused outright rather than downgraded; a
 nonce that is missing, malformed, or already seen inside the 120-second
 replay window fails validation. If either header is lost in transit the client
 simply cannot connect and nothing in the logs points at nginx, so `gen-nginx`
 declares it explicitly alongside `X-Auth-Token` — the one place where the
-redundancy with `proxy_pass_request_header on` is worth the lines. `X-Pad`
+redundancy with `proxy_pass_request_header on` is worth the lines. `X-Offset`
 makes a third: a signed request that arrives without it is refused (HTTP 400)
 rather than read as carrying no pad at all, so a hop that does not forward the
 header cannot forward the request either, and the operator gets a bare 400 with
-nothing naming the proxy.
+nothing naming the proxy. A derived-mode client writes per-session names that
+these three `proxy_set_header` lines never match, so for it they are no-ops and
+its derived names pass through `proxy_pass_request_header on` unchanged.
+
+**Header camouflage.** Every protocol header name is deliberately neutral —
+none carries `X-HTTP-Tunnel-`, `X-XHTTP-`, or the word `tunnel`/`stream`/`xhttp`
+— so an observer reading the header names cannot tell this is a self-built
+tunnel. The names are also outside nginx's default hidden-header list and avoid
+the headers a real CDN or proxy generates (`X-Forwarded-*`, `X-Request-Id`,
+`X-Cache-*`), so a middlebox neither strips nor collides with them. The single
+source of truth is `tunnel/headers.go`; a completeness test
+(`TestEveryProtocolHeaderIsScrubbedOrResponseOnly`) fails if a header is added
+without being classified, and `TestProtocolHeaderNamesAreNeutral` fails if any
+name leaks a protocol marker. Renaming these is a wire-format change with no
+negotiation fallback — the version header `X-Ver` is itself one of them, so an
+old client and a new server cannot agree on what the other speaks. A mixed
+deployment fails closed (HTTP 407, no signature found) rather than corrupting;
+upgrade both ends together.
+
+**Derived header names (PSK mode).** The neutral names above are still
+*constant*, so an observer who has seen one session can match them forever. When
+a `psk` is configured, the client derives every protocol header name from the
+shared key and the session id instead: `X-` + hex(HMAC-SHA256(psk,
+`xhttptunnel/headername/v3` ‖ NUL ‖ sessionID ‖ NUL ‖ slot))[:16]. The session id
+is the salt — per-session, 128-bit random, already bound into the signature — so
+every session uses a fresh set of names and an observer who learns one session's
+names learns nothing reusable. Because the server cannot read a header whose
+name it has not derived yet, the session id travels in the URL as `?s=<session>`
+rather than in `X-Trace` in derived mode; the server reads it at the top of the
+handler and derives the same names. An observer without the key sees opaque
+names that change every session and can never map them to the protocol.
+
+Derivation is gated on the `psk`: an open tunnel (no `psk`) keeps the constant
+names and the `X-Trace` header byte-for-byte as above, so the mode is opt-in and
+backwards compatible. A server accepts both during a fleet upgrade — a constant
+request and a derived request authenticate under their own names — so servers
+can be rolled out before clients. The disguise-site scrubber deletes under both
+name sets, so a derived-mode request that misses the tunnel path cannot leak its
+headers to the fallback site. This hides the *names*; it does not hide the
+values (the target in `X-Route`, the HMAC shape) or the behaviour signature, and
+an observer holding the key sees everything anyway.
 
 Four headers are still the exception that must be set explicitly, because
 nginx's *default* for each is wrong for this tunnel:
@@ -285,7 +325,7 @@ journalctl -u xhttptunnel -f   # View live logs
 | `mode` | `string` | `"server"` | Operational mode: `"server"` or `"client"`. |
 | `listen` | `string` | `":8443"` | Listen address (`":8443"` for server; `"tcp://127.0.0.1:1080"` for client, where the scheme picks the forwarder protocol — `udp://…` opens a UDP forwarder). |
 | `server` | `string` | `""` | Server endpoint URL for client mode (e.g. `"https://example.com:8443/stream"`). |
-| `target` | `string` | server `"tcp://127.0.0.1:22"`, client `"127.0.0.1:22"` | Target service address. Server: the scheme is required — it is the dial address and it selects the protocol (`tcp://127.0.0.1:22`, `udp://127.0.0.1:51820`). Client: bare `host:port`, no scheme — it goes to the server verbatim as `X-Target` while the protocol travels separately in `X-Network`, and any scheme you add is stripped before the dial rather than honoured. |
+| `target` | `string` | server `"tcp://127.0.0.1:22"`, client `"127.0.0.1:22"` | Target service address. Server: the scheme is required — it is the dial address and it selects the protocol (`tcp://127.0.0.1:22`, `udp://127.0.0.1:51820`). Client: bare `host:port`, no scheme — it goes to the server verbatim as `X-Route` while the protocol travels separately in `X-Net`, and any scheme you add is stripped before the dial rather than honoured. |
 | `default_target` / `forward` | `string` | — | Aliases for `target` (server / client respectively); cross-filled when `target` is set. |
 | `path` | `string` | `"/stream"` | Custom Split-HTTP proxy path. |
 | `psk` | `string` | none | Pre-shared key / token (aliases `token`/`auth_token`). CLI subcommands require an explicit non-placeholder value; an empty config-file value explicitly enables open mode. |
@@ -311,7 +351,7 @@ journalctl -u xhttptunnel -f   # View live logs
 | `allowed_targets` | `[]string` | `[]` | Server: restrict client-requested targets. Each entry is `host:port`, `:port`, `host:`, `[host]` or `*` — an unbracketed IPv6 literal is rejected because its colons are ambiguous, so write `[::1]:22` or `[::1]` — optionally prefixed `tcp://` / `udp://` to admit only that protocol (`udp://:53` = UDP DNS on any host; `tcp://192.168.1.10:` = TCP on any port of that host; a scheme-less `127.0.0.1:` admits either; the prefix is a protocol gate only and is never part of the address that gets dialed). An entry that cannot be parsed matches nothing rather than widening the policy. Enforcement runs at session creation, so a custom `Handler` sees only allowlisted targets too. Empty = allow all. |
 | `trust_proxy_headers` | `bool` | `false` | Server: honour `CF-Connecting-IP`/`X-Forwarded-For`/`X-Real-IP` for client-address logging. Enable only behind a trusted proxy that strips them. |
 | `health_path` | `string` | `""` | Server: when set (e.g. `/healthz`), expose an unauthenticated JSON stats snapshot (`Server.Stats`) on the tunnel listener. Empty = disabled. Intended for localhost / operator listeners. |
-| `min_proto_version` | `int` | `0` | Server: reject (HTTP 426) clients advertising an `X-XHTTP-Proto` below this, to retire an old wire generation or the legacy credential scheme fleet-wide. `0` accepts all clients, including header-less legacy ones. Setting it to `2` forces the signed-nonce scheme: a client advertising version 2 is admitted only by signature, which closes the bare-token fallback. Setting it to `3` additionally retires every generation whose metadata and bodies are outside the signature. |
+| `min_proto_version` | `int` | `0` | Server: reject (HTTP 426) clients advertising an `X-Ver` below this, to retire an old wire generation or the legacy credential scheme fleet-wide. `0` accepts all clients, including header-less legacy ones. Setting it to `2` forces the signed-nonce scheme: a client advertising version 2 is admitted only by signature, which closes the bare-token fallback. Setting it to `3` additionally retires every generation whose metadata and bodies are outside the signature. |
 | `brutal` | object | `{enabled: false}` | Cap the send rate of the tunnel's **TCP** sockets with [TCP Brutal](https://github.com/beef92/tcp-brutal) (a Linux kernel module; inert on other platforms). See [TCP Brutal & bandwidth exchange](#tcp-brutal--bandwidth-exchange). |
 
 For a direct TLS deployment, `:8443` (or `tcp+udp://:8443`) starts HTTPS and HTTP/3 on the same port. Use `tcp://127.0.0.1:8443` for a cleartext CDN origin; without a certificate/key the server intentionally does not bind UDP or advertise HTTP/3.
@@ -363,7 +403,7 @@ The pin reaches the importer through the profile's `verifyCertFingerprint` / `se
 
 A pin only helps for a certificate that stays put. `selfsign: true` makes the server generate a fresh certificate into a temp directory at every startup, so nothing stable exists to share: gen-uri prints a warning and emits no pin rather than shipping a fingerprint that breaks after the first restart. Use a static `cert`/`key` pair for a pin that survives restarts, or pass `-fingerprint` to pin the certificate of the current run.
 
-**Share URI shape.** The `sshAddr` field is always bare `host:port`. A `tcp://` prefix in the config's `target` is stripped before it is written, so the profile carries the address the importer needs rather than a scheme that does nothing there — the client's protocol travels separately in `X-Network`, never in the target's scheme. IPv6 origins are bracketed (`[2001:db8::10]:9443`); an unbracketed `2001:db8::10:9443` is not an address any dialer can parse. `tunnelTlsEnabled` is written explicitly as `true` and `alpn` as `auto`, so an imported node tries h3 before h2/h1.1 instead of inheriting the app's h2-only default — otherwise a server listening only on `udp://` would be unreachable after a scan. The link cannot carry SSH credentials: the node imports as `root` with an empty password, so set the real user/password or private key in the app.
+**Share URI shape.** The `sshAddr` field is always bare `host:port`. A `tcp://` prefix in the config's `target` is stripped before it is written, so the profile carries the address the importer needs rather than a scheme that does nothing there — the client's protocol travels separately in `X-Net`, never in the target's scheme. IPv6 origins are bracketed (`[2001:db8::10]:9443`); an unbracketed `2001:db8::10:9443` is not an address any dialer can parse. `tunnelTlsEnabled` is written explicitly as `true` and `alpn` as `auto`, so an imported node tries h3 before h2/h1.1 instead of inheriting the app's h2-only default — otherwise a server listening only on `udp://` would be unreachable after a scan. The link cannot carry SSH credentials: the node imports as `root` with an empty password, so set the real user/password or private key in the app.
 
 ---
 
@@ -510,7 +550,7 @@ downlink from long-poll to a **streaming response** (SSE-style: the server
 pushes frames into one response body as they arrive) on h1/h2/h3, paired with a
 long-lived POST uplink — so each direction remains a separate HTTP stream and
 does not require one request to read and write concurrently. The downlink
-request is a POST too, named by `X-Downstream: 1` rather than by its method, so
+request is a POST too, named by `X-Mode: 1` rather than by its method, so
 it is indistinguishable on the wire from the idle polls beside it; a hop that
 drops the header hands the origin an ordinary idle poll and the client falls
 back on its own. CDN/proxy request and response streaming must remain enabled.
@@ -519,8 +559,8 @@ Uplink throughput no longer shares a round trip with each downlink chunk.
 Negotiation (three layers, cached per `protocol|host|SNI|fingerprint|TransportKey`,
 TTL 5 min):
 
-1. **Capability header** — the client sends `X-Downstream: 1`; a legacy server
-   answers without `X-Downstream-Accepted` and the client keeps polling.
+1. **Capability header** — the client sends `X-Mode: 1`; a legacy server
+   answers without `X-Mode-Accepted` and the client keeps polling.
 2. **Bidirectional readiness + path probe** — after the companion POST passes
    authentication and the per-session admission limit, the server flushes a
    hello frame. If it arrives within `max(5s, 3× measured TTFB)` (capped at
@@ -533,7 +573,7 @@ TTL 5 min):
    runs out.
 3. **Watchdog** — an established stream must see a frame (data or keepalive,
    emitted every 5 s) within 30 s, otherwise it is re-established with resume
-   (`X-Ack`), indefinitely and with capped exponential backoff. An established
+   (`X-Cursor`), indefinitely and with capped exponential backoff. An established
    session is never demoted to polling: its acknowledged sequence space cannot be
    rebased onto the poll cursor. Only a *failed negotiation* downgrades an
    endpoint.
@@ -587,7 +627,7 @@ sequence the peer last acknowledged.
 
 What makes the recovery fast is knowing how long a *healthy* request should
 take. The server advertises its long-poll window in
-`X-HTTP-Tunnel-Poll-Timeout`, and the client derives its request deadline
+`X-Wait`, and the client derives its request deadline
 from that window plus a grace, rather than from a fixed ceiling of its own.
 The difference is the whole point: a fixed ceiling has to be large enough to
 cover a long poll that comes back empty, and that makes it large enough to
@@ -644,7 +684,7 @@ the header's width. So exactly one of them does:
   the band. A band that starts above the chunk's size re-bands it at the
   envelope, so that object lands inside the band with a frame pad it did not
   need — the shape is right, the bytes inside it are wasted.
-- **Negotiated.** Both ends advertise `pad-body` in `X-HTTP-Tunnel-Caps`.
+- **Negotiated.** Both ends advertise `pad-body` in `X-Features`.
   Padding moves out to the transport — the streaming envelope's own pad field,
   or a poll body's leading pad — and the frame layer leaves its pad field at
   zero. The wire object then lands inside the band: 400..600 on both
@@ -709,7 +749,7 @@ Things worth knowing before changing it:
   makes that hold. Negotiated, the frames go out bare and the body carries a
   pad in front, so `Content-Length` — the pad plus the frames — still describes
   the object an observer sees.
-- **The pad's length travels as a signed, masked header.** It rides in `X-Pad`,
+- **The pad's length travels as a signed, masked header.** It rides in `X-Offset`,
   but never in the clear: it is XORed with the same per-request keystream as
   the counters and it is inside the signed message, so an observer holding it
   cannot subtract it from `Content-Length` to learn the payload exactly, and a
@@ -801,15 +841,15 @@ group and its own ceiling). A client keeps its static `group_id`, since one
 client→server TCP connection already multiplexes all of its sessions.
 
 **Bandwidth exchange.** The exchange reuses the target field with the
-reserved address `_BrutalBwExchange`, and adds two headers in the existing
-`X-HTTP-Tunnel-*` family:
+reserved address `_BrutalBwExchange`, and adds two headers in the protocol's
+neutral header family:
 
-- `X-HTTP-Tunnel-Bw` — this side's **ingest** ceiling in bytes/s. The rule is
+- `X-Ingest` — this side's **ingest** ceiling in bytes/s. The rule is
   symmetric on both ends: **the peer's advertised value becomes this side's
   send rate.** A client advertising its downlink makes the server slow its
   uplink to it; the server advertising its ingest capacity makes the client
   slow its uplink to it. The two ends converge on the slower link.
-- `X-HTTP-Tunnel-Caps: brutal-bw` — tells a client the server implements the
+- `X-Features: brutal-bw` — tells a client the server implements the
   exchange, so no protocol version bump is needed.
 
 `rate` is a ceiling the exchange can only **lower**, never raise, which also
@@ -868,7 +908,7 @@ release.
 ### Protocol versioning & operational hardening
 
 - **Wire-protocol generation.** Every tunnel request carries
-  `X-XHTTP-Proto`; the generation a current client announces is 3. A client
+  `X-Ver`; the generation a current client announces is 3. A client
   refuses to speak to a server advertising a *newer* generation (a hard error,
   not a poll fallback — a changed frame layout must not be polled by an older
   reader). An operator can force the fleet off a retired generation with
@@ -931,7 +971,7 @@ release.
 - **Stats & health endpoint.** `Server.Stats()` returns monotonic counters
   (sessions created / rejected / kicked / reaped, request total, live gauge,
   and `proto_version` — the frame-layout generation the server advertises,
-  `tunnelProtoVersion`, which is `1` and not the `X-XHTTP-Proto` generation a
+  `tunnelProtoVersion`, which is `1` and not the `X-Ver` generation a
   client announces). Setting
   `health_path` (e.g. `/healthz`) serves them as
   JSON on the tunnel listener — unauthenticated, so point it at a

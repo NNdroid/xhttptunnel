@@ -30,10 +30,12 @@ type wireProxy struct {
 	// means pass through.
 	editRequest  func(b []byte) []byte
 	editResponse func(b []byte) []byte
-	// editRequestHeaders rewrites the headers a request travels under.
-	editRequestHeaders func(h http.Header)
+	// editRequestHeaders rewrites the headers a request travels under. The
+	// request is passed so a tamper can derive the header names a derived-mode
+	// client actually used (from the URL salt) before it touches them.
+	editRequestHeaders func(h http.Header, r *http.Request)
 	// editResponseHeaders rewrites the headers a response travels under.
-	editResponseHeaders func(h http.Header)
+	editResponseHeaders func(h http.Header, r *http.Request)
 	// lastRequest is the biggest request body seen, for a positive control.
 	lastRequest []byte
 	statuses    []int
@@ -60,7 +62,7 @@ func newWireProxy(t *testing.T, originURL *url.URL) *wireProxy {
 	transport := &http.Transport{}
 	t.Cleanup(transport.CloseIdleConnections)
 	p.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if v := r.Header.Get(PadHeader); v != "" {
+		if v := r.Header.Get(tamperNamer(r).name(slotPad)); v != "" {
 			p.mu.Lock()
 			p.padHeaders = append(p.padHeaders, v)
 			p.mu.Unlock()
@@ -82,7 +84,7 @@ func newWireProxy(t *testing.T, originURL *url.URL) *wireProxy {
 			body = reqEdit(body)
 		}
 		if reqHeaderEdit != nil {
-			reqHeaderEdit(r.Header)
+			reqHeaderEdit(r.Header, r)
 		}
 
 		p.mu.Lock()
@@ -128,7 +130,7 @@ func newWireProxy(t *testing.T, originURL *url.URL) *wireProxy {
 			return
 		}
 		defer resp.Body.Close()
-		if v := resp.Header.Get(PadHeader); v != "" {
+		if v := resp.Header.Get(tamperNamer(r).name(slotPad)); v != "" {
 			p.mu.Lock()
 			p.padHeaders = append(p.padHeaders, v)
 			p.mu.Unlock()
@@ -147,7 +149,7 @@ func newWireProxy(t *testing.T, originURL *url.URL) *wireProxy {
 			got = respEdit(got)
 		}
 		if respHeaderEdit != nil {
-			respHeaderEdit(resp.Header)
+			respHeaderEdit(resp.Header, r)
 		}
 
 		for k, vv := range resp.Header {
@@ -232,6 +234,14 @@ func wireDial(t *testing.T, ctx context.Context, p *wireProxy) net.Conn {
 	return conn
 }
 
+// tamperNamer derives the header namer a wire-proxy request was written under.
+// These tests run a PSK server, so the client derives its names from the PSK
+// and the URL salt; a hop that tampers a header has to reach it under the name
+// the client actually used.
+func tamperNamer(r *http.Request) headerNamer {
+	return deriveHeaderNamer("wire-secret", r.URL.Query().Get(saltParam))
+}
+
 // waitForEvent pulls events until the wanted kind arrives or the deadline
 // passes.
 func waitForEvent(t *testing.T, events chan SessionEvent, kind string, d time.Duration) SessionEvent {
@@ -252,7 +262,7 @@ func waitForEvent(t *testing.T, events chan SessionEvent, kind string, d time.Du
 
 // TestPollPadLengthTravelsMasked pins the shape the pad length has on the
 // wire. It used to be a plaintext byte count, which turned a padded body into
-// an exact statement of the payload inside it: Content-Length less X-Pad is
+// an exact statement of the payload inside it: Content-Length less X-Offset is
 // the payload, to anyone reading the wire. It now travels under the same
 // per-request keystream as the counters, so what an observer can read says
 // nothing, and what a hop can alter is verified against the signature.
@@ -484,8 +494,9 @@ func TestSignedCountersCannotBeRewritten(t *testing.T) {
 	// The hop cannot know the mask, and it does not need to: any change to
 	// the header breaks the signature over the header as it stands.
 	p.mu.Lock()
-	p.editRequestHeaders = func(h http.Header) {
-		for _, name := range []string{"X-Seq", "X-Ack"} {
+	p.editRequestHeaders = func(h http.Header, r *http.Request) {
+		namer := tamperNamer(r)
+		for _, name := range []string{namer.name(slotSeq), namer.name(slotAck)} {
 			v := h.Get(name)
 			if v == "" {
 				continue
@@ -519,8 +530,9 @@ func TestSignedCountersCannotBeRewritten(t *testing.T) {
 // message. Neither hop needs the key: the pad travels masked, but any change
 // to the header breaks the signature over the header as it stands.
 func TestSignedPadLengthCannotBeMovedOnTheWire(t *testing.T) {
-	bumpPad := func(h http.Header) {
-		v := h.Get(PadHeader)
+	bumpPad := func(h http.Header, r *http.Request) {
+		name := tamperNamer(r).name(slotPad)
+		v := h.Get(name)
 		if v == "" {
 			return
 		}
@@ -528,14 +540,14 @@ func TestSignedPadLengthCannotBeMovedOnTheWire(t *testing.T) {
 		if err != nil {
 			return
 		}
-		h.Set(PadHeader, strconv.FormatUint((n+1)%65536, 10))
+		h.Set(name, strconv.FormatUint((n+1)%65536, 10))
 	}
 	for _, tc := range []struct {
 		name string
-		edit func(h http.Header)
+		edit func(h http.Header, r *http.Request)
 	}{
 		// A CDN that forwards only the headers it knows about.
-		{"stripped", func(h http.Header) { h.Del(PadHeader) }},
+		{"stripped", func(h http.Header, r *http.Request) { h.Del(tamperNamer(r).name(slotPad)) }},
 		// A hop that moves the boundary by one byte: the padding then ends
 		// somewhere other than where the writer put its first frame.
 		{"rewritten", bumpPad},
@@ -620,15 +632,15 @@ func TestSignedRequestThatStatesNoPadIsRefused(t *testing.T) {
 	}
 	req.ContentLength = int64(len(padded))
 	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
-	req.Header.Set("X-Target", "127.0.0.1:9")
-	req.Header.Set("X-Network", "tcp")
-	req.Header.Set("X-Session-ID", strings.Repeat("ab", 16))
+	req.Header.Set(TargetHeader, "127.0.0.1:9")
+	req.Header.Set(NetworkHeader, "tcp")
+	req.Header.Set(SessionIDHeader, strings.Repeat("ab", 16))
 	req.Header.Set(AuthNonceHeader, nonce)
 
 	// Everything else in the message is what the sender really means, and the
 	// pad is the one field it leaves unsaid.
 	a := requestAuth{
-		sessionID: req.Header.Get("X-Session-ID"),
+		sessionID: req.Header.Get(SessionIDHeader),
 		network:   "tcp",
 		target:    "127.0.0.1:9",
 		method:    http.MethodPost,
@@ -678,7 +690,7 @@ func TestSignedResponseWithoutItsPadLengthKillsTheTunnel(t *testing.T) {
 	}
 
 	p.mu.Lock()
-	p.editResponseHeaders = func(h http.Header) { h.Del(PadHeader) }
+	p.editResponseHeaders = func(h http.Header, r *http.Request) { h.Del(tamperNamer(r).name(slotPad)) }
 	p.mu.Unlock()
 
 	if _, err := conn.Write(bytes.Repeat([]byte{0x77}, 64)); err != nil {

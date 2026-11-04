@@ -3,7 +3,6 @@ package tunnel
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -203,11 +202,6 @@ func ParseListenAddr(listenAddr string) (string, string) {
 	return listenAddr, NetBoth
 }
 
-// constTimeEqual compares two strings without leaking where they first differ.
-func constTimeEqual(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
-}
-
 // redactAuth renders a credential header safe for logging as "<scheme> <n bytes>".
 // The header carries the shared PSK in cleartext ("Bearer <token>"), and debug
 // logs routinely end up in bug reports and log collectors, so it must never be
@@ -230,63 +224,64 @@ func redactAuth(header string) string {
 // operator needs to see when debugging why a client was refused. The nonce is
 // logged verbatim because it is public by design — it is the value the replay
 // window is keyed on — while the digest is reduced to its byte length.
-func describeAuth(r *http.Request) string {
-	if mac := r.Header.Get(AuthMACHeader); mac != "" {
-		return fmt.Sprintf("signed nonce=%s mac=%d bytes", r.Header.Get(AuthNonceHeader), len(mac))
+func describeAuth(r *http.Request, namer headerNamer) string {
+	if mac := r.Header.Get(namer.name(slotAuthMAC)); mac != "" {
+		return fmt.Sprintf("signed nonce=%s mac=%d bytes", r.Header.Get(namer.name(slotAuthNonce)), len(mac))
 	}
 	return redactAuth(r.Header.Get("Proxy-Authorization"))
 }
 
-// tunnelRequestHeaders is every header this protocol uses to carry session or
-// policy state. The fallback proxy forwards camouflage traffic to an external
-// site, so none of them may leave the origin. X-Auth-Token matters most: it
-// carries the bare pre-shared key (Proxy-Authorization is hop-by-hop and Go's
-// ReverseProxy already strips it, which is exactly why this duplicate exists),
-// and X-Target names the internal address clients are dialing through.
-// tunnelHeaderPrefix is the namespace every protocol header lives under, in
-// lower case because header names reach the scrubber canonicalised and the
-// comparison is case-insensitive.
-const tunnelHeaderPrefix = "x-http-tunnel-"
-
-var tunnelRequestHeaders = []string{
-	"X-Auth-Token",
-	AuthNonceHeader,
-	AuthMACHeader,
-	AuthBodyMACHeader,
-	PadHeader,
-	CapsHeader,
-	BwHeader,
-	"X-Target",
-	"X-Network",
-	"X-Session-ID",
-	ProtoHeader,
-	"X-Seq",
-	"X-Ack",
-	"X-Retry",
-	"X-Downstream",
-	"X-Stream-Resume",
-	"X-Stream-Probe-Window",
-}
+// tunnelRequestHeaders is every protocol header that rides a request. The
+// fallback proxy forwards camouflage traffic to an external site, so none of
+// them may leave the origin. X-Auth-Token matters most: it carries the bare
+// pre-shared key (Proxy-Authorization is hop-by-hop and Go's ReverseProxy
+// already strips it, which is exactly why this duplicate exists), and X-Route
+// names the internal address clients are dialing through.
+//
+// The list is derived from the protocolHeaders registry minus the
+// response-only headers, so a protocol header added to the registry without
+// being classified is caught by TestEveryProtocolHeaderIsScrubbedOrResponseOnly
+// instead of silently reaching a disguise site.
+var tunnelRequestHeaders = func() []string {
+	scrub := make(map[string]bool, len(responseOnlyHeaders))
+	for _, h := range responseOnlyHeaders {
+		scrub[h] = true
+	}
+	var out []string
+	for _, h := range protocolHeaders {
+		if !scrub[h] {
+			out = append(out, h)
+		}
+	}
+	// X-Auth-Token is the operator-configurable token header (--token-header);
+	// it is not part of the registry because its name is not fixed, but it must
+	// be scrubbed with the rest.
+	out = append(out, "X-Auth-Token")
+	return out
+}()
 
 // scrubTunnelRequest strips protocol state before a request leaves the origin
 // through the fallback proxy. The body is emptied as well: it carries raw
 // tunnel frames, which a disguise site has no business parsing. The method is
 // kept so the forwarded request still looks like an ordinary web request.
-func scrubTunnelRequest(req *http.Request) {
-	for _, h := range tunnelRequestHeaders {
-		req.Header.Del(h)
-	}
-	// The list above is hand-kept, so every header added to the protocol is
-	// one more chance to forget it and forward it to a third party. X-Pad,
-	// X-HTTP-Tunnel-Caps and X-HTTP-Tunnel-Bw each spent time on the wrong
-	// side of that gap. The prefix closes the class rather than the instance:
-	// everything in this namespace belongs to the protocol, whether or not
-	// someone remembered to name it.
-	for h := range req.Header {
-		if strings.HasPrefix(strings.ToLower(h), tunnelHeaderPrefix) {
+//
+// The headers to delete are resolved under every namer a request could be
+// written under — the default constant names, and each configured key's
+// derived names when the request carried a URL salt — so a derived-mode
+// request is scrubbed under the names its client actually sent, whichever key
+// it signed with. Deleting a name that is not present is harmless.
+func scrubTunnelRequest(req *http.Request, psk string) {
+	namers := candidateNamers(req, psk)
+	for _, namer := range namers {
+		for _, h := range namer.requestScrubNames() {
 			req.Header.Del(h)
 		}
 	}
+	// The protocol header names are neutral on purpose (see headers.go), so
+	// there is no prefix that closes the class the way the old X-HTTP-Tunnel-
+	// namespace did. The registry and its completeness test take that role
+	// instead: a header added to the protocol without being classified fails
+	// the test, which is what keeps a new field from leaking to a third party.
 	if req.Body != nil && req.Body != http.NoBody {
 		_ = req.Body.Close()
 	}
@@ -295,10 +290,44 @@ func scrubTunnelRequest(req *http.Request) {
 	req.GetBody = nil
 }
 
-// authorize decides whether one request may use this tunnel. Two credential
-// shapes are accepted:
+// candidateNamers returns the header namers a request may be written under:
+// the default constant names, plus each configured key's derived names when
+// the request carries a URL salt. The scrubber deletes under all of them,
+// since it does not authenticate the request and so cannot know which key (or
+// none) produced the names on it.
+func candidateNamers(r *http.Request, psk string) []headerNamer {
+	namers := []headerNamer{defaultNamer}
+	if psk == "" {
+		return namers
+	}
+	s := r.URL.Query().Get(saltParam)
+	if s == "" {
+		return namers
+	}
+	for _, key := range splitTokens(psk) {
+		if key != "" {
+			namers = append(namers, deriveHeaderNamer(key, s))
+		}
+	}
+	return namers
+}
+
+// sessionIDFromRequest resolves the session id a request carries. In strict
+// mode (a PSK is always required, so psk is never empty) it is the URL salt
+// (saltParam): the server cannot read a header whose name it has not derived
+// yet, which is the chicken-and-egg the salt exists to break. A request
+// without a salt is not derivable and is refused downstream.
+func sessionIDFromRequest(r *http.Request, psk string) string {
+	if psk == "" {
+		return ""
+	}
+	return r.URL.Query().Get(saltParam)
+}
+
+// authorize decides whether one request may use this tunnel, and returns the
+// header namer it is to be parsed under. Two credential shapes are accepted:
 //
-//   - v2, the signed path: X-HTTP-Tunnel-Nonce plus X-HTTP-Tunnel-MAC. The
+//   - v2, the signed path: X-Req-Id plus X-Req-Sig. The
 //     PSK never crosses the wire, and the nonce stops the request from being
 //     replayed. This is the only path a current client uses.
 //   - legacy, the bare path: the PSK itself in Proxy-Authorization or
@@ -309,6 +338,12 @@ func scrubTunnelRequest(req *http.Request) {
 // endpoint is upgraded. To retire the legacy path set min_proto_version to 2:
 // a v2 client that does not sign is refused below rather than downgraded, so
 // that setting genuinely closes the bare-token hole.
+//
+// The returned namer is the one the request's headers were actually written
+// under. When the server holds several keys (rotation), each is tried in turn:
+// the first whose derived names authenticate the request wins, and that namer
+// is then used for every header on the request and its response.
+//
 // requestCred records which key authenticated a request, under which nonce, and
 // at which generation. The counters and the body are readable only with the key
 // that signed them, and a server can hold several keys at once, so the handlers
@@ -328,52 +363,61 @@ func (c requestCred) signed() bool {
 	return c.key != "" && c.proto >= bodyProtoVersion
 }
 
-func (st *serverState) authorize(r *http.Request, expected string) (requestCred, bool) {
-	if requiresMAC(r) {
-		// This client announced the signed generation, so it commits to it: the
-		// bare-token path is closed to it. Without this rule min_proto_version
-		// would be a gate with a hole — a v2 client could keep replayable
-		// credentials and still satisfy the minimum, so rotating the PSK would
-		// read as a success.
-		return st.authorizeByMAC(r, expected, r.Header.Get(AuthMACHeader))
+func (st *serverState) authorize(r *http.Request, expected, sessionID string) (headerNamer, requestCred, bool) {
+	// Strict mode: no open tunnel, no constant-name request. The PSK is
+	// required at construction, so expected is never empty here, and the only
+	// accepted credential is a v2+ signature over derived names.
+	//
+	// The request must carry a URL salt to be derivable at all: without it the
+	// server cannot know the session id to derive names from, and a
+	// constant-name request (which carries X-Trace, not ?s=) is a legacy client
+	// that this build no longer accepts.
+	if sessionID == "" {
+		return defaultNamer, requestCred{}, false
 	}
-	if mac := r.Header.Get(AuthMACHeader); mac != "" {
-		// A legacy-generation client that still signs is a migration hybrid.
-		// Take the signature; if it is wrong, fall through to the bare token
-		// rather than treating it as a protocol error.
-		if cred, ok := st.authorizeByMAC(r, expected, mac); ok {
-			return cred, true
+	// The derived names depend on which configured key the client signed under,
+	// so each key is tried in turn; the first that verifies wins and fixes the
+	// namer for every header on this request and its response.
+	for _, key := range splitTokens(expected) {
+		if key == "" {
+			continue
+		}
+		namer := deriveHeaderNamer(key, sessionID)
+		if !requiresMAC(r, namer) {
+			// No signed generation announced under this namer, or an X-Ver that
+			// does not parse. There is no bare-token fallback in strict mode.
+			continue
+		}
+		if cred, ok := st.authorizeByMAC(r, key, r.Header.Get(namer.name(slotAuthMAC)), namer); ok {
+			return namer, cred, true
 		}
 	}
-	if st.authorizeByToken(r, expected) {
-		return requestCred{}, true
-	}
-	return requestCred{}, false
+	return defaultNamer, requestCred{}, false
 }
 
 // requiresMAC reports whether a request announced the signed protocol
-// generation. A request that sends no X-XHTTP-Proto at all is a pre-v2 client
-// and is not held to it, which is what keeps the dual-mode window open.
-func requiresMAC(r *http.Request) bool {
-	v, err := strconv.Atoi(r.Header.Get(ProtoHeader))
+// generation. A request that sends no X-Ver at all is a pre-v2 client and is
+// not held to it, which is what keeps the dual-mode window open.
+func requiresMAC(r *http.Request, namer headerNamer) bool {
+	v, err := strconv.Atoi(r.Header.Get(namer.name(slotProto)))
 	return err == nil && v >= authProtoVersion
 }
 
-func (st *serverState) authorizeByMAC(r *http.Request, expected, mac string) (requestCred, bool) {
-	nonce := r.Header.Get(AuthNonceHeader)
+func (st *serverState) authorizeByMAC(r *http.Request, expected, mac string, namer headerNamer) (requestCred, bool) {
+	nonce := r.Header.Get(namer.name(slotAuthNonce))
 	if !validAuthNonce(nonce) {
 		return requestCred{}, false
 	}
 	// Everything the signature covers is read from the headers, not from local
 	// state, so the value verified here is exactly the value the dispatcher
 	// uses — the counters included, in the masked form they travel.
-	proto, _ := strconv.Atoi(r.Header.Get(ProtoHeader))
+	proto, _ := strconv.Atoi(r.Header.Get(namer.name(slotProto)))
 	var msg []byte
 	if proto >= bodyProtoVersion {
 		msg = v3Message(nonce, requestAuth{
-			sessionID: r.Header.Get("X-Session-ID"),
-			network:   r.Header.Get("X-Network"),
-			target:    r.Header.Get("X-Target"),
+			sessionID: namer.sessionIDFromRequest(r),
+			network:   r.Header.Get(namer.name(slotNetwork)),
+			target:    r.Header.Get(namer.name(slotTarget)),
 			method:    r.Method,
 			proto:     proto,
 			// The kind is not read from a header of its own: it is the
@@ -382,13 +426,13 @@ func (st *serverState) authorizeByMAC(r *http.Request, expected, mac string) (re
 			// ends draw different conclusions, and the signature is what
 			// catches it.
 			bodyKind: bodyKindFor(r),
-		}, countersFrom(r))
+		}, countersFrom(r, namer))
 	} else {
 		// The session id, network and target are bound into the signature so a
 		// valid request cannot be replayed against a different session, aimed
 		// at a different address, or switched to a different transport
 		// protocol.
-		msg = authMessage(nonce, r.Header.Get("X-Session-ID"), r.Header.Get("X-Network"), r.Header.Get("X-Target"))
+		msg = authMessage(nonce, namer.sessionIDFromRequest(r), r.Header.Get(namer.name(slotNetwork)), r.Header.Get(namer.name(slotTarget)))
 	}
 	for _, tok := range splitTokens(expected) {
 		if tok == "" {
@@ -413,11 +457,11 @@ func (st *serverState) authorizeByMAC(r *http.Request, expected, mac string) (re
 
 // countersFrom reads the three sequence fields exactly as they arrived, which
 // is the form they are signed and verified in.
-func countersFrom(r *http.Request) counters {
+func countersFrom(r *http.Request, namer headerNamer) counters {
 	return counters{
-		seq: r.Header.Get("X-Seq"),
-		ack: r.Header.Get("X-Ack"),
-		pad: r.Header.Get(PadHeader),
+		seq: r.Header.Get(namer.name(slotSeq)),
+		ack: r.Header.Get(namer.name(slotAck)),
+		pad: r.Header.Get(namer.name(slotPad)),
 	}
 }
 
@@ -432,28 +476,6 @@ func bodyKindFor(r *http.Request) string {
 		return bodyKindStream
 	}
 	return bodyKindPoll
-}
-
-func (st *serverState) authorizeByToken(r *http.Request, expected string) bool {
-	authHeader := r.Header.Get("Proxy-Authorization")
-	if authHeader == "" {
-		authHeader = r.Header.Get("Authorization")
-	}
-	customTokenHeader := r.Header.Get("X-Auth-Token")
-	for _, tok := range splitTokens(expected) {
-		if tok == "" {
-			continue
-		}
-		// Compared in constant time: a plain == short-circuits on the first
-		// differing byte, which hands an attacker a byte-at-a-time oracle on
-		// the shared secret.
-		if constTimeEqual(authHeader, "Bearer "+tok) ||
-			constTimeEqual(authHeader, tok) ||
-			constTimeEqual(customTokenHeader, tok) {
-			return true
-		}
-	}
-	return false
 }
 
 // splitTokens splits a configured PSK list on commas and trims each element.
@@ -481,7 +503,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			fallbackProxy.Director = func(req *http.Request) {
 				originalDirector(req)
 				req.Host = u.Host
-				scrubTunnelRequest(req)
+				scrubTunnelRequest(req, token)
 			}
 			logger.Info("🛡️ fallback camouflage site enabled", zap.String("target", fallbackURL))
 		} else {
@@ -503,14 +525,14 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		clientIP := st.getClientIP(r)
 		// Per-request hot path: level-check first so the Field slice and the
-		// redaction are skipped when debug logging is off.
+		// redaction are skipped when debug logging is off. The session id is
+		// read only for the tunnel path, below — the fallback branch does not
+		// need it and must not touch the listener.
 		if ce := logger.Check(zap.DebugLevel, "👀 [HTTP] received raw HTTP request"); ce != nil {
 			ce.Write(
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
 				zap.String("remote", clientIP),
-				zap.String("session", r.Header.Get("X-Session-ID")),
-				zap.String("auth", describeAuth(r)),
 			)
 		}
 		if r.URL.Path != path {
@@ -535,9 +557,51 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		}
 		xl.RequestCount.Add(1)
 		st.stats.requests.Add(1)
-		// Advertise this server's protocol generation and, when configured,
-		// refuse clients that announced an older one than the operator allows.
-		w.Header().Set(ProtoHeader, strconv.Itoa(tunnelProtoVersion))
+
+		// The session id is read before any protocol header: in derived mode it
+		// rides the URL salt, because the server cannot read a header whose name
+		// it has not derived yet — the chicken-and-egg the salt exists to break.
+		sessionID := sessionIDFromRequest(r, token)
+
+		// Advertise the generation and the long-poll window under the default
+		// names first, so a refusal before authentication (missing session id,
+		// bad password) still carries a parseable answer. A successful
+		// authentication replaces them with the names the request was actually
+		// written under, so no constant-name header survives on a derived
+		// response.
+		w.Header().Set(defaultNamer.name(slotProto), strconv.Itoa(tunnelProtoVersion))
+		w.Header().Set(defaultNamer.name(slotPollTimeout), strconv.Itoa(int(st.longPollTimeout.Seconds())))
+
+		if sessionID == "" {
+			logger.Warn("❌ [HTTP] rejected request: missing Session ID", zap.String("remote", clientIP))
+			nginxError(w, http.StatusBadRequest)
+			return
+		}
+		// The credential a request arrived with is what decides how much of it
+		// can be trusted: a v3 request signed its counters and its body, and the
+		// handlers below read them through this. Authentication also settles the
+		// header namer — the key whose derived names the request was written
+		// under — which every later read on this request and write on its
+		// response goes through.
+		namer, cred, ok := st.authorize(r, token, sessionID)
+		if !ok {
+			logger.Warn("❌ [HTTP] rejected request: bad password or unauthorized",
+				zap.String("remote", r.RemoteAddr),
+				zap.Bool("signed", r.Header.Get(defaultNamer.name(slotAuthMAC)) != ""),
+			)
+			st.events.emit(AuthRejected{Remote: r.RemoteAddr, Path: r.URL.Path})
+			nginxError(w, http.StatusProxyAuthRequired)
+			return
+		}
+		// The request authenticated; its namer is the one to answer under. Drop
+		// the provisional default-name headers so a derived response does not
+		// carry a constant-name duplicate next to the derived one.
+		w.Header().Del(defaultNamer.name(slotProto))
+		w.Header().Del(defaultNamer.name(slotPollTimeout))
+		w.Header().Set(namer.name(slotProto), strconv.Itoa(tunnelProtoVersion))
+		if ce := logger.Check(zap.DebugLevel, "🔑 [HTTP] authenticated"); ce != nil {
+			ce.Write(zap.String("auth", describeAuth(r, namer)))
+		}
 		// How long this server parks an idle poll. The client needs this to
 		// know how long a healthy request may take: without it the client
 		// can only pick a request timeout for itself, and any value large
@@ -546,22 +610,22 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// server's own bound lets it fail fast on a dead path instead of
 		// waiting out a timeout it chose for a different reason.
 		//
-		// It goes on every response, including the refusals below: a client
-		// that is being turned away is exactly the one that will dial again,
-		// and it should not have to learn the window from a successful
-		// session first.
-		w.Header().Set(PollTimeoutHeader, strconv.Itoa(int(st.longPollTimeout.Seconds())))
+		// It goes on every authenticated response, including the refusals
+		// below: a client that is being turned away is exactly the one that
+		// will dial again, and it should not have to learn the window from a
+		// successful session first.
+		w.Header().Set(namer.name(slotPollTimeout), strconv.Itoa(int(st.longPollTimeout.Seconds())))
 		if st.minProto > 0 {
-			if v, err := strconv.Atoi(r.Header.Get(ProtoHeader)); err != nil || v < st.minProto {
+			if v, err := strconv.Atoi(r.Header.Get(namer.name(slotProto))); err != nil || v < st.minProto {
 				logger.Warn("❌ [HTTP] rejected request: protocol version too old",
 					zap.String("remote", clientIP),
-					zap.String("client_proto", r.Header.Get(ProtoHeader)))
+					zap.String("client_proto", r.Header.Get(namer.name(slotProto))))
 				http.Error(w, "upgrade required", http.StatusUpgradeRequired)
 				return
 			}
 		}
 
-		target := r.Header.Get("X-Target")
+		target := r.Header.Get(namer.name(slotTarget))
 		// A "tcp://" prefix is resolved away before both the allowlist check
 		// and the dial. Left in place the dialer would receive
 		// "tcp://host:port" and fail with "too many colons". The strip also
@@ -570,30 +634,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// scheme, so gen-config refuses the prefix as decoration.
 		_, authority := splitTargetScheme(target)
 		target = authority
-		network := r.Header.Get("X-Network")
-		sessionID := r.Header.Get("X-Session-ID")
-
-		if sessionID == "" {
-			logger.Warn("❌ [HTTP] rejected request: missing Session ID", zap.String("remote", clientIP))
-			nginxError(w, http.StatusBadRequest)
-			return
-		}
-		var cred requestCred
-		if xl.expectedToken != "" {
-			// The credential a request arrived with is what decides how much of
-			// it can be trusted: a v3 request signed its counters and its body,
-			// and the handlers below read them through this.
-			var ok bool
-			if cred, ok = st.authorize(r, xl.expectedToken); !ok {
-				logger.Warn("❌ [HTTP] rejected request: bad password or unauthorized",
-					zap.String("remote", r.RemoteAddr),
-					zap.Bool("signed", r.Header.Get(AuthMACHeader) != ""),
-				)
-				st.events.emit(AuthRejected{Remote: r.RemoteAddr, Path: r.URL.Path})
-				nginxError(w, http.StatusProxyAuthRequired)
-				return
-			}
-		}
+		network := r.Header.Get(namer.name(slotNetwork))
 
 		if target == TargetBwExchange {
 			if !st.brutalCfg.BWExchange {
@@ -609,7 +650,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			// allowlist is a policy for addresses, not protocol requests. It
 			// registers no session, so it does not consume MaxSessions or the
 			// per-IP budget.
-			st.handleBwExchange(w, r, clientIP)
+			st.handleBwExchange(w, r, clientIP, namer)
 			return
 		}
 
@@ -620,7 +661,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// branch shares the same helper. A created session starts both
 		// sequence spaces at zero; reconnecting clients detect that via the
 		// hello frame and reset their own bookkeeping.
-		vConn, created, status := st.attachOrCreateSession(xl, sessionID, target, network, r.Host, r.RemoteAddr, logger)
+		vConn, created, status := st.attachOrCreateSession(xl, sessionID, target, network, r.Host, r.RemoteAddr, namer, logger)
 		if status != 0 {
 			nginxError(w, status)
 			return
@@ -634,7 +675,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// outlive a reconnect, and a peer that stops advertising the capability
 		// has to put the frame layer back in charge — otherwise a downgraded
 		// client would receive frames nobody pads.
-		vConn.padInTransport.Store(hasCapValue(r.Header.Get(CapsHeader), CapPadBody))
+		vConn.padInTransport.Store(hasCapValue(r.Header.Get(namer.name(slotCaps)), CapPadBody))
 
 		// Stream-mode downlink: one persistent request whose response body is
 		// a continuous frame stream (SSE-style — the one full-duplex-ish shape
@@ -645,7 +686,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// A streaming request that arrives without the header — a hop did not
 		// understand it — degrades into an ordinary idle poll, and the client
 		// falls back on its own.
-		if r.Header.Get("X-Downstream") == "1" {
+		if r.Header.Get(namer.name(slotDownstream)) == "1" {
 			serveStreamDownlink(w, r, st, vConn, sessionID, created, cred)
 			return
 		}
@@ -680,7 +721,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// verified in auth and their meaning recovered here — and a request
 		// that was not signed carries them in the clear, which decodeCounters
 		// handles by leaving them alone.
-		wire := countersFrom(r)
+		wire := countersFrom(r, namer)
 		cSeq, cAck, upPad, err := decodeCounters(cred.mask, wire)
 		if err != nil {
 			logger.Warn("❌ [HTTP] rejected request: unreadable sequence fields", zap.Error(err))
@@ -716,7 +757,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// directions ride on the one capability: padding a body for a peer
 		// that is not looking for it would land in its receive ring as
 		// payload.
-		clientPadsBody := hasCapValue(r.Header.Get(CapsHeader), CapPadBody)
+		clientPadsBody := hasCapValue(r.Header.Get(namer.name(slotCaps)), CapPadBody)
 
 		bufPtr := sendBuf.Get().(*[]byte)
 		readChunk := *bufPtr
@@ -748,7 +789,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 				return
 			}
 			digest := sha256.Sum256(readChunk[:n])
-			if !bodyMACMatches(cred.key, cred.nonce, &digest, r.Header.Get(AuthBodyMACHeader)) {
+			if !bodyMACMatches(cred.key, cred.nonce, &digest, r.Header.Get(namer.name(slotAuthBodyMAC))) {
 				safelyPutSendBuf(bufPtr)
 				// The pad is part of the signed bytes, so a mismatch is not a
 				// client bug: something between the two ends changed them.
@@ -841,7 +882,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			vConn.downWindowMu.Lock()
 			defer vConn.downWindowMu.Unlock()
 
-			if vConn.downDispatchSeq < cAck || r.Header.Get("X-Retry") == "1" {
+			if vConn.downDispatchSeq < cAck || r.Header.Get(namer.name(slotRetry)) == "1" {
 				vConn.downDispatchSeq = cAck
 			}
 
@@ -958,16 +999,18 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			rm := maskFor(respMaskDomain, cred.key, cred.nonce)
 			respWire = responseCounters(myDownSeq, myUpAck, respPad, rm)
 			digest := sha256.Sum256(downData)
-			w.Header().Set(AuthRespMACHeader, respMAC(cred.key, cred.nonce, respWire, &digest))
+			w.Header().Set(namer.name(slotAuthRespMAC), respMAC(cred.key, cred.nonce, respWire, &digest))
 		}
-		w.Header().Set("X-Ack", respWire.ack)
-		w.Header().Set("X-Seq", respWire.seq)
-		w.Header().Set(PadHeader, respWire.pad)
+		w.Header().Set(namer.name(slotAck), respWire.ack)
+		w.Header().Set(namer.name(slotSeq), respWire.seq)
+		w.Header().Set(namer.name(slotPad), respWire.pad)
 		w.Header().Set("Content-Length", strconv.Itoa(len(downData)))
 		if caps != "" {
-			w.Header().Set(CapsHeader, caps)
+			w.Header().Set(namer.name(slotCaps), caps)
 		}
-		w.Header().Set("Access-Control-Expose-Headers", "X-Seq, X-Ack, X-Session-ID, X-Pad, X-HTTP-Tunnel-Caps, X-HTTP-Tunnel-Resp-MAC, X-HTTP-Tunnel-Poll-Timeout, Content-Length")
+		w.Header().Set("Access-Control-Expose-Headers", namer.exposeList(
+			[]headerSlot{slotSeq, slotAck, slotSessionID, slotPad, slotCaps, slotAuthRespMAC, slotPollTimeout},
+			"Content-Length"))
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Server", "nginx")
 		w.WriteHeader(http.StatusOK)
@@ -991,14 +1034,14 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 // than a poll, so it does not draw on the session budget. It is still
 // authenticated, and on the client side it is bounded by bw_interval, so the
 // exchange cannot be used to probe the server at high rate.
-func (st *serverState) handleBwExchange(w http.ResponseWriter, r *http.Request, clientIP string) {
+func (st *serverState) handleBwExchange(w http.ResponseWriter, r *http.Request, clientIP string, namer headerNamer) {
 	logger := st.lg()
 	cfg := st.brutalCfg
 	groupID := cfg.GroupID
 	if cfg.GroupFromRemote {
 		groupID = groupIDFromRemote(r.RemoteAddr)
 	}
-	if raw := r.Header.Get(BwHeader); raw != "" {
+	if raw := r.Header.Get(namer.name(slotBw)); raw != "" {
 		v, ok := parseBwValue(raw)
 		if ok {
 			// The configured rate stays a ceiling, so a client can only lower
@@ -1015,14 +1058,14 @@ func (st *serverState) handleBwExchange(w http.ResponseWriter, r *http.Request, 
 	if ce := logger.Check(zap.DebugLevel, "📶 [BW] served a bandwidth exchange"); ce != nil {
 		ce.Write(
 			zap.String("remote", clientIP),
-			zap.String("advertised", r.Header.Get(BwHeader)),
+			zap.String("advertised", r.Header.Get(namer.name(slotBw))),
 			zap.Uint64("group_id", groupID),
 			zap.Uint64("rate", st.groupRate(groupID, cfg.Rate)),
 		)
 	}
-	w.Header().Set(CapsHeader, CapBrutalBw)
+	w.Header().Set(namer.name(slotCaps), CapBrutalBw)
 	if cfg.BWAdvertise > 0 {
-		w.Header().Set(BwHeader, strconv.FormatUint(cfg.BWAdvertise, 10))
+		w.Header().Set(namer.name(slotBw), strconv.FormatUint(cfg.BWAdvertise, 10))
 	}
 	// One tiny request per bw_interval; there is no reason to keep the socket
 	// warm for it.
@@ -1306,7 +1349,7 @@ type ServerConfig struct {
 	// peer address; enable TrustProxyHeaders only behind a CDN that strips the
 	// forwarding headers, or the limit is trivially bypassed by spoofing them.
 	MaxSessionsPerIP int
-	// MinProtoVersion rejects requests advertising an X-XHTTP-Proto below this
+	// MinProtoVersion rejects requests advertising an X-Ver below this
 	// value with HTTP 426, letting an operator force a fleet off an old wire
 	// generation. 0 (default) accepts every client, including legacy ones that
 	// send no header.
@@ -1397,6 +1440,12 @@ type Server struct {
 func NewServer(cfg ServerConfig) (*Server, error) {
 	if err := ValidateBufferLimits(cfg.WindowSizeMB, cfg.BufferBudgetMB); err != nil {
 		return nil, err
+	}
+	// No open mode: the tunnel must be authenticated, and the header names are
+	// derived from the PSK, so an empty one would leave nothing to derive from
+	// and nothing to authenticate against.
+	if cfg.PSK == "" {
+		return nil, fmt.Errorf("tunnel: a PSK is required (open/unauthenticated mode is not allowed)")
 	}
 	window, _ := windowBytes(cfg.WindowSizeMB)
 	if cfg.Path == "" {

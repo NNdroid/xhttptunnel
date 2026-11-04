@@ -302,7 +302,7 @@ func TestPerInstanceLoggers(t *testing.T) {
 // client abandons it and falls back to the poll mode — data still flows in both
 // directions.
 //
-// The origin is fronted by a proxy that drops X-Downstream because the in-process
+// The origin is fronted by a proxy that drops X-Mode because the in-process
 // listener (ListenXHTTP) implements the streaming branch too, so pointing the
 // client straight at it exercises stream mode and would make this test vacuous.
 // Dropping the capability header is exactly what a CDN that does not forward
@@ -325,14 +325,14 @@ func TestStreamClientFallsBackOnPollOnlyOrigin(t *testing.T) {
 	serveAcceptedTCPEcho(t, ctx, origin)
 
 	originURL, _ := url.Parse("http://" + origin.Addr().String())
-	front, _ := stripDownstreamProxy(t, originURL)
+	front, _ := stripDownstreamProxy(t, originURL, "legacy-secret")
 	serverURL, _ := url.Parse(front.URL + "/stream")
 
 	conn, err := DialXHTTP(ctx, serverURL, &DialConfig{
 		Password: "legacy-secret",
 		Path:     "/stream",
 		ALPN:     "h1",
-		// ""/"auto": the client probes, sees no X-Downstream-Accepted, and
+		// ""/"auto": the client probes, sees no X-Mode-Accepted, and
 		// must fall back to polling without losing data.
 	}, echoAddr, "tcp")
 	if err != nil {
@@ -362,7 +362,7 @@ func TestStreamClientFallsBackOnPollOnlyOrigin(t *testing.T) {
 
 // TestStreamResumeAfterDownlinkBreak kills the streaming downlink mid-session
 // (server-side conn teardown of the response) and verifies the client
-// reconnects with its X-Ack and the byte stream continues without loss or
+// reconnects with its X-Cursor and the byte stream continues without loss or
 // duplication.
 func TestStreamSessionRecreationFailsOldConnection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

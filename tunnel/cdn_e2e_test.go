@@ -39,7 +39,7 @@ func TestXHTTPTunnel_E2E_ThroughCDN(t *testing.T) {
 
 	// The fake CDN injects two long-poll timeouts and then rejects an upload.
 	// 524 is Cloudflare's non-standard timeout status. The rejected POST must
-	// be rewound to the server ACK and replayed with X-Retry, or the payload
+	// be rewound to the server ACK and replayed with X-Retries, or the payload
 	// would be silently skipped.
 	cdn := newCDNTestServer(t, "http://"+origin.Addr().String(), []cdnFault{
 		{phase: cdnPhasePoll, status: http.StatusGatewayTimeout},
@@ -231,8 +231,10 @@ type cdnTestServer struct {
 	seenRequestMethod  []string
 	seenRequestLength  []int64
 	seenRequestInfo    []string
+	seenRequestNamers  []headerNamer
 	seenResponseHeader []http.Header
 	seenResponseInfo   []string
+	seenResponseNamers []headerNamer
 	delay              time.Duration
 	jitter             time.Duration // max random variance added to delay (0 = none)
 	lossRate           float64       // probability of returning 504 per request (0 = none)
@@ -298,9 +300,11 @@ func newCDNTestServer(t testing.TB, origin string, faults []cdnFault, delays ...
 		req.Host = originURL.Host
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		namer := cdn.namerFor(resp.Request)
 		cdn.mu.Lock()
 		cdn.seenResponseHeader = append(cdn.seenResponseHeader, resp.Header.Clone())
-		cdn.seenResponseInfo = append(cdn.seenResponseInfo, fmt.Sprintf("%d seq=%s ack=%s len=%s", resp.StatusCode, resp.Header.Get("X-Seq"), resp.Header.Get("X-Ack"), resp.Header.Get("Content-Length")))
+		cdn.seenResponseNamers = append(cdn.seenResponseNamers, namer)
+		cdn.seenResponseInfo = append(cdn.seenResponseInfo, fmt.Sprintf("%d seq=%s ack=%s len=%s", resp.StatusCode, resp.Header.Get(namer.name(slotSeq)), resp.Header.Get(namer.name(slotAck)), resp.Header.Get("Content-Length")))
 		cdn.mu.Unlock()
 		return nil
 	}
@@ -317,13 +321,20 @@ func (c *cdnTestServer) setPhase(phase string) {
 	c.mu.Unlock()
 }
 
+// namerFor derives the header namer a CDN-arriving request was written under,
+// from its URL salt and the fixture's key. A PSK client writes derived names,
+// so the fixture has to know them to read the counters.
+func (c *cdnTestServer) namerFor(r *http.Request) headerNamer {
+	return deriveHeaderNamer(c.psk, r.URL.Query().Get(saltParam))
+}
+
 // plainUplinkSeq recovers the uplink position this request reports, in the
 // clear. The wire form is masked with a per-request keystream, so a request
 // that carries the same bytes as the one before it does not look like it:
 // that is what takes the sequence numbers out of the observer's hands, and
 // it is why this fixture has to hold the key to see them.
-func (c *cdnTestServer) plainUplinkSeq(h http.Header) uint64 {
-	nonce, wire := h.Get(AuthNonceHeader), h.Get("X-Seq")
+func (c *cdnTestServer) plainUplinkSeq(namer headerNamer, h http.Header) uint64 {
+	nonce, wire := h.Get(namer.name(slotAuthNonce)), h.Get(namer.name(slotSeq))
 	if nonce == "" || wire == "" || c.psk == "" {
 		return 0
 	}
@@ -335,13 +346,15 @@ func (c *cdnTestServer) plainUplinkSeq(h http.Header) uint64 {
 }
 
 func (c *cdnTestServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	namer := c.namerFor(r)
 	c.mu.Lock()
 	c.seenRequestHeaders = append(c.seenRequestHeaders, r.Header.Clone())
+	c.seenRequestNamers = append(c.seenRequestNamers, namer)
 	c.seenRequestHost = append(c.seenRequestHost, r.Host)
 	c.seenRequestMethod = append(c.seenRequestMethod, r.Method)
 	c.seenRequestLength = append(c.seenRequestLength, r.ContentLength)
-	c.seenRequestInfo = append(c.seenRequestInfo, fmt.Sprintf("%s seq=%s ack=%s len=%d", r.Method, r.Header.Get("X-Seq"), r.Header.Get("X-Ack"), r.ContentLength))
-	seq := c.plainUplinkSeq(r.Header)
+	c.seenRequestInfo = append(c.seenRequestInfo, fmt.Sprintf("%s seq=%s ack=%s len=%d", r.Method, r.Header.Get(namer.name(slotSeq)), r.Header.Get(namer.name(slotAck)), r.ContentLength))
+	seq := c.plainUplinkSeq(namer, r.Header)
 	c.seenRequestSeq = append(c.seenRequestSeq, seq)
 	// An upload is a request that reports further along the stream than the
 	// one before it. An idle poll sits still. That is the only difference
@@ -475,7 +488,11 @@ func (c *cdnTestServer) assert(t *testing.T) {
 	}
 
 	var sawNoStore, sawPragma, sawIdentity, sawEndToEndAuth bool
-	for _, h := range c.seenRequestHeaders {
+	for i, h := range c.seenRequestHeaders {
+		var namer headerNamer
+		if i < len(c.seenRequestNamers) {
+			namer = c.seenRequestNamers[i]
+		}
 		cacheControl := h.Get("Cache-Control")
 		if strings.Contains(cacheControl, "no-store") && strings.Contains(cacheControl, "no-cache") {
 			sawNoStore = true
@@ -491,8 +508,8 @@ func (c *cdnTestServer) assert(t *testing.T) {
 		// evidence in two end-to-end headers instead. Both are required: a MAC
 		// without a nonce is unverifiable, and a nonce without a MAC is not a
 		// credential at all.
-		nonce := h.Get(AuthNonceHeader)
-		mac := h.Get(AuthMACHeader)
+		nonce := h.Get(namer.name(slotAuthNonce))
+		mac := h.Get(namer.name(slotAuthMAC))
 		if validAuthNonce(nonce) && validHex(mac, sha256.Size) {
 			sawEndToEndAuth = true
 		}
@@ -521,7 +538,11 @@ func (c *cdnTestServer) assert(t *testing.T) {
 		t.Fatal("CDN never received an origin response")
 	}
 	var sawOriginNoStore, sawAccelOff, sawSequenceHeaders bool
-	for _, h := range c.seenResponseHeader {
+	for i, h := range c.seenResponseHeader {
+		var namer headerNamer
+		if i < len(c.seenResponseNamers) {
+			namer = c.seenResponseNamers[i]
+		}
 		cacheControl := h.Get("Cache-Control")
 		if strings.Contains(cacheControl, "no-store") && strings.Contains(cacheControl, "no-transform") {
 			sawOriginNoStore = true
@@ -529,7 +550,7 @@ func (c *cdnTestServer) assert(t *testing.T) {
 		if h.Get("X-Accel-Buffering") == "no" {
 			sawAccelOff = true
 		}
-		if h.Get("X-Seq") != "" && h.Get("X-Ack") != "" {
+		if h.Get(namer.name(slotSeq)) != "" && h.Get(namer.name(slotAck)) != "" {
 			sawSequenceHeaders = true
 		}
 	}

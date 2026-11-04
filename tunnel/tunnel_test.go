@@ -39,7 +39,7 @@ func TestSetChunkSizeKBClamping(t *testing.T) {
 func TestNewClientDefaults(t *testing.T) {
 	// Zero-value tunables must map onto the documented defaults, and SNI/Host
 	// must derive from the server URL when not overridden.
-	c, err := NewClient(ClientConfig{ServerURL: "https://cdn.example.test:8443/stream"})
+	c, err := NewClient(ClientConfig{ServerURL: "https://cdn.example.test:8443/stream", PSK: "defaults-test-psk"})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -65,6 +65,7 @@ func TestNewClientDefaults(t *testing.T) {
 	// Explicit overrides win over the derived values.
 	c2, err := NewClient(ClientConfig{
 		ServerURL:   "https://cdn.example.test/stream",
+		PSK:         "defaults-test-psk",
 		SNI:         "sni.example.test",
 		Host:        "host.example.test",
 		ALPN:        "h2",
@@ -90,11 +91,11 @@ func TestNewClientDefaults(t *testing.T) {
 
 func TestClientChunkSizeIsPerClient(t *testing.T) {
 	SetChunkSizeKB(256)
-	c1, err := NewClient(ClientConfig{ServerURL: "https://one.example/stream", ChunkSizeKB: 128})
+	c1, err := NewClient(ClientConfig{ServerURL: "https://one.example/stream", PSK: "chunk-test-psk", ChunkSizeKB: 128})
 	if err != nil {
 		t.Fatal(err)
 	}
-	c2, err := NewClient(ClientConfig{ServerURL: "https://two.example/stream", ChunkSizeKB: 512})
+	c2, err := NewClient(ClientConfig{ServerURL: "https://two.example/stream", PSK: "chunk-test-psk", ChunkSizeKB: 512})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +113,7 @@ func TestNewClientPropagatesInjectedDialer(t *testing.T) {
 	}
 	c, err := NewClient(ClientConfig{
 		ServerURL:   "https://cdn.example.test/stream",
+		PSK:         "dialer-test-psk",
 		DialContext: dialer,
 	})
 	if err != nil {
@@ -126,24 +128,26 @@ func TestNewClientPropagatesInjectedDialer(t *testing.T) {
 }
 
 func TestNewClientValidation(t *testing.T) {
-	if _, err := NewClient(ClientConfig{}); err == nil {
-		t.Error("empty ServerURL must be rejected")
+	// Strict mode: no PSK, no client. The PSK is what the header names are
+	// derived from, so it is checked before anything else can matter.
+	if _, err := NewClient(ClientConfig{}); err == nil || !strings.Contains(err.Error(), "PSK is required") {
+		t.Errorf("a config without a PSK must be rejected, got err=%v", err)
 	}
-	if _, err := NewClient(ClientConfig{ServerURL: "ftp://example.com/stream"}); err == nil {
+	if _, err := NewClient(ClientConfig{PSK: "validation-test-psk", ServerURL: "ftp://example.com/stream"}); err == nil {
 		t.Error("non-HTTP scheme must be rejected")
 	}
 	// An invalid StreamMode must fail loudly, not silently disable (or force)
 	// the streaming downlink.
-	if _, err := NewClient(ClientConfig{ServerURL: "http://127.0.0.1:1/stream", StreamMode: "strem"}); err == nil || !strings.Contains(err.Error(), "invalid StreamMode") {
+	if _, err := NewClient(ClientConfig{PSK: "validation-test-psk", ServerURL: "http://127.0.0.1:1/stream", StreamMode: "strem"}); err == nil || !strings.Contains(err.Error(), "invalid StreamMode") {
 		t.Fatalf("invalid StreamMode must be rejected, got err=%v", err)
 	}
 	for _, ok := range []string{"", "auto", "poll", "stream", "POLL"} {
-		if _, err := NewClient(ClientConfig{ServerURL: "http://127.0.0.1:1/stream", StreamMode: ok}); err != nil {
+		if _, err := NewClient(ClientConfig{PSK: "validation-test-psk", ServerURL: "http://127.0.0.1:1/stream", StreamMode: ok}); err != nil {
 			t.Errorf("StreamMode %q must be accepted: %v", ok, err)
 		}
 	}
 	// StreamMode must reach the dial config used by DialContext.
-	c, err := NewClient(ClientConfig{ServerURL: "http://127.0.0.1:1/stream", StreamMode: "poll"})
+	c, err := NewClient(ClientConfig{PSK: "validation-test-psk", ServerURL: "http://127.0.0.1:1/stream", StreamMode: "poll"})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -151,7 +155,7 @@ func TestNewClientValidation(t *testing.T) {
 		t.Fatalf("StreamMode not wired to dial config: %q", c.dialCfg.StreamMode)
 	}
 
-	c, err = NewClient(ClientConfig{ServerURL: "http://127.0.0.1:1/stream"})
+	c, err = NewClient(ClientConfig{PSK: "validation-test-psk", ServerURL: "http://127.0.0.1:1/stream"})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

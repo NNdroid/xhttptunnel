@@ -82,18 +82,19 @@ func newBodyRecorder(t *testing.T, originURL *url.URL) *bodyRecorder {
 			return
 		}
 		r.Body.Close()
-		reqNonce := r.Header.Get(AuthNonceHeader)
+		reqNamer := rec.namer(r)
+		reqNonce := r.Header.Get(reqNamer.name(slotAuthNonce))
 		if len(sent) > 0 {
 			// The pad's length travels masked, so it is read the way its
 			// owner reads it and not the way an observer would: the recorder
 			// holds the key, which is the only thing that makes the header
 			// say anything at all.
-			pad := unmaskPadLen(rec.psk, r.Header.Get(AuthNonceHeader), reqMaskDomain, r.Header.Get(PadHeader))
+			pad := unmaskPadLen(rec.psk, reqNonce, reqMaskDomain, r.Header.Get(reqNamer.name(slotPad)))
 			rec.record(recordedBody{method: r.Method, body: sent, pad: pad})
 		}
 
 		if rec.stripRequestCaps.Load() {
-			r.Header.Del(CapsHeader)
+			r.Header.Del(reqNamer.name(slotCaps))
 		}
 
 		r.RequestURI = ""
@@ -124,14 +125,14 @@ func newBodyRecorder(t *testing.T, originURL *url.URL) *bodyRecorder {
 			return
 		}
 		if len(got) > 0 {
-			respPad := unmaskPadLen(rec.psk, reqNonce, respMaskDomain, resp.Header.Get(PadHeader))
+			respPad := unmaskPadLen(rec.psk, reqNonce, respMaskDomain, resp.Header.Get(reqNamer.name(slotPad)))
 			rec.record(recordedBody{status: resp.StatusCode, body: got, pad: respPad, isReply: true})
 		}
 		for k, vv := range resp.Header {
 			switch http.CanonicalHeaderKey(k) {
 			case "Content-Length":
 				continue
-			case http.CanonicalHeaderKey(CapsHeader):
+			case http.CanonicalHeaderKey(reqNamer.name(slotCaps)):
 				if rec.stripCaps.Load() {
 					continue
 				}
@@ -152,6 +153,13 @@ func (r *bodyRecorder) record(b recordedBody) {
 	r.mu.Lock()
 	r.bodies = append(r.bodies, b)
 	r.mu.Unlock()
+}
+
+// namer derives the header namer a request was written under, from the URL
+// salt and the recorder's key. A constants request (no salt) resolves to the
+// default names, so the recorder reads whatever mode the client used.
+func (r *bodyRecorder) namer(req *http.Request) headerNamer {
+	return deriveHeaderNamer(r.psk, req.URL.Query().Get(saltParam))
 }
 
 // mark returns a position in the recorded stream, so a test can ask what
@@ -197,8 +205,8 @@ func (r *bodyRecorder) snapshot() (sent, replies []recordedBody) {
 // Once the client has seen the server echo CapPadBody, padding moves out of the
 // frame and onto the body: the frames in the ring go out bare (six-byte headers,
 // so the send window carries payload instead of padding) and the body grows a
-// leading pad announced by X-Pad, whose total still lands inside the band. The
-// assertion that matters is that the two never stack — a body with an X-Pad must
+// leading pad announced by X-Offset, whose total still lands inside the band. The
+// assertion that matters is that the two never stack — a body with an X-Offset must
 // contain only unpadded frames.
 func TestPollBodiesArePaddedOnTheWire(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -297,20 +305,20 @@ func TestPollBodiesArePaddedOnTheWire(t *testing.T) {
 		check("poll response", b)
 	}
 	if !sawBodyPad {
-		t.Fatal("no body carried X-Pad: the capability never took effect, so padding stayed in the frame layer and every body is a frame taller than the band")
+		t.Fatal("no body carried X-Offset: the capability never took effect, so padding stayed in the frame layer and every body is a frame taller than the band")
 	}
 }
 
 // TestPollPaddingFollowsThePeerRatherThanLatching pins the lifetime of the
 // capability. Padding a request body is only safe while the peer that will read
-// it honours X-Pad, and a session outlives any one response: a fleet mid-upgrade
+// it honours X-Offset, and a session outlives any one response: a fleet mid-upgrade
 // mixes builds, so an echo from one node says nothing about the next. Latching
 // on the first echo would keep prefixing bodies after the peer stopped
 // advertising, and those bytes land in the origin's reassembly as payload —
 // silent corruption, not a shape change.
 //
 // The proxy here drops the capability from responses while leaving the bodies
-// and their X-Pad alone. The client has to notice and go back to padding in the
+// and their X-Offset alone. The client has to notice and go back to padding in the
 // frame, which every peer can read.
 func TestPollPaddingFollowsThePeerRatherThanLatching(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -449,8 +457,8 @@ func TestPollPaddingFollowsThePeerRatherThanLatching(t *testing.T) {
 // The proxy here drops the header from requests only. The origin therefore never
 // learns the client can read a padded body, and must not answer as if it had. If
 // it announced pad-body anyway, the client would take that answer as licence to
-// prefix its bodies with an X-Pad — on the strength of an answer to a request
-// the origin never saw. Data would still line up while the X-Pad itself survives,
+// prefix its bodies with an X-Offset — on the strength of an answer to a request
+// the origin never saw. Data would still line up while the X-Offset itself survives,
 // and the moment a middlebox drops that too, the prefix is reassembled as
 // payload. Failing the handshake closed leaves both ends on the frame shape,
 // which no middlebox can turn into corruption.
@@ -517,7 +525,7 @@ func TestPollPaddingFailsClosedWhenTheRequestHeaderIsStripped(t *testing.T) {
 	}
 	for i, b := range sent {
 		if b.pad != 0 {
-			t.Fatalf("request body %d declares X-Pad=%d although the origin never received the announcement; the handshake has to fail closed", i, b.pad)
+			t.Fatalf("request body %d declares X-Offset=%d although the origin never received the announcement; the handshake has to fail closed", i, b.pad)
 		}
 		frames := splitInnerFrames(t, b.body)
 		if len(frames) == 0 {
@@ -531,7 +539,7 @@ func TestPollPaddingFailsClosedWhenTheRequestHeaderIsStripped(t *testing.T) {
 	}
 	for i, b := range replies {
 		if b.pad != 0 {
-			t.Fatalf("response body %d declares X-Pad=%d although this client never announced pad-body", i, b.pad)
+			t.Fatalf("response body %d declares X-Offset=%d although this client never announced pad-body", i, b.pad)
 		}
 	}
 }

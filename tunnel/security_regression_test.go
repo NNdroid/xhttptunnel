@@ -197,8 +197,8 @@ func TestForcedStreamDialWaitsForUplinkAdmission(t *testing.T) {
 			http.Error(w, "busy", http.StatusTooManyRequests)
 			return
 		}
-		w.Header().Set("X-Downstream-Accepted", "1")
-		w.Header().Set("X-Stream-Uplink-Sync", "1")
+		w.Header().Set(DownstreamAcceptedHeader, "1")
+		w.Header().Set(StreamUplinkSyncHeader, "1")
 		w.Header().Set(ProtoHeader, strconv.Itoa(tunnelProtoVersion))
 		w.WriteHeader(http.StatusOK)
 		if f, ok := w.(http.Flusher); ok {

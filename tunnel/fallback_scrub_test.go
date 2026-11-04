@@ -49,9 +49,9 @@ func TestFallbackProxyScrubTunnelState(t *testing.T) {
 	}
 	req.Header.Set("X-Auth-Token", "my-secret-token")
 	req.Header.Set("Proxy-Authorization", "Bearer my-secret-token")
-	req.Header.Set("X-Session-ID", "5449801b132c8bf037f2a5f0be822e91")
-	req.Header.Set("X-Target", "127.0.0.1:22222")
-	req.Header.Set("X-Network", "tcp")
+	req.Header.Set(SessionIDHeader, "5449801b132c8bf037f2a5f0be822e91")
+	req.Header.Set(TargetHeader, "127.0.0.1:22222")
+	req.Header.Set(NetworkHeader, "tcp")
 	req.Header.Set(ProtoHeader, "1")
 	req.Header.Set("User-Agent", "curl/8.0.0")
 
@@ -99,7 +99,7 @@ func TestFallbackProxyScrubTunnelState(t *testing.T) {
 // names the headers independently, so removing an entry from the list fails
 // here while passing there.
 //
-// X-Pad, X-HTTP-Tunnel-Caps and X-HTTP-Tunnel-Bw travelled to the disguise
+// X-Offset, X-Features and X-Ingest travelled to the disguise
 // target for exactly as long as this test did not exist — the only check was
 // the one derived from the list they were missing from.
 func TestScrubDropsEveryProtocolHeader(t *testing.T) {
@@ -109,35 +109,40 @@ func TestScrubDropsEveryProtocolHeader(t *testing.T) {
 		AuthNonceHeader, AuthMACHeader, AuthBodyMACHeader,
 		PadHeader, CapsHeader, BwHeader, ProtoHeader,
 		"X-Auth-Token",
-		"X-Target", "X-Network", "X-Session-ID",
-		"X-Seq", "X-Ack", "X-Retry", "X-Downstream",
-		"X-Stream-Resume", "X-Stream-Probe-Window",
+		TargetHeader, NetworkHeader, SessionIDHeader,
+		SeqHeader, AckHeader, RetryHeader, DownstreamHeader,
+		StreamResumeHeader, StreamProbeWindowHeader,
 	}
 	req := httptest.NewRequest(http.MethodPost, "http://example.invalid/", strings.NewReader("frame bytes"))
 	for _, h := range sent {
 		req.Header.Set(h, "probe")
 	}
-	// A protocol header nobody has written yet, spelled the way this package
-	// spells its own: the prefix rule has to catch it without an entry.
-	req.Header.Set("X-HTTP-Tunnel-Not-Invented-Yet", "probe")
+	// The protocol no longer has a namespace prefix that catches an unlisted
+	// header at runtime; the registry completeness test
+	// (TestEveryProtocolHeaderIsScrubbedOrResponseOnly) takes that role. So the
+	// check here is the opposite side of the same guarantee: a header that is
+	// legitimately response-only must NOT be scrubbed off a request it does not
+	// belong on, while a request-borne one must.
+	req.Header.Set(AuthRespMACHeader, "probe")
 	// Ordinary browser headers, which camouflage depends on keeping.
 	req.Header.Set("User-Agent", "curl/8.0.0")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	scrubTunnelRequest(req)
+	scrubTunnelRequest(req, "")
 
 	for _, h := range sent {
 		if v := req.Header.Get(h); v != "" {
 			t.Errorf("%s survived the scrub: %q", h, v)
 		}
 	}
-	if v := req.Header.Get("X-HTTP-Tunnel-Not-Invented-Yet"); v != "" {
-		t.Errorf("an unlisted header in the protocol's own namespace survived the scrub: %q", v)
+	if v := req.Header.Get(AuthRespMACHeader); v == "" {
+		t.Error("a response-only header must not be scrubbed off a request it does not belong on")
 	}
 	if req.Header.Get("User-Agent") == "" || req.Header.Get("Accept-Language") == "" {
 		t.Error("ordinary headers must survive the scrub")
 	}
-	if len(req.Header) != 2 {
+	// The response-only header plus the two browser headers.
+	if len(req.Header) != 3 {
 		t.Errorf("scrubbed request still carries %d headers: %v", len(req.Header), req.Header)
 	}
 }
@@ -150,7 +155,7 @@ func TestScrubTunnelRequestNoBody(t *testing.T) {
 	req.Header.Set("X-Auth-Token", "my-secret-token")
 	req.Header.Set("User-Agent", "curl/8.0.0")
 
-	scrubTunnelRequest(req)
+	scrubTunnelRequest(req, "")
 
 	if req.Body != http.NoBody {
 		t.Errorf("Body = %T, want http.NoBody", req.Body)

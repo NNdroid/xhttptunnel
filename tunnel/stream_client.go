@@ -332,6 +332,7 @@ type streamDialArgs struct {
 	logger       *zap.Logger
 	events       *eventHub
 	onReady      func()
+	namer        headerNamer
 }
 
 // dialXHTTPStream runs the stream-mode pump: one persistent GET whose
@@ -341,6 +342,7 @@ type streamDialArgs struct {
 func dialXHTTPStream(a streamDialArgs) (net.Conn, error) {
 	logger := a.logger
 	virtualConn := newMeekVirtualConn(a.sessionID, a.localAddr, a.remoteAddr, logger)
+	virtualConn.namer = a.namer
 	window, err := windowBytes(a.cfg.WindowSizeMB)
 	if err != nil {
 		return nil, err
@@ -647,8 +649,13 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		return false, padErr
 	}
 	req, _ := http.NewRequestWithContext(roundCtx, http.MethodPost, a.reqURL, nil)
-	req.Header.Set("X-Downstream", "1")
-	req.Header.Set("X-Stream-Probe-Window", strconv.Itoa(int(probeWindow.Seconds())))
+	if a.namer.sessionIDInURL {
+		q := req.URL.Query()
+		q.Set(saltParam, a.sessionID)
+		req.URL.RawQuery = q.Encode()
+	}
+	req.Header.Set(a.namer.name(slotDownstream), "1")
+	req.Header.Set(a.namer.name(slotStreamProbeWindow), strconv.Itoa(int(probeWindow.Seconds())))
 	req.Body = io.NopCloser(bytes.NewReader(padded))
 	req.GetBody = nil
 	req.ContentLength = int64(len(padded))
@@ -659,9 +666,9 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	resumeAck := ""
 	if *lastDown > 0 {
 		resumeAck = strconv.FormatUint(*lastDown, 10)
-		req.Header.Set("X-Retry", "1")
+		req.Header.Set(a.namer.name(slotRetry), "1")
 	}
-	if err := applyStreamRequestHeaders(req, a.cfg, a.targetAddr, a.network, a.sessionID, resumeAck, padded, probePad); err != nil {
+	if err := applyStreamRequestHeaders(req, a.cfg, a.targetAddr, a.network, a.sessionID, resumeAck, padded, probePad, a.namer); err != nil {
 		return false, err
 	}
 	// WroteRequest separates the two phases that share the probe budget. If the
@@ -722,7 +729,7 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 		// from a genuine "cannot stream" verdict in the log.
 		return false, fmt.Errorf("%w (origin answered HTTP %d)", errStreamUnavailable, resp.StatusCode)
 	}
-	if resp.Header.Get("X-Downstream-Accepted") != "1" {
+	if resp.Header.Get(a.namer.name(slotDownstreamAccepted)) != "1" {
 		// Old origin or a proxy that dropped the header: it ran the long-poll
 		// branch. Note this response may already carry downlink bytes, which is
 		// why the poll fallback relies on AcquireDownWriter rewinding the
@@ -740,10 +747,10 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	// envelope pad, so reconnecting to a node that does not advertise the
 	// capability costs shape but can never misalign a body. A poll body has no
 	// envelope, which is why its gate has to follow the peer.
-	if hasCapValue(resp.Header.Get(CapsHeader), CapPadBody) {
+	if hasCapValue(resp.Header.Get(a.namer.name(slotCaps)), CapPadBody) {
 		virtualConn.padInTransport.Store(true)
 	}
-	if resp.Header.Get("X-Stream-Uplink-Sync") != "1" {
+	if resp.Header.Get(a.namer.name(slotStreamUplinkSync)) != "1" {
 		// Older origins can send a downlink hello before the companion POST is
 		// admitted, making Dial report success for a one-way connection. Fall
 		// back (or fail loudly in forced mode) until the origin supports the
@@ -754,7 +761,7 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	// A server announcing a newer protocol generation than this client speaks
 	// is fatal, not a fallback: the frame layout may already differ, so
 	// polling could corrupt the stream rather than degrade it.
-	if err := checkServerProto(resp.Header); err != nil {
+	if err := checkServerProto(resp.Header, a.namer); err != nil {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return false, err
 	}
@@ -799,16 +806,21 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 			failRound(uerr)
 			return
 		}
+		if a.namer.sessionIDInURL {
+			q := upReq.URL.Query()
+			q.Set(saltParam, a.sessionID)
+			upReq.URL.RawQuery = q.Encode()
+		}
 		// Set before signing, not after: the content type is what says this
 		// request carries a continuous stream, and the signature covers that
 		// statement, so it has to be in place by the time it is made.
 		upReq.Header.Set("Content-Type", streamContentType)
-		upReq.Header.Set("X-Stream-Resume", "1")
+		upReq.Header.Set(a.namer.name(slotStreamResume), "1")
 		// A stream upload carries no leading pad: its body has no end to
 		// pad to, which is the same reason its kind says it is not digestible
 		// whole. It still states that, so a hop that splices a pad onto a
 		// stream is refused instead of being believed.
-		if err := applyStreamRequestHeaders(upReq, a.cfg, a.targetAddr, a.network, a.sessionID, "", nil, 0); err != nil {
+		if err := applyStreamRequestHeaders(upReq, a.cfg, a.targetAddr, a.network, a.sessionID, "", nil, 0, a.namer); err != nil {
 			failRound(err)
 			return
 		}
@@ -909,7 +921,7 @@ func (a streamDialArgs) runStreamRound(pumpCtx context.Context, client *http.Cli
 	}
 
 	logger := a.logger
-	if resp.Header.Get("X-Session-Created") == "1" && *established {
+	if resp.Header.Get(a.namer.name(slotSessionCreated)) == "1" && *established {
 		// The server recreated the session (kick, reaper, restart). Already
 		// acknowledged uplink bytes have left the reliable buffer, so rebasing
 		// the surviving application connection to zero would either stall or
@@ -1088,7 +1100,7 @@ func (a streamDialArgs) isolatedClient() *http.Client {
 // downlink probe is a POST whose whole body is that pad, so without it the
 // origin would count the padding as uplink bytes and the acknowledgement it
 // hands back would be one this side's send buffer cannot vouch for.
-func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, network, sessionID, ack string, body []byte, pad int) error {
+func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, network, sessionID, ack string, body []byte, pad int, namer headerNamer) error {
 	req.Header.Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Accept", "*/*")
@@ -1099,10 +1111,12 @@ func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, n
 		req.Host = cfg.SNI
 	}
 	req.Header.Set("User-Agent", clientUserAgent)
-	req.Header.Set("X-Target", targetAddr)
-	req.Header.Set("X-Network", network)
-	req.Header.Set("X-Session-ID", sessionID)
-	req.Header.Set(ProtoHeader, strconv.Itoa(offeredProtoVersion))
+	req.Header.Set(namer.name(slotTarget), targetAddr)
+	req.Header.Set(namer.name(slotNetwork), network)
+	if !namer.sessionIDInURL {
+		req.Header.Set(namer.name(slotSessionID), sessionID)
+	}
+	req.Header.Set(namer.name(slotProto), strconv.Itoa(offeredProtoVersion))
 	// The PSK itself never goes on the wire, so a captured request leaks
 	// nothing, and the per-request nonce makes replay a no-op.
 	//
@@ -1122,7 +1136,7 @@ func applyStreamRequestHeaders(req *http.Request, cfg *DialConfig, targetAddr, n
 		pad:       strconv.Itoa(pad),
 		bodyKind:  bodyKindFor(req),
 		body:      body,
-	}); err != nil {
+	}, namer); err != nil {
 		return fmt.Errorf("tunnel: could not generate a nonce: %w", err)
 	}
 	// The capability is written by the signer too, since it is signed: an

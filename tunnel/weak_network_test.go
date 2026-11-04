@@ -412,9 +412,9 @@ func TestTheServerAdvertisesItsLongPollWindow(t *testing.T) {
 	// A 401 or 403 means the header was not set on the error path, which is
 	// not what is being tested; the test wants a request that gets far
 	// enough to be answered.
-	req.Header.Set("X-Target", "127.0.0.1:9")
-	req.Header.Set("X-Network", "tcp")
-	req.Header.Set("X-Session-ID", "poll-window-probe")
+	req.Header.Set(TargetHeader, "127.0.0.1:9")
+	req.Header.Set(NetworkHeader, "tcp")
+	req.Header.Set(SessionIDHeader, "poll-window-probe")
 	req.Header.Set(ProtoHeader, "3")
 
 	resp, err := http.DefaultClient.Do(req)

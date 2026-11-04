@@ -757,7 +757,7 @@ func serverFieldDocs() []stringDoc {
 		{"max_sessions", "Maximum concurrent tunnel sessions allowed on server (0 = default 2000)"},
 		{"max_sessions_per_ip", "Cap concurrent sessions from a single client address (0 = unlimited). Bounds one PSK holder's blast radius; counts the TCP peer address unless trust_proxy_headers is on."},
 		{"health_path", "When set (e.g. /healthz), expose an unauthenticated JSON stats endpoint on the tunnel listener. Empty = disabled. Keep off on a public listener."},
-		{"min_proto_version", "Reject (HTTP 426) clients advertising an X-XHTTP-Proto below this. 0 (default) accepts all clients, including legacy header-less ones. Set 2 to force the signed-nonce scheme: a client advertising v2 is admitted only by signature, which closes the bare-token fallback."},
+		{"min_proto_version", "Reject (HTTP 426) clients advertising an X-Ver below this. 0 (default) accepts all clients, including legacy header-less ones. Set 2 to force the signed-nonce scheme: a client advertising v2 is admitted only by signature, which closes the bare-token fallback."},
 		{"window_size_mb", "Reliable send window per session in MiB (0 = 8; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
 		{"chunk_size_kb", "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must be raised on BOTH ends together."},
 		{"padding", paddingFieldDoc},
@@ -865,7 +865,7 @@ func bindGenConfigFlags(cmd *flag.FlagSet, s *genSpec) {
 	cmd.IntVar(&s.MaxSessions, "max-sessions", 0, "Server max concurrent sessions (0 = 2000)")
 	cmd.IntVar(&s.MaxSessionsPerIP, "max-sessions-per-ip", 0, "Server max sessions per client address (0 = 50)")
 	cmd.StringVar(&s.HealthPath, "health-path", "", "Unauthenticated stats path on the tunnel listener; empty disables it")
-	cmd.IntVar(&s.MinProtoVersion, "min-proto-version", 0, "Reject clients advertising an older X-XHTTP-Proto (0 = accept all)")
+	cmd.IntVar(&s.MinProtoVersion, "min-proto-version", 0, "Reject clients advertising an older X-Ver (0 = accept all)")
 	cmd.IntVar(&s.ChunkSizeKB, "chunk-size-kb", 0, "Upstream payload per poll request, 16-900 (0 = 256)")
 	cmd.StringVar(&s.Padding, "padding", "", `Frame padding rule: "off", "MIN-MAX" or "BELOW:MIN-MAX" bands (default 400-600)`)
 	cmd.IntVar(&s.WindowSizeMB, "window-size-mb", 0, "Reliable send window per session in MiB, 1-64 (0 = 8)")
@@ -1320,11 +1320,20 @@ func locationBlock(path, upstreamName, scheme string, bodyKB int, tokenHeader st
 	// Declared explicitly rather than left to the default pass-through: a
 	// missing nonce, MAC or pad length fails the request with no error pointing
 	// at nginx, so this is the one case where the redundancy pays for the
-	// lines. X-Pad carries the signed pad length, and a signed request that
-	// arrives without it is refused outright.
-	b.WriteString(pad + "proxy_set_header X-HTTP-Tunnel-Nonce $http_x_http_tunnel_nonce;\n")
-	b.WriteString(pad + "proxy_set_header X-HTTP-Tunnel-MAC $http_x_http_tunnel_mac;\n")
-	b.WriteString(pad + "proxy_set_header X-Pad $http_x_pad;\n")
+	// lines. X-Offset carries the signed pad length, and a signed request that
+	// arrives without it is refused outright. (The response direction needs no
+	// proxy_pass_header: X-Offset is outside nginx's default hidden-header
+	// list, which is exactly why the pad field was renamed away from X-Pad.)
+	//
+	// These three constant names are what a pre-derived-mode (constant-name)
+	// client sends. A derived-mode client writes per-session names instead, so
+	// these proxy_set_header lines are no-ops for it (nginx emits no header
+	// when $http_x_req_id is empty) and its derived names pass through the
+	// default proxy_pass_request_headers on, which is why the derived mode
+	// needs no nginx change.
+	b.WriteString(pad + "proxy_set_header X-Req-Id $http_x_req_id;\n")
+	b.WriteString(pad + "proxy_set_header X-Req-Sig $http_x_req_sig;\n")
+	b.WriteString(pad + "proxy_set_header X-Offset $http_x_offset;\n")
 	b.WriteString(pad + "# trust_proxy_headers must be on server-side for these to be trusted.\n\n")
 	b.WriteString(pad + "proxy_connect_timeout 10s;\n")
 	b.WriteString(pad + "proxy_read_timeout 86400s;\n")

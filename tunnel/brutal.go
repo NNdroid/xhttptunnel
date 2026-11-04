@@ -35,40 +35,12 @@ const (
 	// server built against another implementation stays interoperable.
 	TargetBwExchange = "_BrutalBwExchange"
 
-	// BwHeader carries the receiver-side ceiling: the fastest the peer may
-	// send this side data, in bytes/s. The peer applies it as its own send
-	// rate, so the two ends converge on whatever the slower link tolerates.
-	//
-	// The value is what this side can *ingest*, not what it wants to send.
-	// Advertising your downlink makes the server slow its uplink down to it;
-	// the server advertising its ingest capacity makes the client slow its
-	// uplink down.
-	BwHeader = "X-HTTP-Tunnel-Bw"
-
-	// CapsHeader lists the extensions a server implements. The client reads it
-	// to tell an exchange-capable server from an older one with no protocol
-	// bump: an old server rejects TargetBwExchange like any unparseable
-	// target, which is a clean non-200 rather than a partial exchange.
-	CapsHeader  = "X-HTTP-Tunnel-Caps"
+	// CapBrutalBw is the capability value BwHeader/CapsHeader carries for the
+	// bandwidth exchange. It is deliberately not version-gated: the client
+	// reads CapsHeader to tell an exchange-capable server from an older one
+	// with no protocol bump.
 	CapBrutalBw = "brutal-bw"
-	// PadHeader carries the byte count of a poll body's leading pad. It is
-	// sent on requests and responses alike. The count travels masked, and it
-	// is bound into the signature: an observer who reads the header learns
-	// nothing about the payload inside the body, and a hop that drops or
-	// alters it is refused rather than being believed.
-	PadHeader = "X-Pad"
-	// PollTimeoutHeader tells the client how long this server parks an idle
-	// poll, in seconds. The client needs it for one reason: its own request
-	// timeout has to cover a long poll that comes back empty, but it must not
-	// be so long that a link silently dropped by a NAT looks healthy until the
-	// timeout expires. Without the number the client can only pick a timeout
-	// for itself, and every value that covers a long poll also covers a dead
-	// path.
-	//
-	// It is a hint, not a promise the client depends on for correctness: a
-	// client that never saw it falls back to its own conservative bound. That
-	// makes it safe to leave unsigned — it costs a timeout, never data.
-	PollTimeoutHeader = "X-HTTP-Tunnel-Poll-Timeout"
+
 	// CapPadBody advertises that this side reads a poll body with a leading
 	// pad in it, and can tell one from a body that has none. Both directions
 	// are gated on it: a body padded for a peer that does not look for the pad
@@ -443,7 +415,7 @@ func mergeBrutalRate(configured, advertised uint64) uint64 {
 	return configured
 }
 
-// parseBwValue parses the X-HTTP-Tunnel-Bw header. ok is false for an empty,
+// parseBwValue parses the X-Ingest header. ok is false for an empty,
 // non-numeric, zero or out-of-range value; the caller must keep its current
 // rate rather than apply zero, which would stall the connection.
 func parseBwValue(s string) (v uint64, ok bool) {
@@ -454,7 +426,7 @@ func parseBwValue(s string) (v uint64, ok bool) {
 	return n, true
 }
 
-// hasCapValue reports whether a comma-separated X-HTTP-Tunnel-Caps value
+// hasCapValue reports whether a comma-separated X-Features value
 // advertises the named extension.
 func hasCapValue(s, want string) bool {
 	for _, capability := range strings.Split(s, ",") {
@@ -465,7 +437,7 @@ func hasCapValue(s, want string) bool {
 	return false
 }
 
-// hasBrutalBwCap reports whether a comma-separated X-HTTP-Tunnel-Caps value
+// hasBrutalBwCap reports whether a comma-separated X-Features value
 // advertises the bandwidth exchange.
 func hasBrutalBwCap(s string) bool {
 	return hasCapValue(s, CapBrutalBw)

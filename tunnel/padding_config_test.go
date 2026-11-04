@@ -30,7 +30,7 @@ func snapshotPadding(t *testing.T) {
 func TestPaddingFromConfigApplies(t *testing.T) {
 	snapshotPadding(t)
 
-	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", Padding: "1:120-200,400:400-600"}); err != nil {
+	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", PSK: "padding-test-psk", Padding: "1:120-200,400:400-600"}); err != nil {
 		t.Fatalf("NewClient with a padding rule: %v", err)
 	}
 	if got := PaddingSpec(); got != "1:120-200,400:400-600" {
@@ -39,7 +39,7 @@ func TestPaddingFromConfigApplies(t *testing.T) {
 
 	// A server declaring the same rule under another spelling is not a
 	// conflict — the normalised band list is what counts.
-	if _, err := NewServer(ServerConfig{Padding: "1:120-200 , 400:400-600"}); err != nil {
+	if _, err := NewServer(ServerConfig{PSK: "padding-test-psk", Padding: "1:120-200 , 400:400-600"}); err != nil {
 		t.Fatalf("NewServer restating the same rule: %v", err)
 	}
 	if got := PaddingSpec(); got != "1:120-200,400:400-600" {
@@ -54,7 +54,7 @@ func TestPaddingFromConfigApplies(t *testing.T) {
 func TestPaddingDeclarationConflictRejected(t *testing.T) {
 	snapshotPadding(t)
 
-	c := ClientConfig{ServerURL: "https://127.0.0.1:9/stream", Padding: "off"}
+	c := ClientConfig{ServerURL: "https://127.0.0.1:9/stream", PSK: "padding-test-psk", Padding: "off"}
 	if _, err := NewClient(c); err != nil {
 		t.Fatalf("first declaration: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestPaddingDeclarationConflictRejected(t *testing.T) {
 		}
 	}
 	// The server constructor must refuse it too: the policy is shared.
-	if _, err := NewServer(ServerConfig{Padding: "400-600"}); err == nil {
+	if _, err := NewServer(ServerConfig{PSK: "padding-test-psk", Padding: "400-600"}); err == nil {
 		t.Error("NewServer accepted a conflicting padding rule")
 	}
 
@@ -93,7 +93,7 @@ func TestPaddingConfigEmptyKeepsPolicy(t *testing.T) {
 	snapshotPadding(t)
 	withPadding(t, "512:600-1199")
 
-	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream"}); err != nil {
+	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", PSK: "padding-test-psk"}); err != nil {
 		t.Fatalf("NewClient without a padding rule: %v", err)
 	}
 	if got := PaddingSpec(); got != "512:600-1199" {
@@ -106,11 +106,11 @@ func TestPaddingConfigEmptyKeepsPolicy(t *testing.T) {
 func TestPaddingConfigRejectsInvalid(t *testing.T) {
 	snapshotPadding(t)
 
-	_, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", Padding: "400:200-600"})
+	_, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", PSK: "padding-test-psk", Padding: "400:200-600"})
 	if err == nil || !strings.Contains(err.Error(), "client Padding") {
 		t.Errorf("NewClient accepted an unsatisfiable rule (err = %v)", err)
 	}
-	_, err = NewServer(ServerConfig{Padding: "padding"})
+	_, err = NewServer(ServerConfig{PSK: "padding-test-psk", Padding: "padding"})
 	if err == nil || !strings.Contains(err.Error(), "server Padding") {
 		t.Errorf("NewServer accepted a malformed rule (err = %v)", err)
 	}
@@ -130,7 +130,7 @@ func TestPaddingOverrideBlocksDifferingDeclaration(t *testing.T) {
 		t.Fatalf("SetPadding: %v", err)
 	}
 
-	_, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", Padding: "400-600"})
+	_, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", PSK: "padding-test-psk", Padding: "400-600"})
 	if err == nil {
 		t.Fatal("NewClient replaced a SetPadding override without saying so")
 	}
@@ -144,10 +144,10 @@ func TestPaddingOverrideBlocksDifferingDeclaration(t *testing.T) {
 	}
 
 	// Restating the override is not a conflict: nothing changes.
-	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", Padding: "none"}); err != nil {
+	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", PSK: "padding-test-psk", Padding: "none"}); err != nil {
 		t.Errorf("NewClient rejected a config that restates the override: %v", err)
 	}
-	if _, err := NewServer(ServerConfig{Padding: "off"}); err != nil {
+	if _, err := NewServer(ServerConfig{PSK: "padding-test-psk", Padding: "off"}); err != nil {
 		t.Errorf("NewServer rejected a config that restates the override: %v", err)
 	}
 }
@@ -161,18 +161,18 @@ func TestPaddingOverrideBlocksDifferingDeclaration(t *testing.T) {
 func TestPaddingDeclarationMatchingTheRuleInForceIsAccepted(t *testing.T) {
 	snapshotPadding(t)
 
-	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", Padding: "off"}); err != nil {
+	if _, err := NewClient(ClientConfig{ServerURL: "https://127.0.0.1:9/stream", PSK: "padding-test-psk", Padding: "off"}); err != nil {
 		t.Fatalf("first declaration: %v", err)
 	}
 	if err := SetPadding("400-600"); err != nil {
 		t.Fatalf("override: %v", err)
 	}
-	if _, err := NewServer(ServerConfig{Padding: "400:400-600"}); err != nil {
+	if _, err := NewServer(ServerConfig{PSK: "padding-test-psk", Padding: "400:400-600"}); err != nil {
 		t.Fatalf("a config asking for the rule in force was rejected: %v", err)
 	}
 	// Asking for the retired rule now contradicts the override, and the error
 	// must name the decision it contradicts.
-	_, err := NewServer(ServerConfig{Padding: "off"})
+	_, err := NewServer(ServerConfig{PSK: "padding-test-psk", Padding: "off"})
 	if err == nil {
 		t.Fatal("a rule the override retired was accepted")
 	}

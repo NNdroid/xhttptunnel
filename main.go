@@ -92,7 +92,7 @@ type FileConfig struct {
 	// stats endpoint on the tunnel listener. Empty disables it.
 	HealthPath string `json:"health_path"`
 	// MinProtoVersion rejects (HTTP 426) clients advertising an older
-	// X-XHTTP-Proto than this, to force a fleet off a retired wire format. 0
+	// X-Ver than this, to force a fleet off a retired wire format. 0
 	// (default) accepts all clients including header-less legacy ones.
 	MinProtoVersion int `json:"min_proto_version"`
 	MaxConns        int `json:"max_conns"` // Client max concurrent connections
@@ -650,7 +650,7 @@ func runFromConfig(path string) {
 			logger.Fatal("❌ config file contains a public example PSK; set the password the server actually uses")
 		}
 		if cfg.PSK == "" {
-			logger.Warn("⚠️ no PSK set in the config file; the client will connect unauthenticated.")
+			logger.Fatal("❌ no PSK set in the config file; the tunnel is authenticated and cannot run open/unauthenticated")
 		}
 		startClient(ctx, cfg)
 	} else {
@@ -661,7 +661,7 @@ func runFromConfig(path string) {
 			logger.Fatal("❌ config file contains a public example PSK; replace it with a deployment-specific strong random password first")
 		}
 		if cfg.PSK == "" {
-			logger.Warn("⚠️ no PSK set in the config file; the server runs in open mode (unauthenticated). Do not expose it publicly.")
+			logger.Fatal("❌ no PSK set in the config file; the tunnel is authenticated and cannot run open/unauthenticated")
 		}
 		startServer(ctx, cfg)
 	}

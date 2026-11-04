@@ -218,18 +218,13 @@ func TestPollGetTakesOverFromStalledStreamWriter(t *testing.T) {
 	st.sessionsMu.Unlock()
 
 	newReq := func() *http.Request {
-		r := httptest.NewRequest(http.MethodGet, "/stream", nil)
-		r.Header.Set("X-Session-ID", sessionID)
-		r.Header.Set("X-Target", "127.0.0.1:22")
-		r.Header.Set("X-Network", "tcp")
-		r.Header.Set("X-Auth-Token", "pw")
-		r.Header.Set("X-Seq", "0")
-		r.Header.Set("X-Ack", "0")
-		return r
+		// Strict mode: the request is written the way a client writes it —
+		// derived names, the session id as the URL salt, and a signature.
+		return signedRequestFor(t, "pw", http.MethodGet, sessionID, "tcp", "127.0.0.1:22", nil)
 	}
 
 	streamReq := newReq()
-	streamReq.Header.Set("X-Downstream", "1")
+	streamReq.Header.Set(deriveHeaderNamer("pw", sessionID).name(slotDownstream), "1")
 	bw := newStalledStreamWriter()
 	streamDone := make(chan struct{})
 	go func() {
@@ -281,17 +276,22 @@ func TestPollGetTakesOverFromStalledStreamWriter(t *testing.T) {
 	}
 }
 
-// stripDownstreamProxy fronts an origin and drops the X-Downstream capability
+// stripDownstreamProxy fronts an origin and drops the X-Mode capability
 // header, which is what a CDN that does not forward unknown headers does. The
 // origin then answers the probe as an ordinary long poll.
-func stripDownstreamProxy(t *testing.T, origin *url.URL) (*httptest.Server, *int32) {
+func stripDownstreamProxy(t *testing.T, origin *url.URL, psk string) (*httptest.Server, *int32) {
 	t.Helper()
 	var probed int32
 	rp := httputil.NewSingleHostReverseProxy(origin)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Downstream") == "1" {
+		// Strip the streaming-mode header under whichever name the client wrote
+		// it: derived from the URL salt and this origin's key (a PSK client) or
+		// the constant (an open client). This is what makes the origin a
+		// "poll-only" one.
+		namer := deriveHeaderNamer(psk, r.URL.Query().Get(saltParam))
+		if r.Header.Get(namer.name(slotDownstream)) == "1" {
 			atomic.AddInt32(&probed, 1)
-			r.Header.Del("X-Downstream")
+			r.Header.Del(namer.name(slotDownstream))
 		}
 		rp.ServeHTTP(w, r)
 	}))
@@ -348,7 +348,7 @@ func TestStreamFallbackDoesNotLoseFirstDownlinkBytes(t *testing.T) {
 	serveAcceptedTCPEcho(t, ctx, origin)
 
 	originURL, _ := url.Parse("http://" + origin.Addr().String())
-	front, probed := stripDownstreamProxy(t, originURL)
+	front, probed := stripDownstreamProxy(t, originURL, "pw")
 	serverURL, _ := url.Parse(front.URL + "/stream")
 
 	cfg := &DialConfig{Password: "pw", Path: "/stream", ALPN: "h1"}

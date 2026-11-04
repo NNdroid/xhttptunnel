@@ -92,7 +92,7 @@ func TestStreamOneWayBeyondWindow(t *testing.T) {
 func TestStreamDialWaitsForUplinkAdmission(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	s, err := NewServer(ServerConfig{Path: "/stream", Handler: func(c *XHTTPConn) {
+	s, err := NewServer(ServerConfig{Path: "/stream", PSK: "stream-opt-psk", Handler: func(c *XHTTPConn) {
 		defer c.Close()
 		<-ctx.Done()
 	}})
@@ -114,7 +114,7 @@ func TestStreamDialWaitsForUplinkAdmission(t *testing.T) {
 	}))
 	defer func() { cancel(); host.Close() }()
 	u, _ := url.Parse(host.URL + "/stream")
-	c, err := DialXHTTP(ctx, u, &DialConfig{Path: "/stream", ALPN: "h1", StreamMode: "stream"}, "echo:1", "tcp")
+	c, err := DialXHTTP(ctx, u, &DialConfig{Path: "/stream", Password: "stream-opt-psk", ALPN: "h1", StreamMode: "stream"}, "echo:1", "tcp")
 	if err == nil {
 		c.Close()
 		t.Fatal("Dial succeeded before the rejected uplink was admitted")
@@ -156,7 +156,7 @@ func (w *interruptedResponse) Write(p []byte) (int, error) {
 func TestStreamResumePreservesBytesAfterRepeatedBreaks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	s, err := NewServer(ServerConfig{Path: "/stream", Handler: func(c *XHTTPConn) {
+	s, err := NewServer(ServerConfig{Path: "/stream", PSK: "stream-opt-psk", Handler: func(c *XHTTPConn) {
 		defer c.Close()
 		_, _ = io.Copy(c, c)
 	}})
@@ -168,14 +168,18 @@ func TestStreamResumePreservesBytesAfterRepeatedBreaks(t *testing.T) {
 	faults.Store(3)
 	handler := s.Handler()
 	host := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Downstream") == "1" {
+		// Derived mode: the session id rides the URL salt, so this proxy can
+		// derive the names the client wrote under — exactly the capability a
+		// hop that holds the PSK has — and find the stream marker.
+		sid := r.URL.Query().Get(saltParam)
+		if r.Header.Get(deriveHeaderNamer("stream-opt-psk", sid).name(slotDownstream)) == "1" {
 			w = &interruptedResponse{ResponseWriter: w, faults: &faults}
 		}
 		handler.ServeHTTP(w, r)
 	}))
 	defer func() { cancel(); host.Close() }()
 	u, _ := url.Parse(host.URL + "/stream")
-	c, err := DialXHTTP(ctx, u, &DialConfig{Path: "/stream", ALPN: "h1", StreamMode: "stream"}, "echo:1", "tcp")
+	c, err := DialXHTTP(ctx, u, &DialConfig{Path: "/stream", Password: "stream-opt-psk", ALPN: "h1", StreamMode: "stream"}, "echo:1", "tcp")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +213,7 @@ func TestStreamResumePreservesBytesAfterRepeatedBreaks(t *testing.T) {
 func TestStreamOverridesAbsoluteHTTPTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	s, err := NewServer(ServerConfig{Path: "/stream", Handler: func(c *XHTTPConn) {
+	s, err := NewServer(ServerConfig{Path: "/stream", PSK: "stream-opt-psk", Handler: func(c *XHTTPConn) {
 		defer c.Close()
 		_, _ = io.Copy(c, c)
 	}})
@@ -225,7 +229,7 @@ func TestStreamOverridesAbsoluteHTTPTimeout(t *testing.T) {
 	defer hs.Close()
 	go hs.Serve(ln)
 	u, _ := url.Parse("http://" + ln.Addr().String() + "/stream")
-	c, err := DialXHTTP(ctx, u, &DialConfig{Path: "/stream", ALPN: "h1", StreamMode: "stream"}, "echo:1", "tcp")
+	c, err := DialXHTTP(ctx, u, &DialConfig{Path: "/stream", Password: "stream-opt-psk", ALPN: "h1", StreamMode: "stream"}, "echo:1", "tcp")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +275,7 @@ func TestStreamProbeAdaptiveWindowSucceedsOnSlowHandshake(t *testing.T) {
 		go func() { time.Sleep(2 * time.Second); close(ch) }()
 		return &http.Response{
 			StatusCode: 200,
-			Header:     http.Header{"X-Downstream-Accepted": {"1"}, "X-Stream-Uplink-Sync": {"1"}},
+			Header:     http.Header{DownstreamAcceptedHeader: {"1"}, StreamUplinkSyncHeader: {"1"}},
 			Body:       &delayedHelloBody{ctx: r.Context(), hello: hello, release: ch},
 			Request:    r,
 		}, nil

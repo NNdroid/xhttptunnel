@@ -242,8 +242,7 @@ const defaultMaxSessions = 2000
 // single place to change when a frame-format revision lands; clients refuse
 // servers that report a newer generation rather than corrupting silently.
 const (
-	ProtoHeader = "X-XHTTP-Proto"
-	// tunnelProtoVersion names the frame generation the X-XHTTP-Proto header
+	// tunnelProtoVersion names the frame generation the X-Ver header
 	// carries. Servers advertise it and clients refuse a newer one, so it only
 	// moves when the frame layout changes.
 	tunnelProtoVersion = 1
@@ -272,8 +271,8 @@ var errProtoTooNew = errors.New("tunnel: server reports a newer protocol version
 // checkServerProto rejects responses that advertise a protocol generation
 // newer than tunnelProtoVersion. An absent header is treated as the oldest
 // generation (legacy server), so it is always acceptable.
-func checkServerProto(h http.Header) error {
-	v := h.Get(ProtoHeader)
+func checkServerProto(h http.Header, namer headerNamer) error {
+	v := h.Get(namer.name(slotProto))
 	if v == "" {
 		return nil
 	}
@@ -336,7 +335,7 @@ type serverState struct {
 	maxPerIP int
 	// perIP counts live sessions by client IP (host part of remoteAddr).
 	perIP map[string]int
-	// minProto rejects requests whose advertised X-XHTTP-Proto is below this
+	// minProto rejects requests whose advertised X-Ver is below this
 	// (0 = accept everything, including legacy clients that send no header).
 	minProto int
 	// nonces absorbs replayed signed requests. It is shared by every handler

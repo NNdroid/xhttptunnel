@@ -472,6 +472,12 @@ type meekVirtualConn struct {
 	local     net.Addr
 	remote    net.Addr
 
+	// namer resolves this session's protocol header names. The client sets it
+	// once at dial time; the server sets it when the session is created or
+	// looked up, from the same PSK and session id, so both sides agree. The
+	// stream handlers read and write headers through it.
+	namer headerNamer
+
 	readCond *sync.Cond
 	readBuf  bytes.Buffer
 	// readBufBusyAt is the last time readBuf held data. bytes.Buffer never

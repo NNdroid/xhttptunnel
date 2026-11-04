@@ -747,10 +747,12 @@ func TestNginxDefaultSnippet(t *testing.T) {
 	mustContain("proxy_set_header X-Auth-Token $http_x_auth_token;")
 	// All three are headers whose absence fails the request outright with
 	// nothing in the logs naming nginx, so none can be left to implicit
-	// pass-through. X-Pad carries the signed pad length.
-	mustContain("proxy_set_header X-HTTP-Tunnel-Nonce $http_x_http_tunnel_nonce;")
-	mustContain("proxy_set_header X-HTTP-Tunnel-MAC $http_x_http_tunnel_mac;")
-	mustContain("proxy_set_header X-Pad $http_x_pad;")
+	// pass-through. X-Offset carries the signed pad length. (No proxy_pass_header
+	// is needed on the response direction: X-Offset is outside nginx's default
+	// hidden-header list, which is why the pad field is not called X-Pad.)
+	mustContain("proxy_set_header X-Req-Id $http_x_req_id;")
+	mustContain("proxy_set_header X-Req-Sig $http_x_req_sig;")
+	mustContain("proxy_set_header X-Offset $http_x_offset;")
 	mustContain("proxy_next_upstream off;")
 	mustContain("proxy_connect_timeout 10s;")
 	mustContain("proxy_read_timeout 86400s;")
