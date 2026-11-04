@@ -8,9 +8,37 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// wireRequest captures the first request a test proxy sees. The proxy handler
+// runs on httptest's goroutines while the assertions run on the test goroutine,
+// so both the capture and the read must go through the same lock.
+type wireRequest struct {
+	mu     sync.Mutex
+	header http.Header
+	query  string
+}
+
+func (c *wireRequest) record(r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.header == nil {
+		c.header = r.Header.Clone()
+		c.query = r.URL.RawQuery
+	}
+}
+
+func (c *wireRequest) snapshot() (http.Header, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.header == nil {
+		return nil, ""
+	}
+	return c.header.Clone(), c.query
+}
 
 // TestEndToEndDerivedNamesOnTheWire drives a real PSK client through a
 // recording proxy to a real PSK origin, and asserts the request that actually
@@ -32,13 +60,9 @@ func TestEndToEndDerivedNamesOnTheWire(t *testing.T) {
 	serveAcceptedTCPEcho(t, ctx, origin)
 	originURL, _ := url.Parse("http://" + origin.Addr().String() + "/stream")
 
-	var firstHeader http.Header
-	var firstQuery string
+	var first wireRequest
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if firstHeader == nil {
-			firstHeader = r.Header.Clone()
-			firstQuery = r.URL.RawQuery
-		}
+		first.record(r)
 		r.RequestURI = ""
 		r.URL.Scheme = originURL.Scheme
 		r.URL.Host = originURL.Host
@@ -86,6 +110,7 @@ func TestEndToEndDerivedNamesOnTheWire(t *testing.T) {
 		t.Fatalf("echo mismatch: %q", got)
 	}
 
+	firstHeader, firstQuery := first.snapshot()
 	if firstHeader == nil {
 		t.Fatal("proxy never saw a request")
 	}
@@ -126,13 +151,9 @@ func TestEndToEndOpenModeKeepsConstants(t *testing.T) {
 	serveAcceptedTCPEcho(t, ctx, origin)
 	originURL, _ := url.Parse("http://" + origin.Addr().String() + "/stream")
 
-	var firstHeader http.Header
-	var firstQuery string
+	var first wireRequest
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if firstHeader == nil {
-			firstHeader = r.Header.Clone()
-			firstQuery = r.URL.RawQuery
-		}
+		first.record(r)
 		r.RequestURI = ""
 		r.URL.Scheme = originURL.Scheme
 		r.URL.Host = originURL.Host
@@ -171,8 +192,17 @@ func TestEndToEndOpenModeKeepsConstants(t *testing.T) {
 	// capture it before asserting on its headers. We do not need a data
 	// round-trip — the point is the names and the absence of a URL salt.
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && firstHeader == nil {
+	var firstHeader http.Header
+	var firstQuery string
+	for time.Now().Before(deadline) {
+		firstHeader, firstQuery = first.snapshot()
+		if firstHeader != nil {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if firstHeader == nil {
+		t.Fatal("proxy never saw a request")
 	}
 
 	if strings.Contains(firstQuery, "s=") {

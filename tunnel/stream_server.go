@@ -75,12 +75,16 @@ func streamWait(ctx context.Context, c *meekVirtualConn, delay time.Duration) {
 // (0 = proceed). A created session always starts both sequence spaces at
 // zero — reconnecting clients detect this via the hello frame's sequence and
 // reset their own bookkeeping.
-func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, target, network, host, remoteAddr string, namer headerNamer, lg *zap.Logger) (*meekVirtualConn, bool, int) {
+func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, target, network, host, remoteAddr string, lg *zap.Logger) (*meekVirtualConn, bool, int) {
 	st.sessionsMu.Lock()
 	vConn, exists := st.sessions[sessionID]
 	if exists {
+		// Do not refresh the session's namer here. With multiple configured
+		// PSKs each request may authenticate under a different key, so a
+		// request's response must use that request's own namer — not a shared
+		// one that a concurrent poll could overwrite while a long-lived stream
+		// downlink is still reading it. Handlers take the namer as an argument.
 		vConn.updateActive()
-		vConn.namer = namer
 		st.sessionsMu.Unlock()
 		return vConn, false, 0
 	}
@@ -127,7 +131,6 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 		return nil, false, http.StatusServiceUnavailable
 	}
 	vConn = newMeekVirtualConn(sessionID, stringAddr(host), stringAddr(remoteAddr), st.lg())
-	vConn.namer = namer
 	vConn.writeBuf = newReliableBuffer(window)
 	vConn.budget, vConn.reservation = st.bufferBudget, reservation
 	st.sessions[sessionID] = vConn
@@ -177,7 +180,12 @@ func (st *serverState) attachOrCreateSession(xl *XHTTPListener, sessionID, targe
 // streaming is the one "almost duplex" shape legacy proxies tolerate, so the
 // deployment requirements are identical to the long-poll mode's
 // (X-Accel-Buffering: no + response streaming enabled).
-func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState, vConn *meekVirtualConn, sessionID string, created bool, cred requestCred) {
+//
+// namer belongs to this request: it is the one authentication settled on, so
+// every header read from r and written to w goes through it. Keeping it local
+// (rather than reading a shared session field) is what makes a long-lived
+// downlink safe against concurrent polls that selected a different PSK key.
+func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState, vConn *meekVirtualConn, sessionID string, created bool, cred requestCred, namer headerNamer) {
 	if r.Context().Err() != nil {
 		return
 	}
@@ -196,7 +204,7 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	// first bytes and misalign the frame stream; the client detects the
 	// recreated session via hello.seq == 0 and resets its own bookkeeping.
 	// The counter arrives masked, under the key that signed the request.
-	_, ack, _, err := decodeCounters(cred.mask, countersFrom(r, vConn.namer))
+	_, ack, _, err := decodeCounters(cred.mask, countersFrom(r, namer))
 	if err == nil && ack > 0 && !created {
 		vConn.noteDownPeerAck(ack)
 	}
@@ -218,10 +226,10 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	h.Set("Expires", "0")
 	h.Set("X-Accel-Buffering", "no")
 	h.Set("Access-Control-Allow-Origin", st.corsAllowOrigin())
-	h.Set("Access-Control-Expose-Headers", vConn.namer.exposeList(
+	h.Set("Access-Control-Expose-Headers", namer.exposeList(
 		[]headerSlot{slotSeq, slotAck, slotSessionID, slotDownstreamAccepted, slotCaps, slotPollTimeout}))
-	h.Set(vConn.namer.name(slotDownstreamAccepted), "1")
-	h.Set(vConn.namer.name(slotStreamUplinkSync), "1")
+	h.Set(namer.name(slotDownstreamAccepted), "1")
+	h.Set(namer.name(slotStreamUplinkSync), "1")
 	// Echo the pad-body capability the client announced. It means this side
 	// reads the transport-level pad, so padding belongs in the envelope rather
 	// than the frame: with both ends agreed, a streamed frame carries exactly
@@ -233,18 +241,18 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 	// expects the pad. It costs only shape — the frame layer keeps padding,
 	// which an origin reads whatever its build — and it keeps the answer an
 	// honest report that the header survived the path in both directions.
-	if hasCapValue(r.Header.Get(vConn.namer.name(slotCaps)), CapPadBody) {
-		h.Set(vConn.namer.name(slotCaps), CapPadBody)
+	if hasCapValue(r.Header.Get(namer.name(slotCaps)), CapPadBody) {
+		h.Set(namer.name(slotCaps), CapPadBody)
 	}
 	if created {
-		h.Set(vConn.namer.name(slotSessionCreated), "1")
+		h.Set(namer.name(slotSessionCreated), "1")
 	}
 	h.Set("Content-Type", "application/octet-stream")
 	h.Set("Server", "nginx")
 	// The same long-poll window the poll path advertises. The streaming
 	// client runs the same recovery machinery, so it needs the same way to
 	// tell "the path is gone" from "the server had nothing to say".
-	h.Set(vConn.namer.name(slotPollTimeout), strconv.Itoa(int(st.longPollTimeout.Seconds())))
+	h.Set(namer.name(slotPollTimeout), strconv.Itoa(int(st.longPollTimeout.Seconds())))
 	w.WriteHeader(http.StatusOK)
 
 	rc := http.NewResponseController(w)
@@ -266,7 +274,7 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 		// to polling; honour it so a reconnect probe with a widened window is
 		// not rejected by the server's own shorter timeout.
 		probeWindow := streamProbeMinWindow
-		if pwStr := r.Header.Get(vConn.namer.name(slotStreamProbeWindow)); pwStr != "" {
+		if pwStr := r.Header.Get(namer.name(slotStreamProbeWindow)); pwStr != "" {
 			if pw, err := strconv.Atoi(pwStr); err == nil && pw > 0 && pw <= 60 {
 				probeWindow = time.Duration(pw) * time.Second
 			}
@@ -456,7 +464,7 @@ func serveStreamDownlink(w http.ResponseWriter, r *http.Request, st *serverState
 // serveStreamUplink implements the stream-mode uplink: one long POST whose
 // body is a continuous frame stream. It returns when the client ends the
 // tunnel, so it must run before the bounded-body poll path.
-func serveStreamUplink(w http.ResponseWriter, r *http.Request, st *serverState, vConn *meekVirtualConn, sessionID string) {
+func serveStreamUplink(w http.ResponseWriter, r *http.Request, st *serverState, vConn *meekVirtualConn, sessionID string, namer headerNamer) {
 	logger := st.lg()
 	defer r.Body.Close()
 	rc := http.NewResponseController(w)
@@ -473,7 +481,7 @@ func serveStreamUplink(w http.ResponseWriter, r *http.Request, st *serverState, 
 				vConn.Close()
 				return
 			}
-			if r.Context().Err() != nil || r.Header.Get(vConn.namer.name(slotStreamResume)) == "1" {
+			if r.Context().Err() != nil || r.Header.Get(namer.name(slotStreamResume)) == "1" {
 				// A transport round ended, not the application session. Preserve
 				// acknowledged bytes for the replacement POST; explicit close
 				// markers below still close normally. Legacy clients keep the

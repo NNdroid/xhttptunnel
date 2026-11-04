@@ -112,7 +112,7 @@ func TestStreamReadTimeoutKeepsResumableSession(t *testing.T) {
 	defer vc.Close()
 	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(timeoutStreamReader{}))
 	r.Header.Set(StreamResumeHeader, "1")
-	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "timeout-resume")
+	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "timeout-resume", defaultHeaderNamer())
 	if vc.isClosed() {
 		t.Fatal("transport read timeout destroyed resumable application state")
 	}
@@ -156,7 +156,7 @@ func TestStreamSlowReadProgressRefreshesDeadline(t *testing.T) {
 		vc := newMeekVirtualConn("slow-progress", nil, nil, nil)
 		defer vc.Close()
 		start := time.Now()
-		serveStreamUplink(w, r, newServerState(1), vc, "slow-progress")
+		serveStreamUplink(w, r, newServerState(1), vc, "slow-progress", defaultHeaderNamer())
 		if time.Since(start) <= streamWatchdogTimeout {
 			t.Fatal("fixture did not cross the original frame deadline")
 		}
@@ -197,7 +197,7 @@ func TestStreamCorruptFrameClosesResumableSession(t *testing.T) {
 	defer vc.Close()
 	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(&fakeUplinkReader{data: meta}))
 	r.Header.Set(StreamResumeHeader, "1")
-	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "corrupt-resume")
+	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "corrupt-resume", defaultHeaderNamer())
 	if !vc.isClosed() {
 		t.Fatal("corrupt frame on a resumable POST did not close the session")
 	}
@@ -213,7 +213,7 @@ func TestStreamTransportErrorKeepsResumableSession(t *testing.T) {
 	defer vc.Close()
 	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(&fakeUplinkReader{err: errors.New("connection reset by peer")}))
 	r.Header.Set(StreamResumeHeader, "1")
-	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "transport-resume")
+	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "transport-resume", defaultHeaderNamer())
 	if vc.isClosed() {
 		t.Fatal("transport error destroyed resumable application state")
 	}
@@ -226,7 +226,7 @@ func TestStreamTransportErrorClosesLegacySession(t *testing.T) {
 	vc := newMeekVirtualConn("transport-legacy", nil, nil, nil)
 	defer vc.Close()
 	r, _ := http.NewRequest(http.MethodPost, "http://fixture/stream", io.NopCloser(&fakeUplinkReader{err: errors.New("connection reset by peer")}))
-	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "transport-legacy")
+	serveStreamUplink(httptest.NewRecorder(), r, newServerState(1), vc, "transport-legacy", defaultHeaderNamer())
 	if !vc.isClosed() {
 		t.Fatal("transport error on a legacy POST did not close the session")
 	}

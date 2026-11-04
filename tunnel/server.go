@@ -661,7 +661,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// branch shares the same helper. A created session starts both
 		// sequence spaces at zero; reconnecting clients detect that via the
 		// hello frame and reset their own bookkeeping.
-		vConn, created, status := st.attachOrCreateSession(xl, sessionID, target, network, r.Host, r.RemoteAddr, namer, logger)
+		vConn, created, status := st.attachOrCreateSession(xl, sessionID, target, network, r.Host, r.RemoteAddr, logger)
 		if status != 0 {
 			nginxError(w, status)
 			return
@@ -687,7 +687,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// understand it — degrades into an ordinary idle poll, and the client
 		// falls back on its own.
 		if r.Header.Get(namer.name(slotDownstream)) == "1" {
-			serveStreamDownlink(w, r, st, vConn, sessionID, created, cred)
+			serveStreamDownlink(w, r, st, vConn, sessionID, created, cred, namer)
 			return
 		}
 		// Stream-mode uplink: one long POST whose body is a continuous frame
@@ -703,7 +703,7 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 			}
 			defer vConn.streamUp.Store(0)
 			vConn.signalStreamReady()
-			serveStreamUplink(w, r, st, vConn, sessionID)
+			serveStreamUplink(w, r, st, vConn, sessionID, namer)
 			return
 		}
 
