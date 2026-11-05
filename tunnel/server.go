@@ -563,16 +563,21 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// it has not derived yet — the chicken-and-egg the salt exists to break.
 		sessionID := sessionIDFromRequest(r, token)
 
-		// Advertise the generation and the long-poll window under the default
-		// names first, so a refusal before authentication (missing session id,
-		// bad password) still carries a parseable answer. A successful
-		// authentication replaces them with the names the request was actually
-		// written under, so no constant-name header survives on a derived
-		// response.
-		w.Header().Set(defaultNamer.name(slotProto), strconv.Itoa(tunnelProtoVersion))
-		w.Header().Set(defaultNamer.name(slotPollTimeout), strconv.Itoa(int(st.longPollTimeout.Seconds())))
-
 		if sessionID == "" {
+			// No salt means this is not a tunnel request. When a decoy is
+			// configured, unauthorized traffic is proxied to it so the endpoint
+			// masquerades as a normal site; otherwise a compact nginx-style 400
+			// is returned. The provisional default-name headers are only added
+			// on the error path — a fallback response must not carry them.
+			if fallbackProxy != nil {
+				if ce := logger.Check(zap.DebugLevel, "🛡️ [HTTP] missing Session ID, serving fallback camouflage"); ce != nil {
+					ce.Write(zap.String("remote", clientIP))
+				}
+				fallbackProxy.ServeHTTP(w, r)
+				return
+			}
+			w.Header().Set(defaultNamer.name(slotProto), strconv.Itoa(tunnelProtoVersion))
+			w.Header().Set(defaultNamer.name(slotPollTimeout), strconv.Itoa(int(st.longPollTimeout.Seconds())))
 			logger.Warn("❌ [HTTP] rejected request: missing Session ID", zap.String("remote", clientIP))
 			nginxError(w, http.StatusBadRequest)
 			return
@@ -585,6 +590,22 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		// response goes through.
 		namer, cred, ok := st.authorize(r, token, sessionID)
 		if !ok {
+			// Same policy as the missing-session case above: an unauthorized
+			// request is proxied to the decoy when one is configured, so a probe
+			// with a guessed session id sees a normal site instead of an auth
+			// error. The AuthRejected event is still emitted for telemetry.
+			if fallbackProxy != nil {
+				if ce := logger.Check(zap.DebugLevel, "🛡️ [HTTP] bad password or unauthorized, serving fallback camouflage"); ce != nil {
+					ce.Write(
+						zap.String("remote", r.RemoteAddr),
+						zap.Bool("signed", r.Header.Get(defaultNamer.name(slotAuthMAC)) != ""),
+					)
+				}
+				fallbackProxy.ServeHTTP(w, r)
+				return
+			}
+			w.Header().Set(defaultNamer.name(slotProto), strconv.Itoa(tunnelProtoVersion))
+			w.Header().Set(defaultNamer.name(slotPollTimeout), strconv.Itoa(int(st.longPollTimeout.Seconds())))
 			logger.Warn("❌ [HTTP] rejected request: bad password or unauthorized",
 				zap.String("remote", r.RemoteAddr),
 				zap.Bool("signed", r.Header.Get(defaultNamer.name(slotAuthMAC)) != ""),
@@ -1309,9 +1330,11 @@ type ServerConfig struct {
 	// fingerprint across restarts.
 	SelfSign   bool
 	SelfSignCN string
-	// Fallback redirects any request that misses Path to this URL, camou-
-	// flaging the endpoint as an ordinary website. Empty returns an nginx-
-	// style 404 instead.
+	// Fallback proxies any unauthorized request — a path that misses Path, a
+	// request with no session salt, or one that fails authentication — to this
+	// URL, camouflaging the endpoint as an ordinary website. Empty returns an
+	// nginx-style 404/400 instead. A properly authenticated tunnel client is
+	// never sent here.
 	Fallback string
 	// DefaultTarget is where sessions are bridged when the client does not
 	// request a specific target, in "tcp://host:port" form. Only used when

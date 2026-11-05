@@ -173,3 +173,102 @@ func TestScrubTunnelRequestNoBody(t *testing.T) {
 		t.Error("User-Agent must survive the scrub")
 	}
 }
+
+// TestFallbackServesMissingSaltOnTunnelPath locks in that an unauthorized
+// request landing on the tunnel path — here, no session salt at all — is
+// proxied to the decoy when one is configured, instead of being answered with a
+// bare 400. Before this, only a path mismatch triggered the fallback, so a
+// browser that hit the tunnel path saw a 400 rather than the camouflage site.
+func TestFallbackServesMissingSaltOnTunnelPath(t *testing.T) {
+	disguise := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("DISGUISE-SITE"))
+	}))
+	defer disguise.Close()
+
+	xl := &XHTTPListener{connCh: make(chan *XHTTPConn, 256), expectedToken: "test-token"}
+	h := buildSessionHandler(xl, newServerState(1), "/stream", "test-token", disguise.URL)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: h}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/stream")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (decoy)", resp.StatusCode)
+	}
+	if string(body) != "DISGUISE-SITE" {
+		t.Fatalf("body = %q, want the decoy site", string(body))
+	}
+}
+
+// TestNoFallbackReturns400OnTunnelPath is the counter-case: without a decoy, a
+// salt-less request on the tunnel path still gets the compact 400.
+func TestNoFallbackReturns400OnTunnelPath(t *testing.T) {
+	xl := &XHTTPListener{connCh: make(chan *XHTTPConn, 256), expectedToken: "test-token"}
+	h := buildSessionHandler(xl, newServerState(1), "/stream", "test-token", "")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: h}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/stream")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestFallbackServesBadAuthOnTunnelPath extends the policy to the auth failure
+// case: a request that carries a salt but fails authentication is also proxied
+// to the decoy, so a probe with a guessed session id sees a normal site rather
+// than an auth error.
+func TestFallbackServesBadAuthOnTunnelPath(t *testing.T) {
+	disguise := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("DISGUISE-SITE"))
+	}))
+	defer disguise.Close()
+
+	xl := &XHTTPListener{connCh: make(chan *XHTTPConn, 256), expectedToken: "test-token"}
+	h := buildSessionHandler(xl, newServerState(1), "/stream", "test-token", disguise.URL)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: h}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	// Salt present but no signed generation → authentication fails.
+	resp, err := http.Get("http://" + ln.Addr().String() + "/stream?s=some-made-up-id")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (decoy)", resp.StatusCode)
+	}
+	if string(body) != "DISGUISE-SITE" {
+		t.Fatalf("body = %q, want the decoy site", string(body))
+	}
+}
