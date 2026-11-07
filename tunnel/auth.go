@@ -36,34 +36,72 @@ const (
 	authNonceMaxEntries = 20000
 )
 
-// nonceWindow rejects nonces already seen within authNonceTTL. The check and
-// the record happen under one lock, so two concurrent requests sharing a nonce
-// cannot both pass: whichever grabs the lock first wins, the other sees the
-// entry and is refused.
+// nonceWindowShards splits the replay window into per-shard maps so
+// concurrent request handlers do not serialize on one mutex: at thousands of
+// authenticated requests per second, the single lock was a serial point on
+// the server's hottest path.
+const nonceWindowShards = 16
+
+// nonceWindow rejects nonces already seen within authNonceTTL. A nonce lands
+// in exactly one shard, where the check and the record happen under that
+// shard's lock: two concurrent requests sharing a nonce still cannot both
+// pass — whichever grabs the shard lock first wins, the other sees the entry
+// and is refused — while unrelated requests proceed in parallel.
 //
 // Size is bounded by authenticated request rate times the TTL, not by maxLen:
 // entries are only evictable once they expire, so a flood of unique nonces
 // with nothing expired yet cannot be shrunk. That is acceptable because a
-// nonce only enters the map after a valid signature, so growing it costs the
+// nonce only enters its shard after a valid signature, so growing it costs the
 // attacker a working PSK — which already means full access — and the operator
 // already caps authenticated concurrency with max_conns.
 type nonceWindow struct {
-	mu     sync.Mutex
-	ttl    time.Duration
-	seen   map[string]time.Time
-	maxLen int
+	ttl time.Duration
 	// now is the clock mark reads. Injectable so a test can step past the TTL
 	// without sleeping, and without relying on two calls being spaced by more
 	// than a nanosecond.
-	now func() time.Time
+	now    func() time.Time
+	shards [nonceWindowShards]nonceShard
+}
+
+// nonceShard is one shard of the replay window: a lock and the nonces seen
+// inside it, with the same growth-guard semantics the single map used to
+// have (maxLen is a sweep trigger, not a capacity limit).
+type nonceShard struct {
+	mu     sync.Mutex
+	seen   map[string]time.Time
+	maxLen int
 }
 
 func newNonceWindow() *nonceWindow {
-	return &nonceWindow{
-		ttl:    authNonceTTL,
-		seen:   make(map[string]time.Time),
-		maxLen: authNonceMaxEntries,
-		now:    time.Now,
+	w := &nonceWindow{
+		ttl: authNonceTTL,
+		now: time.Now,
+	}
+	for i := range w.shards {
+		w.shards[i].seen = make(map[string]time.Time)
+		w.shards[i].maxLen = authNonceMaxEntries / nonceWindowShards
+	}
+	return w
+}
+
+// nonceShardIndex maps a nonce to its shard. Authenticated nonces are 32 hex
+// characters (validAuthNonce rejects anything else before mark is reached),
+// so the first character is one of 16 hex digits — a uniform, allocation-free
+// shard key for a uniformly random nonce. Any other first character (tests,
+// embedders) falls back to the raw byte: that is a load-balancing choice
+// only, never a correctness one, since the mapping is stable either way.
+func nonceShardIndex(nonce string) int {
+	if nonce == "" {
+		return 0
+	}
+	c := nonce[0] | 0x20 // fold ASCII letters to lower case; digits unaffected
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	default:
+		return int(nonce[0]) % nonceWindowShards
 	}
 }
 
@@ -72,22 +110,23 @@ func newNonceWindow() *nonceWindow {
 // correct: outside the window a nonce has no replay meaning left.
 func (w *nonceWindow) mark(nonce string) bool {
 	now := w.now()
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if exp, ok := w.seen[nonce]; ok && now.Before(exp) {
+	s := &w.shards[nonceShardIndex(nonce)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if exp, ok := s.seen[nonce]; ok && now.Before(exp) {
 		return false
 	}
-	w.seen[nonce] = now.Add(w.ttl)
-	if len(w.seen) > w.maxLen {
-		w.sweepLocked(now)
+	s.seen[nonce] = now.Add(w.ttl)
+	if len(s.seen) > s.maxLen {
+		s.sweepLocked(now)
 	}
 	return true
 }
 
-func (w *nonceWindow) sweepLocked(now time.Time) {
-	for n, exp := range w.seen {
+func (s *nonceShard) sweepLocked(now time.Time) {
+	for n, exp := range s.seen {
 		if !now.Before(exp) {
-			delete(w.seen, n)
+			delete(s.seen, n)
 		}
 	}
 }

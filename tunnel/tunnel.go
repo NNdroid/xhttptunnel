@@ -338,6 +338,11 @@ type serverState struct {
 	// minProto rejects requests whose advertised X-Ver is below this
 	// (0 = accept everything, including legacy clients that send no header).
 	minProto int
+	// maxUploadsPerSession caps the concurrent poll request handlers one
+	// session may run (the admission check in buildSessionHandler). Resolved
+	// through pollWorkerLimit at construction, so the package default state —
+	// which never sees a ServerConfig — carries the default ceiling too.
+	maxUploadsPerSession int
 	// nonces absorbs replayed signed requests. It is shared by every handler
 	// of this server, which is what makes the replay window a property of the
 	// server rather than of one request goroutine.
@@ -433,13 +438,14 @@ func newServerState(maxSessions int) *serverState {
 		maxSessions = defaultMaxSessions
 	}
 	return &serverState{
-		sessions:    make(map[string]*meekVirtualConn),
-		perIP:       make(map[string]int),
-		maxSessions: maxSessions,
-		nonces:      newNonceWindow(),
-		brutalRates: make(map[uint64]uint64),
-		brutalConns: make(map[uint64]net.Conn),
-		stopCleaner: make(chan struct{}),
+		sessions:             make(map[string]*meekVirtualConn),
+		perIP:                make(map[string]int),
+		maxSessions:          maxSessions,
+		maxUploadsPerSession: maxPumpWorkers,
+		nonces:               newNonceWindow(),
+		brutalRates:          make(map[uint64]uint64),
+		brutalConns:          make(map[uint64]net.Conn),
+		stopCleaner:          make(chan struct{}),
 	}
 }
 

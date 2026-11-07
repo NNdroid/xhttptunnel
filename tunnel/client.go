@@ -98,9 +98,45 @@ const (
 	// it arrives instead of waiting for that long poll to come back. Only the
 	// long poll costs a request against the CDN.
 	minPumpWorkers = 2
-	// maxPumpWorkers caps concurrent polls for one busy session.
+	// maxPumpWorkers caps concurrent polls for one busy session. It is the
+	// default ceiling; ClientConfig.MaxPollWorkers raises it for
+	// bandwidth-delay products that 8 × chunk_size cannot cover.
 	maxPumpWorkers = 8
+	// maxPollWorkersLimit bounds an explicit MaxPollWorkers setting. Each
+	// worker is one in-flight POST against the CDN, so the ceiling keeps a
+	// misconfiguration from turning one session into a request storm.
+	maxPollWorkersLimit = 32
 )
+
+// pollWorkerLimit resolves the per-session poll-worker ceiling: 0 selects the
+// default, and an explicit value is clamped into the sane range. Hand-built
+// DialConfigs bypass NewClient's validation, so the clamp is what keeps a
+// bad value out of scaleUp even then.
+func pollWorkerLimit(n int) int {
+	switch {
+	case n <= 0:
+		return maxPumpWorkers
+	case n < minPumpWorkers:
+		return minPumpWorkers
+	case n > maxPollWorkersLimit:
+		return maxPollWorkersLimit
+	default:
+		return n
+	}
+}
+
+// ValidatePollWorkers checks a max_poll_workers setting without constructing
+// a Client or Server. 0 selects the default; explicit values are accepted in
+// the range the engine would clamp to.
+func ValidatePollWorkers(n int) error {
+	if n == 0 {
+		return nil
+	}
+	if n < minPumpWorkers || n > maxPollWorkersLimit {
+		return fmt.Errorf("max_poll_workers must be 0 or %d-%d", minPumpWorkers, maxPollWorkersLimit)
+	}
+	return nil
+}
 
 const (
 	// defaultMaxClientConns caps concurrent local connections per client
@@ -784,6 +820,15 @@ func buildTransport(protocol string, cfg *DialConfig, nextProtos []string, isTLS
 				// the next request errors out and the transport re-dials.
 				KeepAlivePeriod: 10 * time.Second,
 				MaxIdleTimeout:  15 * time.Second,
+				// Flow control: quic-go's defaults start the receive windows
+				// small and grow them by auto-tuning, which spends the first
+				// seconds of every high-bandwidth transfer below the path's
+				// capacity. Start at the scale the tunnel's own reliable-buffer
+				// window already assumes.
+				InitialStreamReceiveWindow:     quicInitialStreamReceiveWindow,
+				MaxStreamReceiveWindow:         quicMaxStreamReceiveWindow,
+				InitialConnectionReceiveWindow: quicInitialConnectionReceiveWindow,
+				MaxConnectionReceiveWindow:     quicMaxConnectionReceiveWindow,
 			},
 			Dial: cfg.QUICDial,
 		}
@@ -811,10 +856,14 @@ func buildTransport(protocol string, cfg *DialConfig, nextProtos []string, isTLS
 	}
 
 	logger.Debug("🚀 [Dialer] preparing HTTP/1.1 transport")
+	idle := cfg.MaxIdleConnsPerHost
+	if idle <= 0 {
+		idle = sharedMaxIdleConns
+	}
 	t1 := &http.Transport{
 		ForceAttemptHTTP2:   false,
-		MaxIdleConns:        sharedMaxIdleConns,
-		MaxIdleConnsPerHost: sharedMaxIdleConns,
+		MaxIdleConns:        idle,
+		MaxIdleConnsPerHost: idle,
 		DisableKeepAlives:   false,
 		IdleConnTimeout:     90 * time.Second,
 	}
@@ -915,6 +964,10 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 	if cfg.ChunkSizeKB != 0 {
 		uploadChunkSize = chunkSizeBytes(cfg.ChunkSizeKB)
 	}
+	// The per-session poll-worker ceiling. workers × chunk is the uplink's
+	// bandwidth-delay product in poll mode, so a high-BDP path needs this
+	// raised together with the server's max_poll_workers, which admits them.
+	maxWorkers := pollWorkerLimit(cfg.MaxPollWorkers)
 
 	pumpCtx, pumpCancel := context.WithCancel(ctx)
 	pumpDone := make(chan struct{})
@@ -1828,8 +1881,8 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 				if pending > uploadChunkSize {
 					want += int32(pending / uploadChunkSize)
 				}
-				if want > maxPumpWorkers {
-					want = maxPumpWorkers
+				if want > int32(maxWorkers) {
+					want = int32(maxWorkers)
 				}
 				for atomic.LoadInt32(&active) < want &&
 					!virtualConn.isClosed() && !virtualConn.closePending() {
@@ -1944,6 +1997,18 @@ type DialConfig struct {
 	// ChunkSizeKB caps each upstream HTTP request body for this session.
 	// Zero uses the package default configured by SetChunkSizeKB.
 	ChunkSizeKB int
+	// MaxPollWorkers caps the concurrent poll requests one session keeps in
+	// flight in long-poll (non-streaming) mode. 0 selects the default (8);
+	// explicit values are clamped to 2-32. Each worker is one in-flight POST
+	// against the CDN, so the ceiling times the chunk size is the per-session
+	// uplink's bandwidth-delay product; raise it together with the server's
+	// max_poll_workers, which admits them.
+	MaxPollWorkers int
+	// MaxIdleConnsPerHost overrides the shared HTTP/1.1 transport's idle
+	// keep-alive socket pool per endpoint. 0 selects the default (512).
+	// Sessions share one transport per endpoint, so a value below the
+	// concurrent-request peak causes connection churn and TLS handshakes.
+	MaxIdleConnsPerHost int
 	// StreamMode selects the downlink transport: "" or "auto" runs the
 	// three-layer negotiation (capability header + TTFB path probe + stall
 	// watchdog, cached per endpoint), "poll" forces the legacy long-poll mode,
@@ -2062,6 +2127,15 @@ type ClientConfig struct {
 	// ChunkSizeKB caps each upstream HTTP request body for this client.
 	// Zero uses the package default configured by SetChunkSizeKB.
 	ChunkSizeKB int
+	// MaxPollWorkers caps the concurrent poll requests one session keeps in
+	// flight in long-poll mode (0 = default 8, clamped 2-32). See
+	// DialConfig.MaxPollWorkers; the server's MaxUploadsPerSession must admit
+	// what this produces.
+	MaxPollWorkers int
+	// MaxIdleConnsPerHost overrides the shared HTTP/1.1 transport's idle
+	// keep-alive socket pool per endpoint (0 = default 512). See
+	// DialConfig.MaxIdleConnsPerHost.
+	MaxIdleConnsPerHost int
 	// Padding sets the frame padding rule for traffic this process emits, in
 	// the syntax documented on SetPadding ("400-600", "23:120-200,400:400-600",
 	// "off"). Empty leaves the process policy alone, and restating the rule in
@@ -2149,6 +2223,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := cfg.Brutal.Validate("client"); err != nil {
 		return nil, err
 	}
+	if err := ValidatePollWorkers(cfg.MaxPollWorkers); err != nil {
+		return nil, err
+	}
 	if err := installDeclaredPadding("client", cfg.Padding); err != nil {
 		return nil, err
 	}
@@ -2209,6 +2286,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		QUICDial:               cfg.QUICDial,
 		TransportKey:           transportKey,
 		ChunkSizeKB:            cfg.ChunkSizeKB,
+		MaxPollWorkers:         cfg.MaxPollWorkers,
+		MaxIdleConnsPerHost:    cfg.MaxIdleConnsPerHost,
 		StreamMode:             cfg.StreamMode,
 		Brutal:                 cfg.Brutal,
 		bwRateFn:               func() uint64 { return c.bwNegotiated.Load() },
@@ -2715,7 +2794,12 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 
 			go func() {
 				defer closeBoth()
-				buf := make([]byte, 32*1024)
+				// A pooled 64 KB buffer rather than a per-connection 32 KB
+				// allocation: fewer ring writes and frame headers per byte on
+				// the uplink, at memory the pool bounds by concurrency.
+				upBufPtr := relayBufPool.Get().(*[]byte)
+				defer relayBufPool.Put(upBufPtr)
+				buf := *upBufPtr
 				// Local error variable: the downlink below owns the
 				// outer `err`, and both run concurrently.
 				var upErr error
@@ -2746,7 +2830,9 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 				}
 			}()
 
-			downN, downErr := io.Copy(&idleRefresher{Conn: clientConn, idle: c.idleTimeout}, xc)
+			downBufPtr := relayBufPool.Get().(*[]byte)
+			downN, downErr := io.CopyBuffer(&idleRefresher{Conn: clientConn, idle: c.idleTimeout}, xc, *downBufPtr)
+			relayBufPool.Put(downBufPtr)
 			if downErr != nil && downErr != io.EOF {
 				logger.Debug("⚠️ [TCP] downlink relay (server->local) ended abnormally", zap.String("id", connID), zap.Int64("bytes", downN), zap.Error(downErr))
 			} else {

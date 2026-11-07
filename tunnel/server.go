@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	quic "github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2"
@@ -44,6 +45,31 @@ const (
 	// by a wide margin so a merely quiet tunnel is never mistaken for a dead
 	// one.
 	sessionIdleTimeout = 120 * time.Second
+
+	// h2UploadBufferPerStream/PerConnection raise the HTTP/2 receive windows
+	// the library would otherwise default to 1 MB each. A poll session keeps
+	// up to max_poll_workers request bodies in flight on one connection, so
+	// the connection-level window is what bounds the uplink's
+	// bandwidth-delay product; 4 MB clears the largest permitted chunk
+	// (900 KB) with headroom at both the stream and the connection level.
+	// net/http's HTTP2Config validates the windows to <4 MiB, so the value
+	// sits just under; the h2c path (x/net/http2.Server) accepts the same
+	// numbers through its MaxUploadBuffer* fields.
+	h2UploadBufferPerStream     = 4<<20 - 1
+	h2UploadBufferPerConnection = 4<<20 - 1
+)
+
+// QUIC/HTTP3 flow-control windows. quic-go's defaults start the receive
+// windows small and grow them by auto-tuning, which spends the first seconds
+// of every high-bandwidth transfer below the path's capacity; these start at
+// the scale the tunnel's own reliable-buffer window already assumes. Both
+// ends set them: the client transport on dials and the server on its HTTP/3
+// socket.
+const (
+	quicInitialStreamReceiveWindow     = 4 << 20
+	quicMaxStreamReceiveWindow         = 16 << 20
+	quicInitialConnectionReceiveWindow = 8 << 20
+	quicMaxConnectionReceiveWindow     = 32 << 20
 )
 
 type XHTTPListener struct {
@@ -729,8 +755,10 @@ func buildSessionHandler(xl *XHTTPListener, st *serverState, path, token, fallba
 		}
 
 		// Bound poll request payloads/goroutines as well as the shared receive
-		// window. The client uses at most eight concurrent poll workers.
-		if vConn.uploads.Add(1) > 8 {
+		// window. The client's max_poll_workers is what produces these; this
+		// ceiling must admit what a matching client sends (both ends are
+		// raised together, the way chunk_size_kb is).
+		if vConn.uploads.Add(1) > int32(st.maxUploadsPerSession) {
 			vConn.uploads.Add(-1)
 			nginxError(w, http.StatusTooManyRequests)
 			return
@@ -1169,6 +1197,16 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		// so parked requests are not cut off mid-flight.
 		ReadTimeout:  120 * time.Second,
 		WriteTimeout: 120 * time.Second,
+		// HTTP/2 receive windows. ServeTLS uses this config for the automatic
+		// h2 upgrade; the library's defaults (1 MB per stream and per
+		// connection) would throttle a poll session's concurrent request
+		// bodies — up to max_poll_workers × chunk_size_kb in flight on one
+		// connection. The h2c path below carries the same settings through
+		// x/net/http2's own config type.
+		HTTP2: &http.HTTP2Config{
+			MaxReceiveBufferPerStream:     h2UploadBufferPerStream,
+			MaxReceiveBufferPerConnection: h2UploadBufferPerConnection,
+		},
 	}
 
 	var (
@@ -1227,6 +1265,16 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 				Addr:      xl.uln.LocalAddr().String(),
 				Handler:   handler,
 				TLSConfig: tlsConfig.Clone(),
+				// Flow-control windows: quic-go's defaults start small and
+				// auto-tune upward, which costs real throughput at the start
+				// of every high-bandwidth transfer. The client sets the same
+				// scale on its transport.
+				QUICConfig: &quic.Config{
+					InitialStreamReceiveWindow:     quicInitialStreamReceiveWindow,
+					MaxStreamReceiveWindow:         quicMaxStreamReceiveWindow,
+					InitialConnectionReceiveWindow: quicInitialConnectionReceiveWindow,
+					MaxConnectionReceiveWindow:     quicMaxConnectionReceiveWindow,
+				},
 			}
 		}
 
@@ -1271,7 +1319,13 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 		}
 
 	} else {
-		server.Handler = h2c.NewHandler(handler, &http2.Server{IdleTimeout: 1 * time.Hour})
+		server.Handler = h2c.NewHandler(handler, &http2.Server{
+			IdleTimeout: 1 * time.Hour,
+			// Same receive windows as the TLS path above: a poll session's
+			// concurrent request bodies share the connection-level window.
+			MaxUploadBufferPerStream:     h2UploadBufferPerStream,
+			MaxUploadBufferPerConnection: h2UploadBufferPerConnection,
+		})
 
 		wg.Add(1)
 		go func() {
@@ -1377,6 +1431,13 @@ type ServerConfig struct {
 	// generation. 0 (default) accepts every client, including legacy ones that
 	// send no header.
 	MinProtoVersion int
+	// MaxUploadsPerSession caps the concurrent poll requests one session may
+	// keep in flight (each is an admitted request handler with a bounded
+	// body). 0 selects the default (8); explicit values are clamped to 2-32.
+	// Raise it together with the client's max_poll_workers, which produces
+	// them — workers × chunk_size_kb is the per-session uplink's
+	// bandwidth-delay product in poll mode.
+	MaxUploadsPerSession int
 	// Padding sets the frame padding rule for traffic this process emits, in
 	// the syntax documented on SetPadding ("400-600", "23:120-200,400:400-600",
 	// "off"). Empty leaves the process policy alone, and restating the rule in
@@ -1480,6 +1541,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err := installDeclaredPadding("server", cfg.Padding); err != nil {
 		return nil, err
 	}
+	if err := ValidatePollWorkers(cfg.MaxUploadsPerSession); err != nil {
+		return nil, err
+	}
 
 	certFile, keyFile := cfg.CertFile, cfg.KeyFile
 	var certDir string
@@ -1517,6 +1581,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	state.trustProxy.Store(cfg.TrustProxyHeaders)
 	state.maxPerIP = cfg.MaxSessionsPerIP
 	state.minProto = cfg.MinProtoVersion
+	state.maxUploadsPerSession = pollWorkerLimit(cfg.MaxUploadsPerSession)
 	state.healthPath = cfg.HealthPath
 	state.corsOrigin = cfg.CORSOrigin
 	state.brutalCfg = cfg.Brutal
@@ -1810,7 +1875,13 @@ func (s *Server) bridge(xc *XHTTPConn) {
 
 		go func() {
 			defer closeTarget()
-			n, err := io.Copy(targetConn, xc)
+			// Pooled 64 KB copy buffers rather than io.Copy's 32 KB default:
+			// fewer frame headers and ring locks per byte on the tunnel's
+			// busiest path. onlyWriter hides the TCP conn's ReaderFrom, which
+			// would silently ignore the caller's buffer.
+			upBufPtr := relayBufPool.Get().(*[]byte)
+			n, err := io.CopyBuffer(onlyWriter{targetConn}, xc, *upBufPtr)
+			relayBufPool.Put(upBufPtr)
 			if err != nil && err != io.EOF {
 				logger.Debug("⚠️ TCP uplink (Client->Target) ended with error", zap.String("id", connID), zap.Int64("bytes", n), zap.Error(err))
 			} else {
@@ -1824,7 +1895,9 @@ func (s *Server) bridge(xc *XHTTPConn) {
 			}
 		}()
 
-		n, err := io.Copy(xc, targetConn)
+		downBufPtr := relayBufPool.Get().(*[]byte)
+		n, err := io.CopyBuffer(xc, targetConn, *downBufPtr)
+		relayBufPool.Put(downBufPtr)
 		if err != nil && err != io.EOF {
 			logger.Debug("⚠️ TCP downlink (Target->Client) ended with error", zap.String("id", connID), zap.Int64("bytes", n), zap.Error(err))
 		} else {

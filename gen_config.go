@@ -72,11 +72,13 @@ type genSpec struct {
 	HealthPath       string
 	MinProtoVersion  int
 	ChunkSizeKB      int
+	MaxPollWorkers   int
 	Padding          string
 	WindowSizeMB     int
 	BufferBudgetMB   int
 	MaxConns         int
 	IdleTimeout      int
+	MaxIdleConns     int
 	// "loopback", "all", or a comma-separated list of host:port / :port /
 	// host: / [host] / *, each optionally prefixed tcp:// or udp://.
 	AllowedTargets string
@@ -202,35 +204,37 @@ func (s *genSpec) build() (*FileConfig, error) {
 	}
 
 	cfg := &FileConfig{
-		Mode:              mode,
-		Listen:            s.Listen,
-		Path:              s.Path,
-		ServerURL:         s.Server,
-		Target:            s.Target,
-		SelfSign:          s.SelfSign,
-		SelfSignCN:        s.SelfSignCN,
-		Cert:              s.Cert,
-		Key:               s.Key,
-		Fallback:          s.Fallback,
-		SNI:               s.SNI,
-		Host:              s.Host,
-		ALPN:              s.ALPN,
-		StreamMode:        s.StreamMode,
-		Fingerprint:       s.Fingerprint,
-		LogLevel:          s.LogLevel,
-		Dump:              s.Dump,
-		MaxSessions:       s.MaxSessions,
-		MaxSessionsPerIP:  s.MaxSessionsPerIP,
-		HealthPath:        s.HealthPath,
-		MinProtoVersion:   s.MinProtoVersion,
-		ChunkSizeKB:       s.ChunkSizeKB,
-		Padding:           s.Padding,
-		WindowSizeMB:      s.WindowSizeMB,
-		BufferBudgetMB:    s.BufferBudgetMB,
-		MaxConns:          s.MaxConns,
-		IdleTimeout:       s.IdleTimeout,
-		TrustProxyHeaders: s.TrustProxy,
-		Brutal:            s.brutal(),
+		Mode:                mode,
+		Listen:              s.Listen,
+		Path:                s.Path,
+		ServerURL:           s.Server,
+		Target:              s.Target,
+		SelfSign:            s.SelfSign,
+		SelfSignCN:          s.SelfSignCN,
+		Cert:                s.Cert,
+		Key:                 s.Key,
+		Fallback:            s.Fallback,
+		SNI:                 s.SNI,
+		Host:                s.Host,
+		ALPN:                s.ALPN,
+		StreamMode:          s.StreamMode,
+		Fingerprint:         s.Fingerprint,
+		LogLevel:            s.LogLevel,
+		Dump:                s.Dump,
+		MaxSessions:         s.MaxSessions,
+		MaxSessionsPerIP:    s.MaxSessionsPerIP,
+		HealthPath:          s.HealthPath,
+		MinProtoVersion:     s.MinProtoVersion,
+		ChunkSizeKB:         s.ChunkSizeKB,
+		MaxPollWorkers:      s.MaxPollWorkers,
+		Padding:             s.Padding,
+		WindowSizeMB:        s.WindowSizeMB,
+		BufferBudgetMB:      s.BufferBudgetMB,
+		MaxConns:            s.MaxConns,
+		IdleTimeout:         s.IdleTimeout,
+		MaxIdleConnsPerHost: s.MaxIdleConns,
+		TrustProxyHeaders:   s.TrustProxy,
+		Brutal:              s.brutal(),
 	}
 
 	psk, err := s.resolvePSK(mode)
@@ -442,6 +446,9 @@ func checkConfig(cfg *FileConfig, explicitPSK bool) *configCheck {
 	if cfg.ChunkSizeKB != 0 && (cfg.ChunkSizeKB < 16 || cfg.ChunkSizeKB > 900) {
 		c.fail("chunk_size_kb %d must be 0 or 16-900; the engine clamps to that range, so raising the ceiling means raising it on BOTH ends", cfg.ChunkSizeKB)
 	}
+	if err := tunnel.ValidatePollWorkers(cfg.MaxPollWorkers); err != nil {
+		c.fail("%s", err)
+	}
 	if err := tunnel.ValidatePadding(cfg.Padding); err != nil {
 		c.fail("%s", err)
 	}
@@ -458,11 +465,12 @@ func checkConfig(cfg *FileConfig, explicitPSK bool) *configCheck {
 		c.warn("brutal is enabled but alpn is h3: HTTP/3 tunnels run over QUIC/UDP and TCP Brutal only caps TCP sockets, so the setting will have no effect")
 	}
 	for name, v := range map[string]int{
-		"max_sessions":        cfg.MaxSessions,
-		"max_sessions_per_ip": cfg.MaxSessionsPerIP,
-		"max_conns":           cfg.MaxConns,
-		"idle_timeout":        cfg.IdleTimeout,
-		"min_proto_version":   cfg.MinProtoVersion,
+		"max_sessions":            cfg.MaxSessions,
+		"max_sessions_per_ip":     cfg.MaxSessionsPerIP,
+		"max_conns":               cfg.MaxConns,
+		"idle_timeout":            cfg.IdleTimeout,
+		"min_proto_version":       cfg.MinProtoVersion,
+		"max_idle_conns_per_host": cfg.MaxIdleConnsPerHost,
 	} {
 		if v < 0 {
 			c.fail("%s must be >= 0", name)
@@ -687,6 +695,7 @@ func renderServerConfig(cfg *FileConfig, withDocs bool) ([]byte, error) {
 		jsonLine{key: "health_path", val: cfg.HealthPath},
 		jsonLine{key: "min_proto_version", val: cfg.MinProtoVersion},
 		jsonLine{key: "chunk_size_kb", val: cfg.ChunkSizeKB},
+		jsonLine{key: "max_poll_workers", val: cfg.MaxPollWorkers},
 		jsonLine{key: "padding", val: cfg.Padding},
 		jsonLine{key: "trust_proxy_headers", val: cfg.TrustProxyHeaders},
 		jsonLine{key: "brutal", val: cfg.Brutal},
@@ -719,9 +728,11 @@ func renderClientConfig(cfg *FileConfig, withDocs bool) ([]byte, error) {
 		jsonLine{key: "cert", val: cfg.Cert},
 		jsonLine{key: "key", val: cfg.Key},
 		jsonLine{key: "chunk_size_kb", val: cfg.ChunkSizeKB},
+		jsonLine{key: "max_poll_workers", val: cfg.MaxPollWorkers},
 		jsonLine{key: "padding", val: cfg.Padding},
 		jsonLine{key: "idle_timeout", val: cfg.IdleTimeout},
 		jsonLine{key: "max_conns", val: cfg.MaxConns},
+		jsonLine{key: "max_idle_conns_per_host", val: cfg.MaxIdleConnsPerHost},
 		jsonLine{key: "brutal", val: cfg.Brutal},
 		jsonLine{key: "dump", val: cfg.Dump},
 		jsonLine{key: "log_level", val: cfg.LogLevel},
@@ -760,6 +771,7 @@ func serverFieldDocs() []stringDoc {
 		{"min_proto_version", "Reject (HTTP 426) clients advertising an X-Ver below this. 0 (default) accepts all clients, including legacy header-less ones. Set 2 to force the signed-nonce scheme: a client advertising v2 is admitted only by signature, which closes the bare-token fallback."},
 		{"window_size_mb", "Reliable send window per session in MiB (0 = 8; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
 		{"chunk_size_kb", "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must be raised on BOTH ends together."},
+		{"max_poll_workers", "Caps the concurrent poll requests one session keeps in flight in long-poll mode (0 = default 8, clamped 2-32). Each worker is one in-flight POST, so the ceiling times chunk_size_kb is the per-session uplink's bandwidth-delay product. The client spawns them and this server admits them, so raise on BOTH ends together. Streaming downlink sessions are not affected."},
 		{"padding", paddingFieldDoc},
 		{"trust_proxy_headers", "Honour CF-Connecting-IP / X-Forwarded-For / X-Real-IP for client-address logging. Those headers are spoofable; enable only behind a trusted proxy that strips them."},
 		{"brutal", "TCP Brutal (Linux kernel module only; inert on other platforms). Caps the send rate of this server's TCP tunnel sockets in bytes/s. The HTTP/3 socket is never affected. Nested object: enabled (default false; off means setsockopt is never called), rate (bytes/s; 0 is illegal unless bw_exchange supplies one), cwnd_gain (tenths, so 20 = 2.0x; 0 = default 20, max 100), group_id (0 = per-connection only), group_from_remote (derive the group from the peer's address instead of group_id; a static group_id on a server pools every client into one aggregate ceiling), bw_exchange (accept the _BrutalBwExchange protocol), bw_advertise (bytes/s this server can ingest; the peer applies it as its own send rate), bw_interval (seconds between exchange attempts, default 60). Exchange requests are authenticated but do not count against max_sessions. A socket failure never breaks a tunnel: the connection continues uncapped and the failure is logged once."},
@@ -784,9 +796,11 @@ func clientFieldDocs() []stringDoc {
 		{"key", "Optional path to the server's TLS private key. Not used by the client at all."},
 		{"window_size_mb", "Reliable send window per session in MiB (0 = 8; explicit 1-64). Does not need to match the peer. Size from bandwidth times RTT."},
 		{"chunk_size_kb", "Caps the upstream payload carried by one poll request (clamped 16-900, default 256). Must match the server value; raise on BOTH ends together."},
+		{"max_poll_workers", "Caps the concurrent poll requests one session keeps in flight in long-poll mode (0 = default 8, clamped 2-32). Each worker is one in-flight POST, so the ceiling times chunk_size_kb is the per-session uplink's bandwidth-delay product. This client spawns them and the server admits them, so raise on BOTH ends together. Streaming downlink sessions are not affected."},
 		{"padding", paddingFieldDoc},
 		{"idle_timeout", "Drop a local connection after this many seconds without traffic (default 900). Idle SSH sessions need a keepalive below it."},
 		{"max_conns", "Maximum concurrent client connections allowed (0 = default 2000)"},
+		{"max_idle_conns_per_host", "Idle keep-alive sockets the shared HTTP/1.1 transport pools per endpoint (0 = default 512). Sessions share one transport, so a value below the concurrent-request peak causes connection churn and fresh TLS handshakes. Only read when alpn is h1."},
 		{"brutal", "TCP Brutal (Linux kernel module only; inert on other platforms). Caps the send rate of this client's TCP tunnel sockets in bytes/s. HTTP/3 tunnels run over QUIC/UDP and are never capped. Nested object: enabled (default false; off means setsockopt is never called), rate (bytes/s ceiling; 0 is illegal unless bw_exchange supplies one), cwnd_gain (tenths, so 20 = 2.0x; 0 = default 20, max 100), group_id (0 = per-connection only), bw_exchange (enable the _BrutalBwExchange protocol), bw_advertise (bytes/s this client can ingest; the server applies it as its own send rate), bw_interval (seconds between exchange attempts, default 60). The rate is a ceiling: the exchange can only lower it. A socket failure never breaks a tunnel: the connection continues uncapped and the failure is logged once."},
 		{"dump", "Dump raw packet hex data in logs for low-level debugging"},
 		{"log_level", "Logging verbosity: debug, info, warn, error"},
@@ -867,6 +881,8 @@ func bindGenConfigFlags(cmd *flag.FlagSet, s *genSpec) {
 	cmd.StringVar(&s.HealthPath, "health-path", "", "Unauthenticated stats path on the tunnel listener; empty disables it")
 	cmd.IntVar(&s.MinProtoVersion, "min-proto-version", 0, "Reject clients advertising an older X-Ver (0 = accept all)")
 	cmd.IntVar(&s.ChunkSizeKB, "chunk-size-kb", 0, "Upstream payload per poll request, 16-900 (0 = 256)")
+	cmd.IntVar(&s.MaxPollWorkers, "max-poll-workers", 0, "Concurrent poll requests per session, 2-32 (0 = 8); raise on BOTH ends together")
+	cmd.IntVar(&s.MaxIdleConns, "max-idle-conns-per-host", 0, "Client h1 idle keep-alive sockets per endpoint (0 = 512)")
 	cmd.StringVar(&s.Padding, "padding", "", `Frame padding rule: "off", "MIN-MAX" or "BELOW:MIN-MAX" bands (default 400-600)`)
 	cmd.IntVar(&s.WindowSizeMB, "window-size-mb", 0, "Reliable send window per session in MiB, 1-64 (0 = 8)")
 	cmd.IntVar(&s.BufferBudgetMB, "buffer-budget-mb", 0, "Server admission budget for tunnel buffers in MiB (0 = disabled)")

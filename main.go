@@ -100,6 +100,18 @@ type FileConfig struct {
 	// default (256) leaves headroom under the 1MB body limit that nginx and
 	// many CDN/WAF tiers enforce. Must be raised on BOTH ends together.
 	ChunkSizeKB int `json:"chunk_size_kb"`
+	// MaxPollWorkers caps the concurrent poll requests one session keeps in
+	// flight in long-poll mode (0 = default 8, clamped 2-32). Each worker is
+	// one in-flight POST, so the ceiling × chunk_size_kb is the per-session
+	// bandwidth-delay product in poll mode. On the client it is how many the
+	// pump may spawn; on the server it is how many per session are admitted.
+	// Raise on BOTH ends together.
+	MaxPollWorkers int `json:"max_poll_workers"`
+	// MaxIdleConnsPerHost (client) overrides the shared HTTP/1.1 transport's
+	// idle keep-alive socket pool per endpoint (0 = default 512). A value
+	// below the concurrent-request peak causes connection churn and fresh
+	// TLS handshakes.
+	MaxIdleConnsPerHost int `json:"max_idle_conns_per_host"`
 	// Padding is the frame padding rule for outgoing traffic, e.g. "400-600"
 	// (payloads under 400 bytes are padded up into 400..600, longer ones are
 	// sent as they are), "off", or an ordered band list. Each side pads only
@@ -577,19 +589,21 @@ func resolveConfig(args []string) (*FileConfig, string) {
 // the blocking local forwarder. It exits the process on startup failure.
 func startClient(ctx context.Context, cfg *FileConfig) {
 	c, err := tunnel.NewClient(tunnel.ClientConfig{
-		ServerURL:    cfg.ServerURL,
-		PSK:          cfg.PSK,
-		SNI:          cfg.SNI,
-		Host:         cfg.Host,
-		ALPN:         cfg.ALPN,
-		Fingerprint:  cfg.Fingerprint,
-		Target:       cfg.Target,
-		MaxConns:     cfg.MaxConns,
-		IdleTimeout:  time.Duration(cfg.IdleTimeout) * time.Second,
-		StreamMode:   cfg.StreamMode,
-		WindowSizeMB: cfg.WindowSizeMB,
-		Dump:         cfg.Dump,
-		Brutal:       cfg.Brutal,
+		ServerURL:           cfg.ServerURL,
+		PSK:                 cfg.PSK,
+		SNI:                 cfg.SNI,
+		Host:                cfg.Host,
+		ALPN:                cfg.ALPN,
+		Fingerprint:         cfg.Fingerprint,
+		Target:              cfg.Target,
+		MaxConns:            cfg.MaxConns,
+		IdleTimeout:         time.Duration(cfg.IdleTimeout) * time.Second,
+		StreamMode:          cfg.StreamMode,
+		WindowSizeMB:        cfg.WindowSizeMB,
+		MaxPollWorkers:      cfg.MaxPollWorkers,
+		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
+		Dump:                cfg.Dump,
+		Brutal:              cfg.Brutal,
 	})
 	if err != nil {
 		logger.Fatal("❌ client failed to start", zap.Error(err))
@@ -603,23 +617,24 @@ func startClient(ctx context.Context, cfg *FileConfig) {
 // the blocking accept/bridge loop. It exits the process on startup failure.
 func startServer(ctx context.Context, cfg *FileConfig) {
 	s, err := tunnel.NewServer(tunnel.ServerConfig{
-		Listen:            cfg.Listen,
-		Path:              cfg.Path,
-		PSK:               cfg.PSK,
-		CertFile:          cfg.Cert,
-		KeyFile:           cfg.Key,
-		Fallback:          cfg.Fallback,
-		DefaultTarget:     cfg.Target,
-		AllowedTargets:    cfg.AllowedTargets,
-		TrustProxyHeaders: cfg.TrustProxyHeaders,
-		MaxSessions:       cfg.MaxSessions,
-		WindowSizeMB:      cfg.WindowSizeMB,
-		BufferBudgetMB:    cfg.BufferBudgetMB,
-		MaxSessionsPerIP:  cfg.MaxSessionsPerIP,
-		HealthPath:        cfg.HealthPath,
-		MinProtoVersion:   cfg.MinProtoVersion,
-		Dump:              cfg.Dump,
-		Brutal:            cfg.Brutal,
+		Listen:               cfg.Listen,
+		Path:                 cfg.Path,
+		PSK:                  cfg.PSK,
+		CertFile:             cfg.Cert,
+		KeyFile:              cfg.Key,
+		Fallback:             cfg.Fallback,
+		DefaultTarget:        cfg.Target,
+		AllowedTargets:       cfg.AllowedTargets,
+		TrustProxyHeaders:    cfg.TrustProxyHeaders,
+		MaxSessions:          cfg.MaxSessions,
+		WindowSizeMB:         cfg.WindowSizeMB,
+		BufferBudgetMB:       cfg.BufferBudgetMB,
+		MaxSessionsPerIP:     cfg.MaxSessionsPerIP,
+		HealthPath:           cfg.HealthPath,
+		MinProtoVersion:      cfg.MinProtoVersion,
+		MaxUploadsPerSession: cfg.MaxPollWorkers,
+		Dump:                 cfg.Dump,
+		Brutal:               cfg.Brutal,
 	})
 	if err != nil {
 		logger.Fatal("❌ server failed to start", zap.Error(err))

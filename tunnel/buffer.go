@@ -60,10 +60,14 @@ var (
 	// pooled request bodies. Keep the hot-path read lock-free and race-free.
 	maxsendBufSize atomic.Int64
 
-	// sendBuf: sized to fit GetSlice's max request length
+	// sendBuf: sized to fit GetSlice's max request length. The chunk — not
+	// currentMaxFrameSize — is the right scale: GetSlice never hands out a
+	// frame header, so the frame padding budget in the frame size was pure
+	// slack in every pooled slot. bufferReservation stays on the frame scale
+	// and still covers this pool with room to spare.
 	sendBuf = sync.Pool{
 		New: func() interface{} {
-			b := make([]byte, currentMaxFrameSize())
+			b := make([]byte, currentMaxSendBufSize())
 			return &b
 		},
 	}
@@ -73,7 +77,29 @@ var (
 			return new(bytes.Buffer)
 		},
 	}
+
+	// relayCopyBufferSize is the bulk copy granularity of the local forwarder
+	// and the server target bridge. Above io.Copy's 32 KB default: fewer ring
+	// writes, frame headers and lock round trips per byte, at a memory cost
+	// the pool bounds by concurrency rather than by session count.
+	relayCopyBufferSize = 64 * 1024
 )
+
+// relayBufPool recycles the bulk copy buffers used by the client's local
+// forwarder and the server's target bridge. Pooled rather than allocated per
+// connection: a high-concurrency deployment would otherwise pin one large
+// buffer per session on both sides of the tunnel.
+var relayBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, relayCopyBufferSize)
+		return &b
+	},
+}
+
+// onlyWriter hides everything but Write from io.CopyBuffer: a *net.TCPConn
+// destination would take its ReaderFrom path and silently ignore the caller's
+// buffer, falling back to io.Copy's own 32 KB pool.
+type onlyWriter struct{ io.Writer }
 
 func init() {
 	maxsendBufSize.Store(defaultChunkSize)
@@ -187,23 +213,118 @@ func (rb *reliableBuffer) Write(p []byte) (int, error) {
 			toWrite = avail
 		}
 
-		firstPart := rb.maxSize - rb.head
-		if toWrite <= firstPart {
-			copy(rb.buf[rb.head:], p[written:written+toWrite])
-			rb.head += toWrite
-			if rb.head == rb.maxSize {
-				rb.head = 0
-			}
-		} else {
-			copy(rb.buf[rb.head:], p[written:written+firstPart])
-			copy(rb.buf[0:], p[written+firstPart:written+toWrite])
-			rb.head = toWrite - firstPart
-		}
+		rb.copyInLocked(p[written : written+toWrite])
 
-		rb.count += toWrite
 		written += toWrite
 		// Publish each batch before waiting for space. A Write larger than
 		// the window must let the dispatcher drain its first batch.
+		rb.signalLocked()
+	}
+
+	return written, nil
+}
+
+// copyInLocked appends p at the write cursor, wrapping the ring as needed.
+// Caller must hold rb.mu and have already checked that rb.count+len(p) fits.
+func (rb *reliableBuffer) copyInLocked(p []byte) {
+	firstPart := rb.maxSize - rb.head
+	if len(p) <= firstPart {
+		copy(rb.buf[rb.head:], p)
+		rb.head += len(p)
+		if rb.head == rb.maxSize {
+			rb.head = 0
+		}
+	} else {
+		copy(rb.buf[rb.head:], p[:firstPart])
+		copy(rb.buf[0:], p[firstPart:])
+		rb.head = len(p) - firstPart
+	}
+	rb.count += len(p)
+}
+
+// Write2 enqueues two segments as one batch: the bytes land contiguously in
+// the ring under a single lock acquisition, with the same per-batch
+// atomicity, backpressure and deadline semantics as Write. A writer that
+// prefixes every payload with a fixed header — the frame layer's six-byte
+// prefix — uses this instead of copying header and payload into an
+// intermediate full-frame buffer first, which is one bulk memcpy fewer per
+// frame on the downlink, where every byte the tunnel carries passes through.
+//
+// A close or deadline partway through returns after the batches that did
+// land, exactly like Write: a frame split by a deadline leaves the peer's
+// parser awaiting a suffix the next call cannot reconstruct, so the caller's
+// framing has to treat a short return the same way Write's callers already
+// do.
+func (rb *reliableBuffer) Write2(a, b []byte) (int, error) {
+	total := len(a) + len(b)
+	if total == 0 {
+		return 0, nil
+	}
+
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if rb.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if deadlineExpired(rb.writeDeadline) {
+		return 0, os.ErrDeadlineExceeded
+	}
+	if rb.buf == nil {
+		rb.buf = make([]byte, rb.maxSize)
+	}
+
+	written := 0
+	// A batch that fits in the window is enqueued atomically, so a deadline
+	// can never split the frame the header belongs to.
+	if total <= rb.maxSize {
+		for rb.maxSize-rb.count < total {
+			rb.cond.Wait()
+			if rb.closed {
+				return 0, io.ErrClosedPipe
+			}
+			if deadlineExpired(rb.writeDeadline) {
+				return 0, os.ErrDeadlineExceeded
+			}
+		}
+	}
+
+	for written < total {
+		if written > 0 {
+			if rb.closed {
+				return written, io.ErrClosedPipe
+			}
+			if deadlineExpired(rb.writeDeadline) {
+				return written, os.ErrDeadlineExceeded
+			}
+		}
+		for rb.count >= rb.maxSize {
+			rb.cond.Wait()
+			if rb.closed {
+				return written, io.ErrClosedPipe
+			}
+			if deadlineExpired(rb.writeDeadline) {
+				return written, os.ErrDeadlineExceeded
+			}
+		}
+
+		avail := rb.maxSize - rb.count
+		toWrite := total - written
+		if toWrite > avail {
+			toWrite = avail
+		}
+
+		// Copy toWrite bytes from logical offset `written` of a||b.
+		if written >= len(a) {
+			off := written - len(a)
+			rb.copyInLocked(b[off : off+toWrite])
+		} else if written+toWrite <= len(a) {
+			rb.copyInLocked(a[written : written+toWrite])
+		} else {
+			rb.copyInLocked(a[written:])
+			rb.copyInLocked(b[:toWrite-(len(a)-written)])
+		}
+
+		written += toWrite
 		rb.signalLocked()
 	}
 
@@ -726,6 +847,16 @@ func (c *meekVirtualConn) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	return c.writeBuf.Write(p)
+}
+
+// Write2 enqueues a header and its payload as one batch in the reliable
+// buffer — see reliableBuffer.Write2 for the why and for the short-return
+// semantics. The close check mirrors Write.
+func (c *meekVirtualConn) Write2(a, b []byte) (int, error) {
+	if c.isClosed() {
+		return 0, io.ErrClosedPipe
+	}
+	return c.writeBuf.Write2(a, b)
 }
 
 // PutReadData reorders out-of-order data and returns the cumulative Ack: the

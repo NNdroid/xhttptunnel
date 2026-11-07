@@ -232,6 +232,27 @@ func (c *XHTTPConn) writeSingleFrame(chunk []byte) error {
 		padLenInt = padLenFor(frameHeaderSize + chunkSize)
 	}
 
+	var header [frameHeaderSize]byte
+	binary.BigEndian.PutUint32(header[0:4], uint32(chunkSize))
+	binary.BigEndian.PutUint16(header[4:6], uint16(padLenInt))
+
+	// An unpadded frame is exactly the header plus the payload, so when the
+	// session ring sits underneath — every production wiring — the two can go
+	// out as one atomic two-segment write instead of being copied into an
+	// intermediate full-frame buffer first. That is one bulk memcpy fewer per
+	// frame, and this call is on the downlink path of every byte the tunnel
+	// carries. A generic io.Writer (tests over raw pipes) and a padded frame
+	// still take the buffer path below: padding has to be spliced between the
+	// two segments, and a Write2 would land it after them.
+	if padLenInt == 0 {
+		if w2, ok := c.w.(interface {
+			Write2(a, b []byte) (int, error)
+		}); ok {
+			_, err := w2.Write2(header[:], chunk)
+			return err
+		}
+	}
+
 	frameLen := 6 + padLenInt + chunkSize
 	if frameLen > cap(c.frameBuf) {
 		newCap := cap(c.frameBuf) * 2
@@ -243,8 +264,7 @@ func (c *XHTTPConn) writeSingleFrame(chunk []byte) error {
 		c.frameBuf = c.frameBuf[:frameLen]
 	}
 
-	binary.BigEndian.PutUint32(c.frameBuf[0:4], uint32(chunkSize))
-	binary.BigEndian.PutUint16(c.frameBuf[4:6], uint16(padLenInt))
+	copy(c.frameBuf[0:6], header[:])
 
 	if padLenInt > 0 {
 		if padLenInt > cap(c.padScratch) {

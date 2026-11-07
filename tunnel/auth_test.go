@@ -214,25 +214,28 @@ func TestNonceWindowSweepsWhenOverCapacity(t *testing.T) {
 	w := newNonceWindow()
 	c := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	w.now = func() time.Time { return c }
-	w.maxLen = 4
+	// The nonces below all share the first character, so they land in one
+	// shard and the capacity guard fires on that shard alone.
+	shard := &w.shards[nonceShardIndex("0a")]
+	shard.maxLen = 4
 
-	for i := 0; i < 4; i++ {
-		if !w.mark(strconv.Itoa(i)) {
-			t.Fatalf("mark %d was refused", i)
+	for _, n := range []string{"0a", "0b", "0c", "0d"} {
+		if !w.mark(n) {
+			t.Fatalf("mark %q was refused", n)
 		}
 	}
-	if len(w.seen) != 4 {
-		t.Fatalf("window = %d entries, want 4", len(w.seen))
+	if len(shard.seen) != 4 {
+		t.Fatalf("window = %d entries, want 4", len(shard.seen))
 	}
 
 	// Everything is expired by now. The next insert trips the capacity guard and
 	// the sweep drops the dead entries instead of letting the map grow.
 	c = c.Add(authNonceTTL)
-	if !w.mark("4") {
-		t.Fatal("mark 4 was refused")
+	if !w.mark("0e") {
+		t.Fatal("mark 0e was refused")
 	}
-	if len(w.seen) != 1 {
-		t.Errorf("window = %d entries after the sweep, want 1", len(w.seen))
+	if len(shard.seen) != 1 {
+		t.Errorf("window = %d entries after the sweep, want 1", len(shard.seen))
 	}
 }
 
