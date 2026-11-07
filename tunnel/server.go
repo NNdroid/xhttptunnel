@@ -1496,14 +1496,18 @@ type ServerConfig struct {
 // a custom Handler). Construct one with [NewServer] and run it with
 // [Server.ListenAndServe].
 type Server struct {
+	// xl is published by ListenAndServe and read by Close/Addr, which may
+	// run concurrently with it (the intended "serve in a goroutine, close
+	// from main" pattern), so it is accessed atomically. It leads the struct
+	// on purpose: on 32-bit targets atomic.Pointer carries no self-alignment,
+	// and any int-sized addition to ServerConfig would otherwise shift it off
+	// an 8-byte boundary and trap the atomic ops (see
+	// TestAtomicFieldAlignment_32bit). Offset 0 can never drift.
+	xl atomic.Pointer[XHTTPListener]
+
 	cfg    ServerConfig
 	state  *serverState
 	defURL *url.URL
-
-	// xl is published by ListenAndServe and read by Close/Addr, which may
-	// run concurrently with it (the intended "serve in a goroutine, close
-	// from main" pattern), so it is accessed atomically.
-	xl atomic.Pointer[XHTTPListener]
 
 	// certDir is the temp directory backing a SelfSign certificate, if any.
 	// Removed on Close so repeated NewServer/Close cycles do not litter the
