@@ -892,6 +892,13 @@ func serverEndpoint(u *url.URL, path string) (isTLS bool, hostPort, reqURL strin
 }
 
 func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetAddr, network string) (net.Conn, error) {
+	// Strict mode at the low-level entry point too, matching NewClient: a
+	// password-less dial would send unsigned requests that the strict server
+	// refuses one by one, silently producing a tunnel that can never
+	// establish.
+	if cfg.Password == "" {
+		return nil, fmt.Errorf("tunnel: a PSK is required (open/unauthenticated mode is not allowed)")
+	}
 	window, err := windowBytes(cfg.WindowSizeMB)
 	if err != nil {
 		return nil, err
@@ -1434,6 +1441,17 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 					}
 
 					if err != nil {
+						if handle != nil {
+							// The request is over and there is no response body
+							// to consume, so release the idle-poll request
+							// context now. Every path that does have a body
+							// cancels it after the body is closed; skipping the
+							// cancel here would leave one child of pumpCtx
+							// behind per failed poll, and a link that fails in
+							// bursts would accumulate them for the pump's
+							// lifetime.
+							handle.cancel()
+						}
 						if pumpCtx.Err() != nil {
 							logger.Debug("🛑 [Pump] context cancelled, worker exiting", zap.Int("worker", id))
 							break
@@ -1470,7 +1488,6 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						}
 						continue
 					}
-					atomic.StoreInt32(&consecutiveErrors, 0)
 
 					// The server's long-poll window, learned from the response.
 					// Once known, the next request's deadline is derived from it
@@ -1551,8 +1568,11 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						// Credential and policy rejections will not fix themselves on a
 						// retry. The 403 belongs here too: the allowlist runs before a
 						// session is registered, so there is nothing to poll and every
-						// retry hits the same refusal. 429 and 504 below stay
-						// recoverable because those are transient edge states.
+						// retry hits the same refusal. 426 belongs here as well: a
+						// min_proto_version refusal is fleet policy, not a transient
+						// edge state, so the client reports it and stops rather than
+						// retrying into the same refusal forever. 429 and 504 below
+						// stay recoverable because those are transient edge states.
 						//
 						// Closing the virtual conn is what actually stops the pump: a
 						// bare worker return only exits this goroutine, and the loop
@@ -1560,12 +1580,15 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						// straight back (up to 7 restarts, up to 30s of backoff each).
 						if resp.StatusCode == http.StatusProxyAuthRequired ||
 							resp.StatusCode == http.StatusUnauthorized ||
-							resp.StatusCode == http.StatusForbidden {
+							resp.StatusCode == http.StatusForbidden ||
+							resp.StatusCode == http.StatusUpgradeRequired {
 							if cfg.events != nil {
 								reported.Store(true)
 								if resp.StatusCode == http.StatusForbidden {
 									cfg.events.emit(TargetDenied{SessionID: sessionID, Target: targetAddr, Network: network})
 									cfg.events.emit(TunnelDied{SessionID: sessionID, Target: targetAddr, Network: network, Reason: "target denied", Detail: string(bodyErr)})
+								} else if resp.StatusCode == http.StatusUpgradeRequired {
+									cfg.events.emit(TunnelDied{SessionID: sessionID, Target: targetAddr, Network: network, Reason: "protocol version rejected", Detail: string(bodyErr)})
 								} else {
 									cfg.events.emit(TunnelDied{SessionID: sessionID, Target: targetAddr, Network: network, Reason: "auth rejected", Detail: string(bodyErr)})
 								}
@@ -1589,6 +1612,10 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 								zap.String("session", sessionID),
 								zap.Int("status", resp.StatusCode),
 							)
+							// A normal long-poll timeout is not a failure: start
+							// the next round with a clean count, the way the
+							// recoverable edge states always have.
+							atomic.StoreInt32(&consecutiveErrors, 0)
 							bytesBufPool.Put(downBuf)
 							continue
 						}
@@ -1617,6 +1644,10 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 							dispatchSeq = currentSeq
 							windowMu.Unlock()
 							bytesBufPool.Put(downBuf)
+							// An edge rate limit is recoverable by design — the
+							// Retry-After above is the recovery — so it does not
+							// count toward the failure budget.
+							atomic.StoreInt32(&consecutiveErrors, 0)
 							if !sleepCtx(pumpCtx, retryAfter) {
 								break
 							}
@@ -1630,6 +1661,21 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						)
 
 						bytesBufPool.Put(downBuf)
+						// A persistent unexpected status is a decision about the
+						// path, not a transient edge state — a chunk_size_kb the
+						// two ends disagree on, or an intermediary that rewrites
+						// the request, refuses every retry the same way. Count it
+						// toward the same failure budget a transport error gets,
+						// so the pump falls back to its capped restart backoff
+						// instead of hammering the edge at a fixed one request
+						// per second forever.
+						if atomic.AddInt32(&consecutiveErrors, 1) > pollFailureThreshold(serverPollWait.Load()) {
+							logger.Warn("❌ [Pump] too many unexpected status responses, worker exiting to trigger a data pump restart",
+								zap.Int("worker", id),
+								zap.Int("status", resp.StatusCode),
+							)
+							break
+						}
 						if !sleepCtx(pumpCtx, 1*time.Second) {
 							break
 						}
@@ -1659,6 +1705,17 @@ func DialXHTTP(ctx context.Context, serverURL *url.URL, cfg *DialConfig, targetA
 						}
 						continue
 					}
+
+					// A fully processed 200 with its sequence field intact is
+					// the only thing that proves the path healthy, so it is
+					// the only thing that resets the failure count here. The
+					// recoverable edge states (429, 504/524) reset it in their
+					// own branches; everything else — transport errors,
+					// unexpected statuses, bodies that never arrived — lets it
+					// accumulate, so a persistently broken path escalates into
+					// the pump's capped restart backoff instead of retrying at
+					// full speed forever.
+					atomic.StoreInt32(&consecutiveErrors, 0)
 					sSeq := wireSeq
 
 					// The server answers in kind. Echoing the capability means
@@ -1964,6 +2021,27 @@ func (c *idleRefresher) Write(p []byte) (int, error) {
 	return c.Conn.Write(p)
 }
 
+// halfCloseSource is the tunnel conn the downlink relay reads from. Before
+// the local application half-closes, reads are unbounded: the tunnel's own
+// recovery machinery owns liveness, and an idle-but-healthy session must not
+// be reaped for silence. Once the uplink saw a local EOF — the application
+// said "nothing more to send" — every read re-arms the idle deadline
+// instead, so a peer that never answers still reaps the session after
+// IdleTimeout rather than parking it forever. A slow-but-healthy response is
+// never cut: the deadline moves with every read that made progress.
+type halfCloseSource struct {
+	conn net.Conn
+	idle time.Duration
+	half *atomic.Bool
+}
+
+func (r *halfCloseSource) Read(p []byte) (int, error) {
+	if r.half.Load() {
+		_ = r.conn.SetReadDeadline(time.Now().Add(r.idle))
+	}
+	return r.conn.Read(p)
+}
+
 // DialConfig is the low-level per-session client configuration consumed by
 // [DialXHTTP]. Most embedders should use [ClientConfig] and [Client] instead;
 // this type remains for custom wiring on top of the raw protocol.
@@ -2075,8 +2153,9 @@ type ClientConfig struct {
 	// fresh nonce plus its HMAC-SHA256 over a message that binds the nonce,
 	// the session id, the network, the target, the request metadata and a
 	// digest of the body, so a captured request leaks nothing, cannot be
-	// replayed, and cannot be rewritten in flight. Empty disables
-	// authentication.
+	// replayed, and cannot be rewritten in flight. Required: NewClient
+	// rejects an empty value rather than running an unauthenticated open
+	// mode.
 	PSK string
 	// SNI overrides the TLS SNI. Empty derives it from ServerURL's host.
 	SNI string
@@ -2740,6 +2819,7 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 	}()
 
 	var activeTCPConns int32
+	var acceptFailures int
 
 	for {
 		conn, err := ln.Accept()
@@ -2747,9 +2827,16 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 			if ctx.Err() != nil || c.isClosed() {
 				return nil
 			}
-			logger.Error("❌ failed to Accept a local connection", zap.Error(err))
+			// A persistent accept failure — fd exhaustion, a ulimit — must
+			// not spin the CPU: back off before retrying, reset on success.
+			acceptFailures++
+			logger.Error("❌ failed to Accept a local connection", zap.Error(err), zap.Int("consecutive_failures", acceptFailures))
+			if !sleepCtx(ctx, time.Duration(min(acceptFailures, 10))*100*time.Millisecond) {
+				return nil
+			}
 			continue
 		}
+		acceptFailures = 0
 
 		if atomic.LoadInt32(&activeTCPConns) >= int32(c.maxConns) {
 			logger.Warn("❌ [TCP] refused local connection: reached max concurrent connections", zap.Int("limit", c.maxConns), zap.String("client", conn.RemoteAddr().String()))
@@ -2792,8 +2879,12 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 			}
 			defer closeBoth()
 
+			// halfClosed is set by the uplink relay when the local application
+			// half-closes; the downlink's halfCloseSource reads it to switch
+			// from unbounded reads to idle-budgeted ones.
+			var halfClosed atomic.Bool
+
 			go func() {
-				defer closeBoth()
 				// A pooled 64 KB buffer rather than a per-connection 32 KB
 				// allocation: fewer ring writes and frame headers per byte on
 				// the uplink, at memory the pool bounds by concurrency.
@@ -2823,15 +2914,33 @@ func (c *Client) serveTCP(ctx context.Context, hostPort string) error {
 					}
 				}
 
-				if upErr != nil && upErr != io.EOF {
+				// A local EOF is the application's half-close — "nothing more
+				// to send" — not the end of the tunnel. Stop relaying and let
+				// the downlink keep running: the server bridge holds the
+				// target open, so the peer's response still reaches the local
+				// reader, and the session ends when the target closes (the
+				// close marker) or when the idle budget halfCloseSource
+				// re-arms runs out on a silent peer. An application that
+				// closes outright surfaces the same way here, but its full
+				// close then shows up as a write error on the downlink and
+				// tears the session down through closeBoth there. Any other
+				// uplink error means one side is broken: tear the session
+				// down now.
+				if upErr != nil && !errors.Is(upErr, io.EOF) {
 					logger.Debug("⚠️ [TCP] uplink relay (local->server) ended abnormally", zap.String("id", connID), zap.Int64("bytes", written), zap.Error(upErr))
-				} else {
-					logger.Debug("🛑 [TCP] uplink relay (local->server) ended normally", zap.String("id", connID), zap.Int64("bytes", written))
+					closeBoth()
+					return
 				}
+				halfClosed.Store(true)
+				logger.Debug("🛑 [TCP] uplink relay (local->server) half-closed, downlink stays open", zap.String("id", connID), zap.Int64("bytes", written))
 			}()
 
 			downBufPtr := relayBufPool.Get().(*[]byte)
-			downN, downErr := io.CopyBuffer(&idleRefresher{Conn: clientConn, idle: c.idleTimeout}, xc, *downBufPtr)
+			downN, downErr := io.CopyBuffer(
+				&idleRefresher{Conn: clientConn, idle: c.idleTimeout},
+				&halfCloseSource{conn: xc, idle: c.idleTimeout, half: &halfClosed},
+				*downBufPtr,
+			)
 			relayBufPool.Put(downBufPtr)
 			if downErr != nil && downErr != io.EOF {
 				logger.Debug("⚠️ [TCP] downlink relay (server->local) ended abnormally", zap.String("id", connID), zap.Int64("bytes", downN), zap.Error(downErr))
@@ -2978,7 +3087,9 @@ func (c *Client) serveUDP(ctx context.Context, hostPort string) error {
 							return
 						}
 						session.lastActive.Store(time.Now().Unix())
-						pc.WriteTo(dBuf[:l], addr)
+						if _, werr := pc.WriteTo(dBuf[:l], addr); werr != nil {
+							logger.Debug("⚠️ [UDP] failed to write downlink datagram", zap.String("id", id), zap.String("client", addr.String()), zap.Error(werr))
+						}
 					}
 				}(cAddr, sess, connID)
 			}

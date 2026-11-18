@@ -251,6 +251,9 @@ func TestGenConfigValidationMatrix(t *testing.T) {
 		{"bad allowed target port", []string{"-allowed-targets", ":0", "-psk", "s"}, "allowed_targets"},
 		{"bad allowed target scheme", []string{"-allowed-targets", "grpc://1.2.3.4:22", "-psk", "s"}, "allowed_targets"},
 		{"bad allowed target host", []string{"-allowed-targets", "tcp://bad host:22", "-psk", "s"}, "allowed_targets"},
+		{"unbracketed ipv6 with port", []string{"-allowed-targets", "::1:22", "-psk", "s"}, "unbracketed IPv6"},
+		{"unbracketed ipv6 with port, prefixed", []string{"-allowed-targets", "tcp://2001:db8::10:22", "-psk", "s"}, "unbracketed IPv6"},
+		{"unbracketed ipv6 any port", []string{"-allowed-targets", "2001:db8::10:", "-psk", "s"}, "allowed_targets"},
 		{"bad server url", []string{"-mode", "client", "-server", "ftp://x", "-psk", "s"}, "server"},
 		{"bad selfsign cn", []string{"-selfsign-cn", "bad host", "-psk", "s"}, "selfsign_cn"},
 	}
@@ -285,20 +288,19 @@ func TestGenConfigRejectsUnknownMode(t *testing.T) {
 	}
 }
 
-func TestOpenMode(t *testing.T) {
+func TestEmptyPSKIsRejected(t *testing.T) {
+	// An empty psk has no open mode behind it: the generator refuses it
+	// outright rather than emitting a file that cannot start.
 	cfg := mustBuild(t, mustSpec(t, "-psk", ""))
 	if cfg.PSK != "" {
-		t.Fatalf("psk = %q, want empty for open mode", cfg.PSK)
+		t.Fatalf("psk = %q, want empty", cfg.PSK)
 	}
-	check := checkConfig(cfg, false)
-	if check.err() != nil {
-		t.Fatalf("open mode must be legal: %v", check.err())
+	err := checkConfig(cfg, false).err()
+	if err == nil {
+		t.Fatal("an empty psk was accepted")
 	}
-	if !check.warned() {
-		t.Errorf("open mode must warn about unauthenticated sessions; warnings = %v", check.warnings)
-	}
-	if joined := strings.Join(check.warnings, " "); !strings.Contains(joined, "unauthenticated") {
-		t.Errorf("open-mode warning is not about authentication: %v", check.warnings)
+	if !strings.Contains(err.Error(), "no open mode") {
+		t.Fatalf("empty-psk error does not name the missing open mode: %v", err)
 	}
 }
 
@@ -348,12 +350,13 @@ func TestPskFile(t *testing.T) {
 	}
 }
 
-func TestPskModeOpenAndRandom(t *testing.T) {
-	cfg := mustBuild(t, mustSpec(t, "-psk-mode", "open"))
-	if cfg.PSK != "" {
-		t.Errorf("psk = %q, want empty", cfg.PSK)
+func TestPskModeOpenIsRejectedAndRandomGenerates(t *testing.T) {
+	// "open" is no longer a mode: the tunnel is always authenticated, so the
+	// generator refuses it instead of emitting a file that cannot start.
+	if _, err := mustSpec(t, "-psk-mode", "open").build(); err == nil {
+		t.Error("-psk-mode open was accepted")
 	}
-	cfg = mustBuild(t, mustSpec(t, "-mode", "client", "-psk-mode", "random"))
+	cfg := mustBuild(t, mustSpec(t, "-mode", "client", "-psk-mode", "random"))
 	if len(cfg.PSK) != 64 {
 		t.Errorf("psk = %q, want 64 hex chars", cfg.PSK)
 	}
@@ -1062,7 +1065,7 @@ func TestChangedFlags(t *testing.T) {
 	}
 	changed := changedFlags(cmd)
 	if !changed["psk"] {
-		t.Error("an explicit -psk \"\" must register as changed, or open mode is undetectable")
+		t.Error("an explicit -psk \"\" must register as changed, or an explicit empty is undetectable")
 	}
 	if changed["listen"] {
 		t.Error("an unset flag registered as changed")

@@ -27,8 +27,11 @@ var (
 	version string
 
 	// Version is the human-facing version string. Prefer versionString() so a
-	// linker-injected version wins over the source default.
-	Version = "1.1.0"
+	// linker-injected version wins over the source default. The default
+	// matches the release tag family (v1.0.yyyyMMdd.<count>-<hash>, see
+	// scripts/build.sh), so an unstamped dev build identifies with the
+	// releases it was built from.
+	Version = "1.0.0"
 	// logger is the CLI's own sink for startup warnings and errors; all
 	// protocol-level logging flows through the tunnel package logger, which
 	// initLogger keeps in sync with this one.

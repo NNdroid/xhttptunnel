@@ -209,7 +209,13 @@ func (a stringAddr) String() string  { return string(a) }
 
 func generateRandomHex(n int) string {
 	b := make([]byte, n)
-	rand.Read(b)
+	// A crypto/rand failure means every identifier this process mints —
+	// session ids above all — degenerates into a predictable constant.
+	// Failing loudly is the only correct answer, matching the nonce drawing
+	// in auth.go.
+	if _, err := rand.Read(b); err != nil {
+		panic("tunnel: crypto/rand failed: " + err.Error())
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -405,6 +411,10 @@ type serverState struct {
 	// next accept. Only the newest matters: applying the parameters to any
 	// one member updates the whole group.
 	brutalConns map[uint64]net.Conn
+	// brutalConnIDs is the reverse of brutalConns (conn → group), so a closed
+	// connection can be forgotten in O(1) from the ConnState hook instead of
+	// a scan that grows with the number of groups ever seen.
+	brutalConnIDs map[net.Conn]uint64
 
 	cleanerOnce sync.Once
 	stopOnce    sync.Once
@@ -445,6 +455,7 @@ func newServerState(maxSessions int) *serverState {
 		nonces:               newNonceWindow(),
 		brutalRates:          make(map[uint64]uint64),
 		brutalConns:          make(map[uint64]net.Conn),
+		brutalConnIDs:        make(map[net.Conn]uint64),
 		stopCleaner:          make(chan struct{}),
 	}
 }
@@ -796,7 +807,7 @@ func (st *serverState) sweepIdleSessions() {
 	var victims []*meekVirtualConn
 	for id, v := range st.sessions {
 		if now-v.lastActive.Load() > int64(sessionIdleTimeout.Seconds()) {
-			logger.Debug("🧹 [Cleaner] found an idle session, reclaiming resources", zap.String("session", id))
+			st.lg().Debug("🧹 [Cleaner] found an idle session, reclaiming resources", zap.String("session", id))
 			st.removeSessionLocked(id)
 			victims = append(victims, v)
 		}
@@ -862,6 +873,24 @@ func (st *serverState) noteGroupConn(groupID uint64, c net.Conn) {
 	st.brutalMu.Lock()
 	defer st.brutalMu.Unlock()
 	st.brutalConns[groupID] = c
+	st.brutalConnIDs[c] = groupID
+}
+
+// forgetBrutalConn drops the group's memory of a connection that has closed,
+// if it was still the remembered member. brutalRates is deliberately kept:
+// it carries a negotiated rate across the gap while the group is empty, and
+// a uint64 per group is not worth a re-negotiation.
+func (st *serverState) forgetBrutalConn(c net.Conn) {
+	st.brutalMu.Lock()
+	defer st.brutalMu.Unlock()
+	gid, ok := st.brutalConnIDs[c]
+	if !ok {
+		return
+	}
+	delete(st.brutalConnIDs, c)
+	if cur, ok := st.brutalConns[gid]; ok && cur == c {
+		delete(st.brutalConns, gid)
+	}
 }
 
 // setGroupRate records the rate in force for a group and pushes it to the

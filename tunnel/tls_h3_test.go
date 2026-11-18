@@ -19,7 +19,7 @@ func TestListenXHTTP_HTTP3RequiresTLS(t *testing.T) {
 
 	// A cleartext origin is the normal CDN-origin deployment. It should not
 	// reserve UDP or advertise an H3 capability it cannot serve.
-	listener, err := ListenXHTTP(ctx, "tcp+udp://127.0.0.1:0", "/stream", "", "", "", "")
+	listener, err := ListenXHTTP(ctx, "tcp+udp://127.0.0.1:0", "/stream", "test-secret", "", "", "")
 	if err != nil {
 		t.Fatalf("start cleartext listener: %v", err)
 	}
@@ -31,10 +31,10 @@ func TestListenXHTTP_HTTP3RequiresTLS(t *testing.T) {
 		t.Fatal("cleartext listener unexpectedly reserved UDP/H3")
 	}
 
-	if _, err := ListenXHTTP(ctx, "udp://127.0.0.1:0", "/stream", "", "", "", ""); err == nil {
+	if _, err := ListenXHTTP(ctx, "udp://127.0.0.1:0", "/stream", "test-secret", "", "", ""); err == nil {
 		t.Fatal("cleartext udp:// listener must be rejected because H3 requires TLS")
 	}
-	if _, err := ListenXHTTP(ctx, "tcp://127.0.0.1:0", "/stream", "", "only-cert.pem", "", ""); err == nil {
+	if _, err := ListenXHTTP(ctx, "tcp://127.0.0.1:0", "/stream", "test-secret", "only-cert.pem", "", ""); err == nil {
 		t.Fatal("partial TLS configuration must be rejected")
 	}
 }

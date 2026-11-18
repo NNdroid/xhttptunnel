@@ -54,8 +54,9 @@ curl -fsSL https://raw.githubusercontent.com/NNdroid/xhttptunnel/main/scripts/in
   precedence over it.
 - **PSK**: without `--psk` a server generates a fresh 256-bit token and prints
   it once; a client installs *no* PSK and will not invent one, because a
-  freshly generated secret could never authenticate. `--psk ""` opts into
-  explicit open mode on either side. Published placeholder tokens are rejected.
+  freshly generated secret could never authenticate. `--psk ""` writes an empty
+  value the binary refuses to start with — there is no open mode. Published
+  placeholder tokens are rejected.
 - **Target policy**: `--no-public-targets` (the default) writes an
   `allowed_targets` allowlist of `127.0.0.1:` and `localhost:`, so a leaked PSK
   can only reach loopback services. `--allow-public-targets` writes an empty
@@ -134,9 +135,10 @@ xhttptunnel gen-config -mode server -docs=false                              # d
 
 `-psk-mode` selects the secret: `auto` (default) generates one for a server and
 keeps the placeholder for a client; `random` always generates; `placeholder`
-emits a template for either; `open` writes an empty PSK. The precedence is
+emits a template for either. There is no `open` mode: an empty PSK is refused
+at generation time, and the precedence is
 `-psk` / `-psk-file` first — a file keeps the secret off the command line and
-out of `ps` — then `-psk-mode`, and `-psk ""` opts into open mode. Publishing an
+out of `ps` — then `-psk-mode`. Publishing an
 example token as an explicit `-psk` is a hard error; the placeholder is only an
 error when *you* type it — a generator-substituted one warns instead, because
 the binary's own check is the hard refusal.
@@ -275,7 +277,9 @@ backwards compatible. A server accepts both during a fleet upgrade — a constan
 request and a derived request authenticate under their own names — so servers
 can be rolled out before clients. The disguise-site scrubber deletes under both
 name sets, so a derived-mode request that misses the tunnel path cannot leak its
-headers to the fallback site. This hides the *names*; it does not hide the
+headers to the fallback site, and it drops the `?s=` session salt from the
+forwarded URL so the disguise site sees no correlation token either. This hides
+the *names*; it does not hide the
 values (the target in `X-Route`, the HMAC shape) or the behaviour signature, and
 an observer holding the key sees everything anyway.
 
@@ -328,7 +332,7 @@ journalctl -u xhttptunnel -f   # View live logs
 | `target` | `string` | server `"tcp://127.0.0.1:22"`, client `"127.0.0.1:22"` | Target service address. Server: the scheme is required — it is the dial address and it selects the protocol (`tcp://127.0.0.1:22`, `udp://127.0.0.1:51820`). Client: bare `host:port`, no scheme — it goes to the server verbatim as `X-Route` while the protocol travels separately in `X-Net`, and any scheme you add is stripped before the dial rather than honoured. |
 | `default_target` / `forward` | `string` | — | Aliases for `target` (server / client respectively); cross-filled when `target` is set. |
 | `path` | `string` | `"/stream"` | Custom Split-HTTP proxy path. |
-| `psk` | `string` | none | Pre-shared key / token (aliases `token`/`auth_token`). CLI subcommands require an explicit non-placeholder value; an empty config-file value explicitly enables open mode. |
+| `psk` | `string` | none | Pre-shared key / token (aliases `token`/`auth_token`). CLI subcommands require an explicit non-placeholder value; an empty value is refused at startup — there is no open mode. |
 | `cert` / `key` | `string` | `""` | TLS certificate / private key files. Both empty = cleartext origin (behind a TLS-terminating CDN). |
 | `selfsign` | `bool` | `false` | Auto-generate a self-signed TLS certificate if `cert`/`key` are omitted. The sample server config enables it. |
 | `selfsign_cn` | `string` | `"www.bing.com"` | Common Name (SNI) for generated certificate. |
@@ -367,6 +371,12 @@ reservations even for idle sessions, and is released when the session closes.
 `gen-config` exposes these as `-window-size-mb` and `-buffer-budget-mb`.
 `Server.Stats()` and the health snapshot expose `buffer_reserved_bytes` and
 `buffer_budget_bytes` when a budget is configured.
+
+UDP targets run as connected sockets on the server, and the bridge reaps a
+target that sends nothing for 60 seconds. A service that idles silently —
+WireGuard without `PersistentKeepalive`, for example — needs its own
+keepalive below that bound, or the client will see the session end and dial
+again.
 
 Streaming ACKs are coalesced by bytes (32 KiB) and time (10 ms), independently
 of keepalives. The downlink response's headers are flushed first; the initial
@@ -948,7 +958,11 @@ release.
   lifted onto another request. A body that is a continuous stream rather than a
   bounded object says so in the signed message too, and does not sign a digest
   it has no end to take: the kind is drawn by both ends from the same header,
-  so a mismatch between them is a refusal rather than a misread.
+  so a mismatch between them is a refusal rather than a misread. This covers
+  the poll transports end to end. The streaming downlink is the exception: its
+  frames carry their sequence numbers in the plaintext envelope and are
+  neither signed nor masked, and the streaming response carries no digest —
+  the stream's integrity rides on the TLS hop between the two ends.
 - **The counters travel masked.** They are XORed with a per-request keystream
   derived from the PSK and the nonce, so an observer holding the nonce and a
   year of traffic has no counters to difference. The mask is applied per

@@ -303,6 +303,15 @@ func scrubTunnelRequest(req *http.Request, psk string) {
 			req.Header.Del(h)
 		}
 	}
+	// The session salt (?s=) goes too. It is not a secret — the session id is
+	// public by design — but it is a per-session correlation token, and the
+	// disguise site has no business seeing it on a request that missed the
+	// tunnel.
+	if req.URL.Query().Get(saltParam) != "" {
+		q := req.URL.Query()
+		q.Del(saltParam)
+		req.URL.RawQuery = q.Encode()
+	}
 	// The protocol header names are neutral on purpose (see headers.go), so
 	// there is no prefix that closes the class the way the old X-HTTP-Tunnel-
 	// namespace did. The registry and its completeness test take that role
@@ -1133,6 +1142,12 @@ func ListenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 
 func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile, fallbackURL string, st *serverState) (*XHTTPListener, error) {
 	logger := st.lg()
+	// Strict mode at the low-level entry point too, matching NewServer: the
+	// session handler refuses every request that carries no URL salt, so an
+	// empty token would silently produce a listener that accepts nothing.
+	if token == "" {
+		return nil, fmt.Errorf("tunnel: a PSK is required (open/unauthenticated mode is not allowed)")
+	}
 	if (certFile == "") != (keyFile == "") {
 		return nil, fmt.Errorf("TLS requires both cert and key files")
 	}
@@ -1221,6 +1236,14 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 			conns[c] = struct{}{}
 		case http.StateClosed, http.StateHijacked:
 			delete(conns, c)
+		}
+		if state == http.StateClosed || state == http.StateHijacked {
+			// Release the brutal group's memory of this connection, if it
+			// was still the remembered member: a closed conn can no
+			// longer receive a pushed rate and only pins memory where it
+			// is kept. Without this the per-group table grows with every
+			// distinct client address the server ever saw.
+			st.forgetBrutalConn(c)
 		}
 	}
 
@@ -1347,9 +1370,9 @@ func listenXHTTP(ctx context.Context, listenAddr, path, token, certFile, keyFile
 }
 
 // ServerConfig configures a [Server]. The zero value is not directly useful:
-// Listen defaults to ":8443" only through the CLI; embedders should set at
-// least Listen and a PSK (an empty PSK runs the server in unauthenticated
-// open mode — never expose that publicly).
+// Listen defaults to ":8443" only through the CLI; embedders must set at
+// least Listen and a PSK — NewServer rejects an empty PSK rather than
+// running an unauthenticated open mode, and there is no way to opt into one.
 type ServerConfig struct {
 	// WindowSizeMB sets the per-session reliable send window in MiB.
 	// 0 preserves the 8 MiB default; valid explicit sizes are 1-64.
@@ -1372,7 +1395,8 @@ type ServerConfig struct {
 	// <token>" or "X-Auth-Token"; that path is still accepted so a fleet can
 	// be upgraded in place (servers first, clients after), and it is closed to
 	// any client that advertises protocol version 2. Comma-separated values
-	// accept multiple keys. Empty disables authentication.
+	// accept multiple keys. Required: NewServer rejects an empty value —
+	// there is no open/unauthenticated mode to fall back to.
 	PSK string
 	// CertFile/KeyFile enable TLS when both are set. Leave both empty for a
 	// cleartext origin (typically behind a TLS-terminating CDN).
@@ -1538,6 +1562,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	window, _ := windowBytes(cfg.WindowSizeMB)
 	if cfg.Path == "" {
 		cfg.Path = "/stream"
+	}
+	if cfg.HealthPath != "" && cfg.HealthPath == cfg.Path {
+		// The health handler registers an exact-match pattern, which ServeMux
+		// prefers over the "/" catch-all the tunnel endpoint is served by:
+		// on the same path it would shadow the tunnel entirely (GET answers
+		// JSON stats, POST gets 405) rather than just adding an endpoint.
+		return nil, fmt.Errorf("tunnel: health_path %q must differ from the tunnel path %q: the health handler would shadow the tunnel endpoint", cfg.HealthPath, cfg.Path)
 	}
 	if err := cfg.Brutal.Validate("server"); err != nil {
 		return nil, err

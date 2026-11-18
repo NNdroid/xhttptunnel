@@ -197,9 +197,14 @@ func TestForcedStreamDialWaitsForUplinkAdmission(t *testing.T) {
 			http.Error(w, "busy", http.StatusTooManyRequests)
 			return
 		}
-		w.Header().Set(DownstreamAcceptedHeader, "1")
-		w.Header().Set(StreamUplinkSyncHeader, "1")
-		w.Header().Set(ProtoHeader, strconv.Itoa(tunnelProtoVersion))
+		// The dial now runs with a PSK, so the client reads every response
+		// header under its per-session derived names; the fake origin must
+		// echo under the same derivation. The salt rides the URL exactly as
+		// it does on the wire.
+		namer := deriveHeaderNamer("forced-stream-secret", r.URL.Query().Get(saltParam))
+		w.Header().Set(namer.name(slotDownstreamAccepted), "1")
+		w.Header().Set(namer.name(slotStreamUplinkSync), "1")
+		w.Header().Set(namer.name(slotProto), strconv.Itoa(tunnelProtoVersion))
 		w.WriteHeader(http.StatusOK)
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
@@ -223,7 +228,7 @@ func TestForcedStreamDialWaitsForUplinkAdmission(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	conn, err := DialXHTTP(ctx, serverURL, &DialConfig{
-		Path: "/", ALPN: "h1", StreamMode: "stream", events: hub,
+		Password: "forced-stream-secret", Path: "/", ALPN: "h1", StreamMode: "stream", events: hub,
 	}, "target.invalid:1", "tcp")
 	if conn != nil {
 		conn.Close()

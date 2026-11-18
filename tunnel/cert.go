@@ -65,7 +65,8 @@ func CertFingerprint(certFile string) (string, error) {
 }
 
 // GenerateSelfSignedCert generates a realistic-looking self-signed certificate
-// valid for 10 years and saves it to disk.
+// and saves it to disk. The validity window is backdated one day and runs 390
+// days forward, in line with common certificate-lifetime conventions.
 func GenerateSelfSignedCert(certPath, keyPath, commonName string) error {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

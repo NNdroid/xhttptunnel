@@ -444,7 +444,7 @@ func maskU64(v uint64, m []byte, off int) uint64 {
 func decodeCounters(m []byte, c counters) (seq, ack uint64, pad int, err error) {
 	if c.seq != "" {
 		if seq, err = strconv.ParseUint(c.seq, 10, 64); err != nil {
-			return 0, 0, 0, fmt.Errorf("tunnel: unreadable X-Seq %q", c.seq)
+			return 0, 0, 0, fmt.Errorf("tunnel: unreadable %s %q", SeqHeader, c.seq)
 		}
 		if m != nil {
 			seq = maskU64(seq, m, 0)
@@ -452,7 +452,7 @@ func decodeCounters(m []byte, c counters) (seq, ack uint64, pad int, err error) 
 	}
 	if c.ack != "" {
 		if ack, err = strconv.ParseUint(c.ack, 10, 64); err != nil {
-			return 0, 0, 0, fmt.Errorf("tunnel: unreadable X-Ack %q", c.ack)
+			return 0, 0, 0, fmt.Errorf("tunnel: unreadable %s %q", AckHeader, c.ack)
 		}
 		if m != nil {
 			ack = maskU64(ack, m, 8)

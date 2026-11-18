@@ -1050,7 +1050,7 @@ Configuration flags (a value given here is used verbatim and never prompted):
   --selfsign | --no-selfsign
   --selfsign-cn <cn>        Common name for the self-signed certificate
   --fallback <url>          Fallback URL for unauthorized requests
-  --psk <value>             Explicit PSK; --psk "" selects open mode
+  --psk <value>             Explicit PSK; an empty value writes a config the binary refuses to start with (there is no open mode)
   --psk-auto | --psk-manual PSK mode (server defaults to auto, client to manual)
   --sni <domain>            Client TLS SNI and HTTP Host (default: selfsign_cn, else derived)
   --fingerprint <hex>       Client certificate pin (SHA-256 of the DER certificate)

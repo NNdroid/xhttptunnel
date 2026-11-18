@@ -36,7 +36,6 @@ const (
 	pskModeAuto        = "auto"        // server: random, client: placeholder
 	pskModeRandom      = "random"      // always generate
 	pskModePlaceholder = "placeholder" // always emit the inert example token
-	pskModeOpen        = "open"        // empty PSK, no authentication
 )
 
 // genSpec is the operator-supplied half of a config. build() turns it into a
@@ -96,7 +95,8 @@ type genSpec struct {
 	BrutalBWInterval  int
 
 	// Changed holds the flags the operator actually set, so an explicit
-	// "-psk """ (open mode) is distinguishable from the flag being omitted.
+	// "-psk """ (rejected as empty) is distinguishable from the flag being
+	// omitted.
 	Changed map[string]bool
 	// PSKGenerated records a freshly generated secret so the caller can show it
 	// once, out of band of the JSON stream.
@@ -143,8 +143,6 @@ func (s *genSpec) resolvePSK(mode string) (string, error) {
 	switch s.PSKMode {
 	case pskModePlaceholder:
 		return placeholderPSK, nil
-	case pskModeOpen:
-		return "", nil
 	case pskModeRandom:
 		p, err := randomPSK(256)
 		if err != nil {
@@ -166,7 +164,7 @@ func (s *genSpec) resolvePSK(mode string) (string, error) {
 		// refuses to start instead of failing on the first connection.
 		return placeholderPSK, nil
 	default:
-		return "", fmt.Errorf("-psk-mode %q is not %q, %q, %q or %q", s.PSKMode, pskModeAuto, pskModeRandom, pskModePlaceholder, pskModeOpen)
+		return "", fmt.Errorf("-psk-mode %q is not %q, %q or %q (there is no open mode; the tunnel is always authenticated)", s.PSKMode, pskModeAuto, pskModeRandom, pskModePlaceholder)
 	}
 }
 
@@ -412,16 +410,19 @@ func checkConfig(cfg *FileConfig, explicitPSK bool) *configCheck {
 	if cfg.HealthPath != "" && !strings.HasPrefix(cfg.HealthPath, "/") {
 		c.fail("health_path %q must start with \"/\"", cfg.HealthPath)
 	}
+	if cfg.HealthPath != "" && cfg.HealthPath == cfg.Path {
+		c.fail("health_path %q must differ from path %q: the exact-match health handler would shadow the tunnel endpoint (GET serves JSON stats, POST gets 405)", cfg.HealthPath, cfg.Path)
+	}
 
 	if isPlaceholderPSK(cfg.PSK) {
 		if explicitPSK {
-			c.fail("psk is the published example token %q, which the binary refuses to run with; pass a real secret, -psk \"\" for open mode, or let the generator create one", cfg.PSK)
+			c.fail("psk is the published example token %q, which the binary refuses to run with; pass a real secret, or let the generator create one", cfg.PSK)
 		} else {
 			c.warn("psk is the placeholder %q, so this file will refuse to start until a real secret is supplied", cfg.PSK)
 		}
 	}
 	if cfg.PSK == "" {
-		c.warn("psk is empty: the tunnel will accept unauthenticated sessions")
+		c.fail("psk is empty: there is no open mode, so the generator refuses an empty secret; pass a real secret with -psk or -psk-file, or let the generator create one")
 	}
 
 	if cfg.ALPN != "" {
@@ -587,6 +588,15 @@ func checkAllowedTargetEntry(entry string) error {
 	host, port, ok := splitHostPort(e)
 	if !ok {
 		return fmt.Errorf("allowed_targets entry %q must be \"host:port\", \":port\", \"host:\", \"[host]\" or \"*\"%s", entry, restricted)
+	}
+	if host != "" && host != "*" && strings.Contains(host, ":") && net.ParseIP(host) != nil && !strings.HasPrefix(e, "[") {
+		// An unbracketed IPv6 literal with a port ("::1:22") is exactly the
+		// ambiguity the grammar exists to avoid: the same string is also a
+		// legal IPv6 literal on its own, so which part is the host is a
+		// guess. Require the brackets the documentation asks for
+		// ("[::1]:22" or "[::1]"). An IPv4 host carries no colon and is
+		// unambiguous, so it is untouched.
+		return fmt.Errorf("allowed_targets entry %q is an unbracketed IPv6 literal; wrap it in brackets: [%s]:<port> or [%s]%s", entry, host, host, restricted)
 	}
 	if host != "" && host != "*" && hostIllegal(host) {
 		return fmt.Errorf("allowed_targets entry %q has an invalid host%s", entry, restricted)
@@ -757,7 +767,7 @@ func serverFieldDocs() []stringDoc {
 		{"listen", "Server address. Plain address or tcp+udp:// enables H3 only with TLS; tcp:// disables H3 for a CDN HTTP origin."},
 		{"path", "Custom Split-HTTP endpoint path (e.g. /stream)"},
 		{"target", "Default backend service to forward tunnel traffic to (e.g. tcp://127.0.0.1:22 or udp://127.0.0.1:51820). Alias: default_target"},
-		{"psk", "Pre-shared key for authentication. Never sent over the wire: each request carries a fresh nonce plus its HMAC-SHA256 over the nonce, session id, network and target — and from protocol generation 3 also the request metadata (including the masked sequence counters and the pad length) and a digest of the body — so a captured request leaks nothing, cannot be replayed or retargeted, and cannot be rewritten in flight. Legacy clients that still send the bare token are accepted during the migration window (upgrade servers first, then clients). Aliases: token, auth_token. Empty = open mode."},
+		{"psk", "Pre-shared key for authentication. Never sent over the wire: each request carries a fresh nonce plus its HMAC-SHA256 over the nonce, session id, network and target — and from protocol generation 3 also the request metadata (including the masked sequence counters and the pad length) and a digest of the body — so a captured request leaks nothing, cannot be replayed or retargeted, and cannot be rewritten in flight. Legacy clients that still send the bare token are accepted during the migration window (upgrade servers first, then clients). Aliases: token, auth_token. Empty is rejected at startup; there is no open mode."},
 		{"selfsign", "Automatically generate simulated Amazon/Bing CDN self-signed TLS certificate if cert/key omitted (set false for plain HTTP behind CDN)"},
 		{"selfsign_cn", "Common Name for auto self-signed certificate (e.g. www.bing.com)"},
 		{"cert", "Optional path to custom TLS certificate file"},
@@ -786,7 +796,7 @@ func clientFieldDocs() []stringDoc {
 		{"listen", "Local TCP listening address for applications to connect to (e.g. tcp://127.0.0.1:1080)"},
 		{"server", "Remote xhttptunnel server streaming URL (e.g. https://example.com:8443/stream)"},
 		{"target", "Target backend service to connect through the tunnel (e.g. 127.0.0.1:22). Alias: forward"},
-		{"psk", "Pre-shared key matching the server. It is never sent: each request carries a fresh nonce plus its HMAC-SHA256 over the nonce, session id, network and target — and from protocol generation 3 also the request metadata (including the masked sequence counters and the pad length) and a digest of the body — so a captured request leaks nothing and cannot be replayed, retargeted or rewritten in flight. Aliases: token, auth_token. Empty = connect unauthenticated."},
+		{"psk", "Pre-shared key matching the server. It is never sent: each request carries a fresh nonce plus its HMAC-SHA256 over the nonce, session id, network and target — and from protocol generation 3 also the request metadata (including the masked sequence counters and the pad length) and a digest of the body — so a captured request leaks nothing and cannot be replayed, retargeted or rewritten in flight. Aliases: token, auth_token. Empty is rejected at startup; there is no open mode."},
 		{"sni", "Optional TLS SNI disguise/domain (default: inherited from the server URL domain. Required if the server URL uses a CDN IP)"},
 		{"host", "Optional HTTP Host disguise/domain (default: inherited from the server URL domain. Required if the server URL uses a CDN IP)"},
 		{"alpn", "HTTP protocol selection: 'auto' (probe HTTP/3, fall back), 'h3', 'h2', or 'h1'"},
@@ -861,9 +871,9 @@ func bindGenConfigFlags(cmd *flag.FlagSet, s *genSpec) {
 	cmd.StringVar(&s.Path, "path", "", "Tunnel path, e.g. /stream (server)")
 	cmd.StringVar(&s.Server, "server", "", "Tunnel server URL, e.g. https://example.com:8443/stream (client)")
 	cmd.StringVar(&s.Target, "target", "", "Default target: tcp://127.0.0.1:22 on a server, bare 127.0.0.1:22 on a client")
-	cmd.StringVar(&s.PSK, "psk", "", "Pre-shared key; an empty value means open mode. Wins over -psk-mode")
+	cmd.StringVar(&s.PSK, "psk", "", "Pre-shared key; an empty value is rejected (there is no open mode). Wins over -psk-mode")
 	cmd.StringVar(&s.PSKFile, "psk-file", "", "Read the pre-shared key from this file instead of the command line")
-	cmd.StringVar(&s.PSKMode, "psk-mode", pskModeAuto, "PSK source when -psk/-psk-file is unset: auto (server random, client placeholder), random, placeholder, open")
+	cmd.StringVar(&s.PSKMode, "psk-mode", pskModeAuto, "PSK source when -psk/-psk-file is unset: auto (server random, client placeholder), random, placeholder")
 	cmd.BoolVar(&s.SelfSign, "selfsign", true, "Generate a self-signed CDN-style TLS certificate (server)")
 	cmd.StringVar(&s.SelfSignCN, "selfsign-cn", "", "Common name for the self-signed cert; on a client it becomes sni and host")
 	cmd.StringVar(&s.Cert, "cert", "", "Custom TLS certificate path (server); on a client it only feeds gen-uri's fingerprint pin")
